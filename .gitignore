@@ -3,7 +3,7 @@
 *.rbc
 /.bundle/
 /vendor/bundle/
-Gemfile.lock
+# Gemfile.lock はデプロイに必要なのでコミットする
 
 # SQLite
 *.sqlite3
