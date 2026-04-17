@@ -5,11 +5,13 @@
 shared_secret: "CHANGE_ME"
 
 # APNs (iOS)
+# sandbox: true でサンドボックス環境（開発ビルド用）に接続
 apns:
   key_path: "/path/to/AuthKey_XXXXXXXXXX.p8"
   key_id: "XXXXXXXXXX"
   team_id: "XXXXXXXXXX"
   bundle_id: "org.b-shock.capsicum"
+  sandbox: false
 
 # FCM (Android)
 fcm:

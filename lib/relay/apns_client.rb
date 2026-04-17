@@ -4,7 +4,8 @@ module Relay
   class ApnsClient
     def initialize(config)
       @config = config
-      @connection = Apnotic::Connection.new(
+      connection_class = config['apns']['sandbox'] ? Apnotic::Connection::Development : Apnotic::Connection
+      @connection = connection_class.new(
         auth_method: :token,
         cert_path: config['apns']['key_path'],
         key_id: config['apns']['key_id'],
