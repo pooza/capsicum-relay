@@ -1,0 +1,15 @@
+[Unit]
+Description=capsicum push notification relay
+After=network.target
+
+[Service]
+Type=simple
+User=deploy
+WorkingDirectory=/home/deploy/repos/capsicum-relay
+ExecStart=/home/deploy/.rbenv/shims/bundle exec puma -C config/puma.rb
+Restart=on-failure
+RestartSec=5
+Environment=RACK_ENV=production
+
+[Install]
+WantedBy=multi-user.target

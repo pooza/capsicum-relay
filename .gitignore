@@ -1,0 +1,38 @@
+# Ruby
+*.gem
+*.rbc
+/.bundle/
+/vendor/bundle/
+Gemfile.lock
+
+# SQLite
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Config (secrets)
+/config/settings.yml
+
+# Credentials
+*.p8
+*.p12
+*.json
+!/config/*.sample.json
+
+# Logs
+/log/
+*.log
+
+# PID files
+*.pid
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store

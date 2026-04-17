@@ -1,0 +1,17 @@
+# capsicum-relay 設定ファイル
+# コピーして config/settings.yml として配置
+
+# capsicum からの登録リクエスト認証用
+shared_secret: "CHANGE_ME"
+
+# APNs (iOS)
+apns:
+  key_path: "/path/to/AuthKey_XXXXXXXXXX.p8"
+  key_id: "XXXXXXXXXX"
+  team_id: "XXXXXXXXXX"
+  bundle_id: "org.b-shock.capsicum"
+
+# FCM (Android)
+fcm:
+  project_id: "capsicum-xxxxx"
+  service_account_path: "/path/to/service-account.json"
