@@ -4,13 +4,17 @@ module Relay
   class ApnsClient
     def initialize(config)
       @config = config
-      connection_class = config['apns']['sandbox'] ? Apnotic::Connection::Development : Apnotic::Connection
-      @connection = connection_class.new(
+      options = {
         auth_method: :token,
         cert_path: config['apns']['key_path'],
         key_id: config['apns']['key_id'],
-        team_id: config['apns']['team_id']
-      )
+        team_id: config['apns']['team_id'],
+      }
+      @connection = if config['apns']['sandbox']
+                      Apnotic::Connection.development(options)
+                    else
+                      Apnotic::Connection.new(options)
+                    end
     end
 
     def push(device_token:, payload:)
