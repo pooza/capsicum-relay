@@ -20,6 +20,12 @@ module Relay
     def push(device_token:, payload:)
       notification = Apnotic::Notification.new(device_token)
       notification.topic = @config['apns']['bundle_id']
+      notification.alert = {
+        title: 'capsicum',
+        body: "#{payload['account']} に通知があります",
+      }
+      notification.sound = 'default'
+      notification.mutable_content = true
       notification.custom_payload = payload
       notification.push_type = 'alert'
 
