@@ -1,3 +1,4 @@
+require 'securerandom'
 require 'sqlite3'
 
 module Relay
@@ -13,9 +14,10 @@ module Relay
     end
 
     def register(token:, device_type:, account:, server:)
-      @db.execute(<<~SQL, [token, device_type, account, server])
-        INSERT INTO subscriptions (token, device_type, account, server, created_at, updated_at)
-        VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))
+      push_token = SecureRandom.hex(32)
+      @db.execute(<<~SQL, [token, push_token, device_type, account, server])
+        INSERT INTO subscriptions (token, push_token, device_type, account, server, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))
         ON CONFLICT(token) DO UPDATE SET
           device_type = excluded.device_type,
           account = excluded.account,
