@@ -24,6 +24,10 @@ module Relay
       request.body = {
         message: {
           token: device_token,
+          notification: {
+            title: 'capsicum',
+            body: "#{payload['account']} に通知があります",
+          },
           data: payload,
         },
       }.to_json
