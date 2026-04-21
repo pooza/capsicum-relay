@@ -7,6 +7,10 @@ module Relay
   class FcmClient
     FCM_ENDPOINT = 'https://fcm.googleapis.com/v1/projects/%s/messages:send'
 
+    # FCM が返す errorCode のうち「デバイストークン自体が無効」を示すもの。
+    # INVALID_ARGUMENT は request 側のバグでも返るため含めない（誤削除回避）。
+    PERMANENT_ERROR_CODES = %w[UNREGISTERED SENDER_ID_MISMATCH].freeze
+
     def initialize(config)
       @config = config
       @project_id = config['fcm']['project_id']
@@ -39,7 +43,12 @@ module Relay
       if response.is_a?(Net::HTTPSuccess)
         { success: true, name: JSON.parse(response.body)['name'] }
       else
-        { success: false, status: response.code, body: response.body }
+        {
+          success: false,
+          status: response.code,
+          body: response.body,
+          permanent: permanent_failure?(response),
+        }
       end
     end
 
@@ -48,6 +57,16 @@ module Relay
     def access_token
       @authorizer.fetch_access_token!
       @authorizer.access_token
+    end
+
+    def permanent_failure?(response)
+      return true if response.code == '404'
+
+      body = JSON.parse(response.body)
+      error_codes = body.dig('error', 'details')&.flat_map { |d| d['errorCode'] }&.compact || []
+      PERMANENT_ERROR_CODES.any? { |code| error_codes.include?(code) }
+    rescue JSON::ParserError
+      false
     end
   end
 end

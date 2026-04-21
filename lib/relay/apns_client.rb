@@ -2,6 +2,11 @@ require 'apnotic'
 
 module Relay
   class ApnsClient
+    # APNs が返す reason のうち「デバイストークン自体が無効」を示すもの。
+    # これらを受けた場合、relay は Mastodon に HTTP 410 Gone を返して
+    # subscription を destroy してもらい、自らの row も削除する。
+    PERMANENT_REASONS = %w[BadDeviceToken Unregistered DeviceTokenNotForTopic].freeze
+
     def initialize(config)
       @config = config
       options = {
@@ -34,10 +39,12 @@ module Relay
       if response&.ok?
         { success: true, id: response.headers['apns-id'] }
       else
+        reason = response&.body&.dig('reason')
         {
           success: false,
           status: response&.status,
-          reason: response&.body&.dig('reason'),
+          reason: reason,
+          permanent: PERMANENT_REASONS.include?(reason),
         }
       end
     end
