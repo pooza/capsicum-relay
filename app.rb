@@ -87,7 +87,10 @@ module Relay
     # Receive Web Push from Mastodon / Misskey
     post '/push/:push_token' do
       sub = settings.database.find_by_push_token(params[:push_token])
-      halt 404, { error: 'Unknown push token' }.to_json unless sub
+      # Mastodon は 410 Gone で subscription を自動 destroy するため、
+      # 見つからない push_token は stale と見なして 410 で返す（404 だと
+      # Mastodon 側に古い subscription が残り続ける）。
+      halt 410, { error: 'Unknown push token' }.to_json unless sub
 
       # Web Push ペイロードはそのまま転送（復号はクライアント側）
       raw_body = request.body.read
