@@ -92,9 +92,15 @@ module Relay
       # Mastodon 側に古い subscription が残り続ける）。
       halt 410, { error: 'Unknown push token' }.to_json unless sub
 
-      # Web Push ペイロードはそのまま転送（復号はクライアント側）
+      # Web Push ペイロードはそのまま転送（復号はクライアント側）。
+      # aes128gcm (RFC 8291) は salt / sender public key が body 先頭に
+      # 埋め込まれるため body と encoding だけで足りるが、レガシーの
+      # aesgcm は Crypto-Key / Encryption ヘッダに salt / dh 公開鍵が入る
+      # ため、両ヘッダも転送する（Misskey 一部フォークや旧 Mastodon 対応）。
       raw_body = request.body.read
       encoding = request.env['HTTP_CONTENT_ENCODING']
+      crypto_key = request.env['HTTP_CRYPTO_KEY']
+      encryption_header = request.env['HTTP_ENCRYPTION']
 
       payload = {
         'body' => Base64.strict_encode64(raw_body),
@@ -102,6 +108,8 @@ module Relay
         'server' => sub['server'],
         'account' => sub['account'],
       }
+      payload['crypto_key'] = crypto_key if crypto_key
+      payload['encryption'] = encryption_header if encryption_header
 
       result = case sub['device_type']
                when 'ios'
