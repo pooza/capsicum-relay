@@ -62,40 +62,20 @@ Metrics/AbcSize:
   Exclude:
     - test/**/*
   Max: 30
-Metrics/BlockLength:
-  Exclude:
-    - test/**/*
-    - '**/contract/*'
-    - '**/controller/*'
-    - app/task/**/*.rb
-    - '*.gemspec'
 Metrics/ClassLength:
   Exclude:
-    - test/**/*
-    - '**/contract/*'
-    - '**/controller/*'
-    - '**/service/*'
   Max: 200
 Metrics/CyclomaticComplexity:
   Exclude:
-    - test/**/*
-    - '**/contract/*'
   Max: 10
 Metrics/MethodLength:
   Exclude:
-    - test/**/*
   Max: 20
 Metrics/ModuleLength:
   Exclude:
-    - test/**/*
-    - '**/contract/*'
-    - '**/controller/*'
-    - '**/service/*'
   Max: 200
 Metrics/PerceivedComplexity:
   Exclude:
-    - test/**/*
-    - '**/contract/*'
   Max: 10
 Naming/RescuedExceptionsVariableName:
   PreferredName: e
