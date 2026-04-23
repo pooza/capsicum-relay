@@ -27,7 +27,7 @@ module Relay
           device_type = excluded.device_type,
           updated_at = datetime('now')
       SQL
-      find_by_composite(token, account, server)
+      return find_by_composite(token, account, server)
     end
 
     def unregister(id)
@@ -35,32 +35,32 @@ module Relay
       return nil unless sub
 
       @db.execute('DELETE FROM subscriptions WHERE id = ?', [id])
-      sub
+      return sub
     end
 
     def find(id)
-      @db.execute('SELECT * FROM subscriptions WHERE id = ?', [id]).first
+      return @db.execute('SELECT * FROM subscriptions WHERE id = ?', [id]).first
     end
 
     def find_by_composite(token, account, server)
-      @db.execute(
+      return @db.execute(
         'SELECT * FROM subscriptions WHERE token = ? AND account = ? AND server = ?',
         [token, account, server],
       ).first
     end
 
     def find_by_push_token(push_token)
-      @db.execute('SELECT * FROM subscriptions WHERE push_token = ?', [push_token]).first
+      return @db.execute('SELECT * FROM subscriptions WHERE push_token = ?', [push_token]).first
     end
 
     def update_push_token(id, push_token)
-      @db.execute(<<~SQL, [push_token, id])
+      return @db.execute(<<~SQL, [push_token, id])
         UPDATE subscriptions SET push_token = ?, updated_at = datetime('now') WHERE id = ?
       SQL
     end
 
     def count
-      @db.get_first_value('SELECT COUNT(*) FROM subscriptions')
+      return @db.get_first_value('SELECT COUNT(*) FROM subscriptions')
     end
 
     private

@@ -35,6 +35,62 @@ module Relay
       rescue JSON::ParserError
         halt 400, {error: 'Invalid JSON'}.to_json
       end
+
+      def build_push_payload(sub)
+        payload = {
+          'body' => Base64.strict_encode64(request.body.read),
+          'encoding' => request.env['HTTP_CONTENT_ENCODING'].to_s,
+          'server' => sub['server'],
+          'account' => sub['account'],
+        }
+        # aes128gcm は body 先頭に salt / sender public key が埋まるので body と
+        # encoding で足りるが、レガシー aesgcm は Crypto-Key / Encryption ヘッダに
+        # 入るため、存在すれば転送する（旧 Mastodon / 一部 Misskey 対応）。
+        crypto_key = request.env['HTTP_CRYPTO_KEY']
+        encryption_header = request.env['HTTP_ENCRYPTION']
+        payload['crypto_key'] = crypto_key if crypto_key
+        payload['encryption'] = encryption_header if encryption_header
+        return payload
+      end
+
+      def dispatch_push(sub, payload)
+        case sub['device_type']
+        when 'ios'
+          halt 503, {error: 'APNs not configured'}.to_json unless settings.respond_to?(:apns)
+          return settings.apns.push(device_token: sub['token'], payload: payload)
+        when 'android'
+          halt 503, {error: 'FCM not configured'}.to_json unless settings.respond_to?(:fcm)
+          return settings.fcm.push(device_token: sub['token'], payload: payload)
+        end
+      end
+
+      def handle_push_result(sub, result)
+        return handle_push_delivered(sub) if result[:success]
+        return handle_push_gone(sub, result) if result[:permanent]
+        return handle_push_failed(result)
+      end
+
+      def handle_push_delivered(sub)
+        settings.logger.info("Pushed to #{sub['device_type']}: #{sub['account']}")
+        return {status: 'delivered'}.to_json
+      end
+
+      def handle_push_gone(sub, result)
+        # Device token が無効化された（UNREGISTERED / BadDeviceToken 等）。
+        # Mastodon には 410 を返して subscription を destroy してもらい、
+        # relay 側の行も掃除する。
+        settings.database.unregister(sub['id'])
+        reason = result[:reason] || result[:status]
+        settings.logger.info("Subscription gone: #{sub['account']} (#{reason})")
+        status 410
+        return {status: 'gone', detail: result}.to_json
+      end
+
+      def handle_push_failed(result)
+        settings.logger.error("Push failed: #{result}")
+        status 502
+        return {status: 'failed', detail: result}.to_json
+      end
     end
 
     # Health check
@@ -88,53 +144,9 @@ module Relay
       # Mastodon 側に古い subscription が残り続ける）。
       halt 410, {error: 'Unknown push token'}.to_json unless sub
 
-      # Web Push ペイロードはそのまま転送（復号はクライアント側）。
-      # aes128gcm (RFC 8291) は salt / sender public key が body 先頭に
-      # 埋め込まれるため body と encoding だけで足りるが、レガシーの
-      # aesgcm は Crypto-Key / Encryption ヘッダに salt / dh 公開鍵が入る
-      # ため、両ヘッダも転送する（Misskey 一部フォークや旧 Mastodon 対応）。
-      raw_body = request.body.read
-      encoding = request.env['HTTP_CONTENT_ENCODING']
-      crypto_key = request.env['HTTP_CRYPTO_KEY']
-      encryption_header = request.env['HTTP_ENCRYPTION']
-
-      payload = {
-        'body' => Base64.strict_encode64(raw_body),
-        'encoding' => encoding.to_s,
-        'server' => sub['server'],
-        'account' => sub['account'],
-      }
-      payload['crypto_key'] = crypto_key if crypto_key
-      payload['encryption'] = encryption_header if encryption_header
-
-      result = case sub['device_type']
-               when 'ios'
-                 unless settings.respond_to?(:apns)
-                   halt 503,
-                     {error: 'APNs not configured'}.to_json
-                 end
-                 settings.apns.push(device_token: sub['token'], payload: payload)
-               when 'android'
-                 halt 503, {error: 'FCM not configured'}.to_json unless settings.respond_to?(:fcm)
-                 settings.fcm.push(device_token: sub['token'], payload: payload)
-      end
-
-      if result[:success]
-        settings.logger.info("Pushed to #{sub['device_type']}: #{sub['account']}")
-        {status: 'delivered'}.to_json
-      elsif result[:permanent]
-        # Device token が無効化された（UNREGISTERED / BadDeviceToken 等）。
-        # Mastodon には 410 を返して subscription を destroy してもらい、
-        # relay 側の行も掃除する。
-        settings.database.unregister(sub['id'])
-        settings.logger.info("Subscription gone: #{sub['account']} (#{result[:reason] || result[:status]})")
-        status 410
-        {status: 'gone', detail: result}.to_json
-      else
-        settings.logger.error("Push failed: #{result}")
-        status 502
-        {status: 'failed', detail: result}.to_json
-      end
+      payload = build_push_payload(sub)
+      result = dispatch_push(sub, payload)
+      handle_push_result(sub, result)
     end
   end
 end

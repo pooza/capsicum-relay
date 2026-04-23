@@ -15,14 +15,33 @@ module Relay
         key_id: config['apns']['key_id'],
         team_id: config['apns']['team_id'],
       }
-      @connection = if config['apns']['sandbox']
-        Apnotic::Connection.development(options)
+      if config['apns']['sandbox']
+        @connection = Apnotic::Connection.development(options)
       else
-        Apnotic::Connection.new(options)
+        @connection = Apnotic::Connection.new(options)
       end
     end
 
     def push(device_token:, payload:)
+      response = @connection.push(build_notification(device_token, payload))
+      return {success: true, id: response.headers['apns-id']} if response&.ok?
+
+      reason = response&.body&.dig('reason')
+      return {
+        success: false,
+        status: response&.status,
+        reason: reason,
+        permanent: PERMANENT_REASONS.include?(reason),
+      }
+    end
+
+    def close
+      return @connection&.close
+    end
+
+    private
+
+    def build_notification(device_token, payload)
       notification = Apnotic::Notification.new(device_token)
       notification.topic = @config['apns']['bundle_id']
       notification.alert = {
@@ -33,24 +52,7 @@ module Relay
       notification.mutable_content = true
       notification.custom_payload = payload
       notification.push_type = 'alert'
-
-      response = @connection.push(notification)
-
-      if response&.ok?
-        {success: true, id: response.headers['apns-id']}
-      else
-        reason = response&.body&.dig('reason')
-        {
-          success: false,
-          status: response&.status,
-          reason: reason,
-          permanent: PERMANENT_REASONS.include?(reason),
-        }
-      end
-    end
-
-    def close
-      @connection&.close
+      return notification
     end
   end
 end

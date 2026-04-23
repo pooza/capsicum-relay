@@ -62,6 +62,10 @@ Metrics/AbcSize:
   Exclude:
     - test/**/*
   Max: 30
+Metrics/BlockLength:
+  AllowedMethods:
+    - configure
+    - helpers
 Metrics/ClassLength:
   Exclude:
   Max: 200

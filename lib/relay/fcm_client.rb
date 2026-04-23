@@ -22,6 +22,23 @@ module Relay
 
     def push(device_token:, payload:)
       uri = URI(FCM_ENDPOINT % @project_id)
+      response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) do |http|
+        http.request(build_request(uri, device_token, payload))
+      end
+      if response.is_a?(Net::HTTPSuccess)
+        return {success: true, name: JSON.parse(response.body)['name']}
+      end
+      return {
+        success: false,
+        status: response.code,
+        body: response.body,
+        permanent: permanent_failure?(response),
+      }
+    end
+
+    private
+
+    def build_request(uri, device_token, payload)
       request = Net::HTTP::Post.new(uri)
       request['Authorization'] = "Bearer #{access_token}"
       request['Content-Type'] = 'application/json'
@@ -35,28 +52,12 @@ module Relay
           data: payload,
         },
       }.to_json
-
-      response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) do |http|
-        http.request(request)
-      end
-
-      if response.is_a?(Net::HTTPSuccess)
-        {success: true, name: JSON.parse(response.body)['name']}
-      else
-        {
-          success: false,
-          status: response.code,
-          body: response.body,
-          permanent: permanent_failure?(response),
-        }
-      end
+      return request
     end
-
-    private
 
     def access_token
       @authorizer.fetch_access_token!
-      @authorizer.access_token
+      return @authorizer.access_token
     end
 
     def permanent_failure?(response)
@@ -64,9 +65,9 @@ module Relay
 
       body = JSON.parse(response.body)
       error_codes = body.dig('error', 'details')&.flat_map {|d| d['errorCode']}&.compact || []
-      PERMANENT_ERROR_CODES.any? {|code| error_codes.include?(code)}
+      return PERMANENT_ERROR_CODES.any? {|code| error_codes.include?(code)}
     rescue JSON::ParserError
-      false
+      return false
     end
   end
 end
