@@ -68,7 +68,7 @@ module Relay
         server: json_body['server'],
       )
 
-      settings.logger.info("Registered: #{sub['account']}@#{sub['server']} (#{sub['device_type']})")
+      settings.logger.info("Registered: #{sub['account']} (#{sub['device_type']})")
       status 201
       sub.to_json
     end
@@ -80,7 +80,7 @@ module Relay
       sub = settings.database.unregister(params[:id].to_i)
       halt 404, { error: 'Not found' }.to_json unless sub
 
-      settings.logger.info("Unregistered: #{sub['account']}@#{sub['server']}")
+      settings.logger.info("Unregistered: #{sub['account']}")
       sub.to_json
     end
 
@@ -121,14 +121,14 @@ module Relay
                end
 
       if result[:success]
-        settings.logger.info("Pushed to #{sub['device_type']}: #{sub['account']}@#{sub['server']}")
+        settings.logger.info("Pushed to #{sub['device_type']}: #{sub['account']}")
         { status: 'delivered' }.to_json
       elsif result[:permanent]
         # Device token が無効化された（UNREGISTERED / BadDeviceToken 等）。
         # Mastodon には 410 を返して subscription を destroy してもらい、
         # relay 側の行も掃除する。
         settings.database.unregister(sub['id'])
-        settings.logger.info("Subscription gone: #{sub['account']}@#{sub['server']} (#{result[:reason] || result[:status]})")
+        settings.logger.info("Subscription gone: #{sub['account']} (#{result[:reason] || result[:status]})")
         status 410
         { status: 'gone', detail: result }.to_json
       else
