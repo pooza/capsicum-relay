@@ -5,23 +5,23 @@ require 'uri'
 
 module Relay
   class FcmClient
-    FCM_ENDPOINT = 'https://fcm.googleapis.com/v1/projects/%s/messages:send'
+    FCM_ENDPOINT = 'https://fcm.googleapis.com/v1/projects/%s/messages:send'.freeze
 
     # FCM が返す errorCode のうち「デバイストークン自体が無効」を示すもの。
     # INVALID_ARGUMENT は request 側のバグでも返るため含めない（誤削除回避）。
-    PERMANENT_ERROR_CODES = %w[UNREGISTERED SENDER_ID_MISMATCH].freeze
+    PERMANENT_ERROR_CODES = ['UNREGISTERED', 'SENDER_ID_MISMATCH'].freeze
 
     def initialize(config)
       @config = config
       @project_id = config['fcm']['project_id']
       @authorizer = Google::Auth::ServiceAccountCredentials.make_creds(
         json_key_io: File.open(config['fcm']['service_account_path']),
-        scope: 'https://www.googleapis.com/auth/firebase.messaging'
+        scope: 'https://www.googleapis.com/auth/firebase.messaging',
       )
     end
 
     def push(device_token:, payload:)
-      uri = URI(format(FCM_ENDPOINT, @project_id))
+      uri = URI(FCM_ENDPOINT % @project_id)
       request = Net::HTTP::Post.new(uri)
       request['Authorization'] = "Bearer #{access_token}"
       request['Content-Type'] = 'application/json'
@@ -41,7 +41,7 @@ module Relay
       end
 
       if response.is_a?(Net::HTTPSuccess)
-        { success: true, name: JSON.parse(response.body)['name'] }
+        {success: true, name: JSON.parse(response.body)['name']}
       else
         {
           success: false,
@@ -63,8 +63,8 @@ module Relay
       return true if response.code == '404'
 
       body = JSON.parse(response.body)
-      error_codes = body.dig('error', 'details')&.flat_map { |d| d['errorCode'] }&.compact || []
-      PERMANENT_ERROR_CODES.any? { |code| error_codes.include?(code) }
+      error_codes = body.dig('error', 'details')&.flat_map {|d| d['errorCode']}&.compact || []
+      PERMANENT_ERROR_CODES.any? {|code| error_codes.include?(code)}
     rescue JSON::ParserError
       false
     end

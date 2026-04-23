@@ -1,0 +1,141 @@
+plugins:
+  - rubocop-performance
+
+AllCops:
+  AllowSymlinksInCacheRootDirectory: true
+  DisplayCopNames: true
+  Exclude:
+    - '**/._*'
+    - '**/.git/**/*'
+    - config/**/*
+    - tmp/**/*
+    - '**/old/**/*'
+  Include:
+    - '**/*.rb'
+    - '**/Rakefile'
+    - '**/config.ru'
+  NewCops: enable
+  TargetRubyVersion: 4.0
+Layout/ArgumentAlignment:
+  EnforcedStyle: with_fixed_indentation
+Layout/ArrayAlignment:
+  EnforcedStyle: with_fixed_indentation
+Layout/EmptyLineAfterGuardClause:
+  Enabled: false
+Layout/EndAlignment:
+  EnforcedStyleAlignWith: variable
+Layout/EndOfLine:
+  EnforcedStyle: lf
+Layout/FirstArgumentIndentation:
+  EnforcedStyle: consistent
+Layout/FirstArrayElementIndentation:
+  EnforcedStyle: consistent
+Layout/FirstHashElementIndentation:
+  EnforcedStyle: consistent
+Layout/LineContinuationLeadingSpace:
+  EnforcedStyle: leading
+Layout/LineEndStringConcatenationIndentation:
+  EnforcedStyle: indented
+Layout/LineLength:
+  Exclude:
+    - test/**/*
+  Max: 100
+Layout/MultilineMethodCallIndentation:
+  EnforcedStyle: indented
+Layout/MultilineOperationIndentation:
+  EnforcedStyle: indented
+Layout/ParameterAlignment:
+  EnforcedStyle: with_fixed_indentation
+Layout/SpaceBeforeBlockBraces:
+  EnforcedStyle: space
+Layout/SpaceInsideBlockBraces:
+  EnforcedStyle: no_space
+  EnforcedStyleForEmptyBraces: no_space
+  SpaceBeforeBlockParameters: false
+Layout/SpaceInsideHashLiteralBraces:
+  EnforcedStyle: no_space
+Lint/AssignmentInCondition:
+  Enabled: false
+Lint/UnusedMethodArgument:
+  Enabled: false
+Metrics/AbcSize:
+  Exclude:
+    - test/**/*
+  Max: 30
+Metrics/BlockLength:
+  Exclude:
+    - test/**/*
+    - '**/contract/*'
+    - '**/controller/*'
+    - app/task/**/*.rb
+    - '*.gemspec'
+Metrics/ClassLength:
+  Exclude:
+    - test/**/*
+    - '**/contract/*'
+    - '**/controller/*'
+    - '**/service/*'
+  Max: 200
+Metrics/CyclomaticComplexity:
+  Exclude:
+    - test/**/*
+    - '**/contract/*'
+  Max: 10
+Metrics/MethodLength:
+  Exclude:
+    - test/**/*
+  Max: 20
+Metrics/ModuleLength:
+  Exclude:
+    - test/**/*
+    - '**/contract/*'
+    - '**/controller/*'
+    - '**/service/*'
+  Max: 200
+Metrics/PerceivedComplexity:
+  Exclude:
+    - test/**/*
+    - '**/contract/*'
+  Max: 10
+Naming/RescuedExceptionsVariableName:
+  PreferredName: e
+Style/AsciiComments:
+  Enabled: false
+Style/ConditionalAssignment:
+  Enabled: false
+Style/Documentation:
+  Enabled: false
+Style/EmptyMethod:
+  EnforcedStyle: expanded
+Style/FormatString:
+  EnforcedStyle: percent
+Style/FormatStringToken:
+  EnforcedStyle: template
+Style/FrozenStringLiteralComment:
+  Enabled: false
+Style/IdenticalConditionalBranches:
+  Exclude:
+    - test/**/*
+Style/IfUnlessModifier:
+  Exclude:
+    - test/**/*
+Style/RedundantReturn:
+  Enabled: false
+Style/RescueModifier:
+  Enabled: false
+Style/RescueStandardError:
+  Enabled: false
+Style/StringLiterals:
+  EnforcedStyle: single_quotes
+Style/SymbolArray:
+  EnforcedStyle: brackets
+Style/TrailingCommaInArguments:
+  EnforcedStyleForMultiline: comma
+Style/TrailingCommaInArrayLiteral:
+  EnforcedStyleForMultiline: comma
+Style/TrailingCommaInHashLiteral:
+  EnforcedStyleForMultiline: comma
+Style/WordArray:
+  EnforcedStyle: brackets
+Style/YodaCondition:
+  Enabled: false

@@ -15,12 +15,8 @@ module Relay
       set :database, Relay::Database.new
       set :logger, Logger.new($stdout)
 
-      if settings.config.dig('apns', 'key_path')
-        set :apns, Relay::ApnsClient.new(settings.config)
-      end
-      if settings.config.dig('fcm', 'project_id')
-        set :fcm, Relay::FcmClient.new(settings.config)
-      end
+      set :apns, Relay::ApnsClient.new(settings.config) if settings.config.dig('apns', 'key_path')
+      set :fcm, Relay::FcmClient.new(settings.config) if settings.config.dig('fcm', 'project_id')
     end
 
     before do
@@ -31,13 +27,13 @@ module Relay
       def authenticate!
         secret = settings.config['shared_secret']
         provided = request.env['HTTP_X_RELAY_SECRET']
-        halt 401, { error: 'Unauthorized' }.to_json unless provided == secret
+        halt 401, {error: 'Unauthorized'}.to_json unless provided == secret
       end
 
       def json_body
         @json_body ||= JSON.parse(request.body.read)
       rescue JSON::ParserError
-        halt 400, { error: 'Invalid JSON' }.to_json
+        halt 400, {error: 'Invalid JSON'}.to_json
       end
     end
 
@@ -53,12 +49,12 @@ module Relay
     post '/register' do
       authenticate!
 
-      required = %w[token device_type account server]
-      missing = required.select { |k| json_body[k].nil? || json_body[k].empty? }
-      halt 400, { error: "Missing fields: #{missing.join(', ')}" }.to_json unless missing.empty?
+      required = ['token', 'device_type', 'account', 'server']
+      missing = required.select {|k| json_body[k].nil? || json_body[k].empty?}
+      halt 400, {error: "Missing fields: #{missing.join(', ')}"}.to_json unless missing.empty?
 
-      unless %w[ios android].include?(json_body['device_type'])
-        halt 400, { error: 'device_type must be ios or android' }.to_json
+      unless ['ios', 'android'].include?(json_body['device_type'])
+        halt 400, {error: 'device_type must be ios or android'}.to_json
       end
 
       sub = settings.database.register(
@@ -78,7 +74,7 @@ module Relay
       authenticate!
 
       sub = settings.database.unregister(params[:id].to_i)
-      halt 404, { error: 'Not found' }.to_json unless sub
+      halt 404, {error: 'Not found'}.to_json unless sub
 
       settings.logger.info("Unregistered: #{sub['account']}")
       sub.to_json
@@ -90,7 +86,7 @@ module Relay
       # Mastodon は 410 Gone で subscription を自動 destroy するため、
       # 見つからない push_token は stale と見なして 410 で返す（404 だと
       # Mastodon 側に古い subscription が残り続ける）。
-      halt 410, { error: 'Unknown push token' }.to_json unless sub
+      halt 410, {error: 'Unknown push token'}.to_json unless sub
 
       # Web Push ペイロードはそのまま転送（復号はクライアント側）。
       # aes128gcm (RFC 8291) は salt / sender public key が body 先頭に
@@ -113,16 +109,19 @@ module Relay
 
       result = case sub['device_type']
                when 'ios'
-                 halt 503, { error: 'APNs not configured' }.to_json unless settings.respond_to?(:apns)
+                 unless settings.respond_to?(:apns)
+                   halt 503,
+                     {error: 'APNs not configured'}.to_json
+                 end
                  settings.apns.push(device_token: sub['token'], payload: payload)
                when 'android'
-                 halt 503, { error: 'FCM not configured' }.to_json unless settings.respond_to?(:fcm)
+                 halt 503, {error: 'FCM not configured'}.to_json unless settings.respond_to?(:fcm)
                  settings.fcm.push(device_token: sub['token'], payload: payload)
-               end
+      end
 
       if result[:success]
         settings.logger.info("Pushed to #{sub['device_type']}: #{sub['account']}")
-        { status: 'delivered' }.to_json
+        {status: 'delivered'}.to_json
       elsif result[:permanent]
         # Device token が無効化された（UNREGISTERED / BadDeviceToken 等）。
         # Mastodon には 410 を返して subscription を destroy してもらい、
@@ -130,11 +129,11 @@ module Relay
         settings.database.unregister(sub['id'])
         settings.logger.info("Subscription gone: #{sub['account']} (#{result[:reason] || result[:status]})")
         status 410
-        { status: 'gone', detail: result }.to_json
+        {status: 'gone', detail: result}.to_json
       else
         settings.logger.error("Push failed: #{result}")
         status 502
-        { status: 'failed', detail: result }.to_json
+        {status: 'failed', detail: result}.to_json
       end
     end
   end

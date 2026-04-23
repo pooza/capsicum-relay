@@ -45,7 +45,7 @@ module Relay
     def find_by_composite(token, account, server)
       @db.execute(
         'SELECT * FROM subscriptions WHERE token = ? AND account = ? AND server = ?',
-        [token, account, server]
+        [token, account, server],
       ).first
     end
 
@@ -67,7 +67,7 @@ module Relay
 
     def migrate!
       existing = @db.execute(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'subscriptions'"
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'subscriptions'",
       ).first
 
       if existing.nil?
