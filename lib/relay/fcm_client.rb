@@ -42,14 +42,19 @@ module Relay
       request = Net::HTTP::Post.new(uri)
       request['Authorization'] = "Bearer #{access_token}"
       request['Content-Type'] = 'application/json'
+      # data-only メッセージ。capsicum 側で RFC 8291 復号して通知内容を個別化
+      # するため notification フィールドは付けない（付けると OS がバックグラウンド
+      # 時に通知ブロックを直接描画してしまい、アプリ側の復号ハンドラが発火
+      # する前に「${account} に通知があります」が出る）。
+      # Android は data-only で priority 未指定だと遅延配信になりうるので
+      # HIGH を明示する。
       request.body = {
         message: {
           token: device_token,
-          notification: {
-            title: 'capsicum',
-            body: "#{payload['account']} に通知があります",
+          data: payload.transform_values(&:to_s),
+          android: {
+            priority: 'HIGH',
           },
-          data: payload,
         },
       }.to_json
       return request
