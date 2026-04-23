@@ -1,6 +1,6 @@
 source 'https://rubygems.org'
 
-ruby '>= 3.2'
+ruby '~> 4.0.2'
 
 # Web framework
 gem 'sinatra'
@@ -32,4 +32,5 @@ gem 'yaml'
 
 group :development do
   gem 'rubocop'
+  gem 'rubocop-performance'
 end
