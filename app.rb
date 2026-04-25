@@ -64,6 +64,19 @@ module Relay
         end
       end
 
+      def log_push_received(sub)
+        # 各サーバーがどの暗号化形式で送ってくるかを diagnose できるよう、
+        # Content-Encoding と関連ヘッダの有無をログに残す (#5)。機密情報は
+        # 含まないため常時出力。capsicum 側の復号 (#336) 検証時に役立つ。
+        encoding = request.env['HTTP_CONTENT_ENCODING'].to_s
+        crypto_key = request.env['HTTP_CRYPTO_KEY'] ? '+ck' : ''
+        encryption = request.env['HTTP_ENCRYPTION'] ? '+enc' : ''
+        settings.logger.info(
+          "Received push: #{sub['account']} (#{sub['device_type']}," \
+            " encoding=#{encoding.inspect}#{crypto_key}#{encryption})",
+        )
+      end
+
       def handle_push_result(sub, result)
         return handle_push_delivered(sub) if result[:success]
         return handle_push_gone(sub, result) if result[:permanent]
@@ -144,6 +157,7 @@ module Relay
       # Mastodon 側に古い subscription が残り続ける）。
       halt 410, {error: 'Unknown push token'}.to_json unless sub
 
+      log_push_received(sub)
       payload = build_push_payload(sub)
       result = dispatch_push(sub, payload)
       handle_push_result(sub, result)
