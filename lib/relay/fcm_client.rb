@@ -33,6 +33,7 @@ module Relay
         status: response.code,
         body: response.body,
         permanent: permanent_failure?(response),
+        oversized: oversized_payload?(response),
       }
     end
 
@@ -71,6 +72,21 @@ module Relay
       body = JSON.parse(response.body)
       error_codes = body.dig('error', 'details')&.flat_map {|d| d['errorCode']}&.compact || []
       return PERMANENT_ERROR_CODES.any? {|code| error_codes.include?(code)}
+    rescue JSON::ParserError
+      return false
+    end
+
+    # FCM data message は 4KB 制限。超過すると INVALID_ARGUMENT 400 +
+    # "Android message is too big" が返るが、INVALID_ARGUMENT 全体を permanent
+    # にすると request 側のバグまで unregister してしまうため、メッセージ
+    # 文字列で限定マッチして oversized フラグを立てる (#9)。oversized は
+    # subscription を残したまま該当通知だけドロップする app 側ハンドラで処理する。
+    def oversized_payload?(response)
+      return false unless response.code == '400'
+
+      body = JSON.parse(response.body)
+      message = body.dig('error', 'message').to_s
+      return message.include?('message is too big')
     rescue JSON::ParserError
       return false
     end
