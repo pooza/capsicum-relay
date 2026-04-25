@@ -15,7 +15,9 @@ module Relay
       set :database, Relay::Database.new
       set :logger, Logger.new($stdout)
 
-      set :apns, Relay::ApnsClient.new(settings.config) if settings.config.dig('apns', 'key_path')
+      if settings.config.dig('apns', 'key_path')
+        set :apns, Relay::ApnsClient.new(settings.config, logger: settings.logger)
+      end
       set :fcm, Relay::FcmClient.new(settings.config) if settings.config.dig('fcm', 'project_id')
     end
 
