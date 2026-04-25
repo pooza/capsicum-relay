@@ -79,6 +79,7 @@ module Relay
 
       def handle_push_result(sub, result)
         return handle_push_delivered(sub) if result[:success]
+        return handle_push_oversized(sub, result) if result[:oversized]
         return handle_push_gone(sub, result) if result[:permanent]
         return handle_push_failed(result)
       end
@@ -97,6 +98,19 @@ module Relay
         settings.logger.info("Subscription gone: #{sub['account']} (#{reason})")
         status 410
         return {status: 'gone', detail: result}.to_json
+      end
+
+      def handle_push_oversized(sub, result)
+        # FCM (4KB) / APNs (4KB) のペイロード上限を超えた個別メッセージ。
+        # subscription は健全なので unregister せず、Mastodon にも 413 を
+        # 返してこの 1 通だけドロップさせる。permanent: false のままだと
+        # Mastodon が retry を続けてログを汚すため、ここで明示的に止める (#9)。
+        settings.logger.warn(
+          "Push oversized (subscription kept): #{sub['account']}" \
+            " (#{sub['device_type']}): #{result}",
+        )
+        status 413
+        return {status: 'oversized', detail: result}.to_json
       end
 
       def handle_push_failed(result)
