@@ -57,7 +57,7 @@ module Relay
     end
 
     def poll_server(server)
-      announcements = fetch_mastodon_announcements(server)
+      announcements = fetch_announcements(server)
       announcements.each do |announcement|
         id = announcement['id'].to_s
         next if id.empty?
@@ -70,12 +70,14 @@ module Relay
       report_error("poll_server(#{server})", e)
     end
 
-    # Mastodon: GET https://{server}/api/v1/announcements?with_dismissed=true
-    # 認証不要 public endpoint。空配列 / 404 / parse error はすべて空扱いに。
-    # Misskey サーバーは Phase 3 で対応するため Phase 2 では 404 で空配列に
-    # 落ちる (副作用なし)。
-    def fetch_mastodon_announcements(server)
-      uri = URI("https://#{server}/api/v1/announcements?with_dismissed=true")
+    # モロヘイヤの公開キャッシュ endpoint (mulukhiya-toot-proxy#4355) を polling。
+    # SNS の announcement API は認証必須なため capsicum-relay からは叩けず、モロ
+    # ヘイヤが既に info_agent_service で fetch + Redis キャッシュ済みのデータを
+    # 経由する。features.announcement_push: true を返す mulukhiya 5.24.0+ で有効。
+    # Mastodon / Misskey 両方とも `id` / `content` フィールドを持つため、正規化は
+    # published_at (Mastodon) / createdAt (Misskey) の差分吸収だけで済む。
+    def fetch_announcements(server)
+      uri = URI("https://#{server}/mulukhiya/api/announcement/list")
       response = Net::HTTP.start(uri.hostname, uri.port,
         use_ssl: true,
         open_timeout: REQUEST_TIMEOUT,
@@ -85,12 +87,24 @@ module Relay
       return [] unless response.is_a?(Net::HTTPSuccess)
 
       parsed = JSON.parse(response.body)
-      return parsed.is_a?(Array) ? parsed : []
+      return [] unless parsed.is_a?(Array)
+      return parsed.map {|item| normalize_announcement(item)}
     rescue StandardError => e
       @logger.warn(
-        "fetch_mastodon_announcements(#{server}) failed: #{e.class}: #{e.message}",
+        "fetch_announcements(#{server}) failed: #{e.class}: #{e.message}",
       )
       return []
+    end
+
+    # モロヘイヤ /announcement/list は Mastodon は content + published_at、
+    # Misskey は content + createdAt の shape で返す。downstream で扱いやすい
+    # 統一 shape に揃える。
+    def normalize_announcement(item)
+      return {
+        'id' => item['id'],
+        'content' => item['content'].to_s,
+        'published_at' => (item['published_at'] || item['createdAt']).to_s,
+      }
     end
 
     def dispatch_push(server, announcement)
