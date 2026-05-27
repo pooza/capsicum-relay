@@ -109,6 +109,40 @@ module Relay
       return @db.get_first_value('SELECT COUNT(*) FROM announcement_subscriptions')
     end
 
+    # announcement polling worker (capsicum-relay#14 Phase 2) 用。subscription が
+    # 1 件でもある server のみ poll 対象にする。
+    def announcement_servers
+      return @db.execute(<<~SQL).map {|row| row['server']}
+        SELECT DISTINCT server FROM announcement_subscriptions
+      SQL
+    end
+
+    # server に紐づく subscription を、push 発火に必要な device_type / token と
+    # 一緒に取得する (subscriptions を JOIN)。
+    def announcement_subscriptions_for_server(server)
+      return @db.execute(<<~SQL, [server])
+        SELECT a.id AS announcement_subscription_id, a.server, a.account,
+               s.id AS subscription_id, s.token, s.device_type, s.push_token
+        FROM announcement_subscriptions a
+        JOIN subscriptions s ON a.push_token = s.push_token
+        WHERE a.server = ?
+      SQL
+    end
+
+    def announcement_seen?(server, announcement_id)
+      return @db.get_first_value(<<~SQL, [server, announcement_id.to_s]).to_i.positive?
+        SELECT COUNT(*) FROM seen_announcements
+        WHERE server = ? AND announcement_id = ?
+      SQL
+    end
+
+    def mark_announcement_seen(server, announcement_id)
+      @db.execute(<<~SQL, [server, announcement_id.to_s])
+        INSERT OR IGNORE INTO seen_announcements (server, announcement_id, seen_at)
+        VALUES (?, ?, datetime('now'))
+      SQL
+    end
+
     private
 
     def migrate!

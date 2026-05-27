@@ -5,6 +5,7 @@ require 'yaml'
 require_relative 'lib/relay/database'
 require_relative 'lib/relay/apns_client'
 require_relative 'lib/relay/fcm_client'
+require_relative 'lib/relay/announcement_worker'
 require_relative 'lib/relay/sentry_setup'
 
 Relay::SentrySetup.init!
@@ -24,6 +25,20 @@ module Relay
         set :apns, Relay::ApnsClient.new(settings.config, logger: settings.logger)
       end
       set :fcm, Relay::FcmClient.new(settings.config) if settings.config.dig('fcm', 'project_id')
+
+      # capsicum-relay#14 Phase 2: announcement polling worker。
+      # interval が 0 / negative なら無効化 (テスト時等)。
+      interval = settings.config.dig('announcement', 'poll_interval')
+      if interval.nil? || interval.to_i.positive?
+        set :announcement_worker, Relay::AnnouncementWorker.new(
+          database: settings.database,
+          logger: settings.logger,
+          apns: (settings.respond_to?(:apns) ? settings.apns : nil),
+          fcm: (settings.respond_to?(:fcm) ? settings.fcm : nil),
+          interval: interval&.to_i || Relay::AnnouncementWorker::DEFAULT_INTERVAL,
+        )
+        settings.announcement_worker.start!
+      end
     end
 
     before do

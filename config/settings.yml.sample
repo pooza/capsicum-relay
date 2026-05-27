@@ -17,3 +17,8 @@ apns:
 fcm:
   project_id: "capsicum-xxxxx"
   service_account_path: "/path/to/service-account.json"
+
+# お知らせ通知 push (capsicum-relay#14)
+# poll_interval を 0 にすると polling worker を無効化 (テスト用)
+announcement:
+  poll_interval: 60

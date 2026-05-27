@@ -28,8 +28,8 @@ module Relay
       register_error_callback(@connection)
     end
 
-    def push(device_token:, payload:)
-      response = @connection.push(build_notification(device_token, payload))
+    def push(device_token:, payload:, alert: nil)
+      response = @connection.push(build_notification(device_token, payload, alert: alert))
       return {success: true, id: response.headers['apns-id']} if response&.ok?
 
       reason = response&.body&.dig('reason')
@@ -63,10 +63,10 @@ module Relay
       end
     end
 
-    def build_notification(device_token, payload)
+    def build_notification(device_token, payload, alert: nil)
       notification = Apnotic::Notification.new(device_token)
       notification.topic = @config['apns']['bundle_id']
-      notification.alert = {
+      notification.alert = alert || {
         title: 'capsicum',
         body: "#{payload['account']} に通知があります",
       }
