@@ -63,6 +63,52 @@ module Relay
       return @db.get_first_value('SELECT COUNT(*) FROM subscriptions')
     end
 
+    # お知らせ通知 (announcement push) の subscription 管理。capsicum#477 /
+    # capsicum-relay#14。subscriptions と外部キーで紐付き、subscription 解除
+    # 時にカスケード削除される。
+    def register_announcement_subscription(push_token:, server:, account:)
+      @db.execute(<<~SQL, [push_token, server, account])
+        INSERT INTO announcement_subscriptions
+          (push_token, server, account, created_at, updated_at)
+        VALUES (?, ?, ?, datetime('now'), datetime('now'))
+        ON CONFLICT(push_token, server, account) DO UPDATE SET
+          updated_at = datetime('now')
+      SQL
+      return find_announcement_subscription_by_composite(push_token, server, account)
+    end
+
+    def unregister_announcement_subscription(id)
+      sub = find_announcement_subscription(id)
+      return nil unless sub
+
+      @db.execute('DELETE FROM announcement_subscriptions WHERE id = ?', [id])
+      return sub
+    end
+
+    def find_announcement_subscription(id)
+      return @db.execute(
+        'SELECT * FROM announcement_subscriptions WHERE id = ?', [id]
+      ).first
+    end
+
+    def find_announcement_subscription_by_composite(push_token, server, account)
+      return @db.execute(<<~SQL, [push_token, server, account]).first
+        SELECT * FROM announcement_subscriptions
+        WHERE push_token = ? AND server = ? AND account = ?
+      SQL
+    end
+
+    def find_announcement_subscriptions_by_push_token(push_token)
+      return @db.execute(
+        'SELECT * FROM announcement_subscriptions WHERE push_token = ?',
+        [push_token],
+      )
+    end
+
+    def announcement_subscription_count
+      return @db.get_first_value('SELECT COUNT(*) FROM announcement_subscriptions')
+    end
+
     private
 
     def migrate!
@@ -86,6 +132,47 @@ module Relay
       @db.execute(<<~SQL)
         CREATE INDEX IF NOT EXISTS idx_subscriptions_token
         ON subscriptions(token)
+      SQL
+
+      create_announcement_tables!
+    end
+
+    def create_announcement_tables!
+      create_announcement_subscriptions_table!
+      create_seen_announcements_table!
+    end
+
+    def create_announcement_subscriptions_table!
+      @db.execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS announcement_subscriptions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          push_token TEXT NOT NULL,
+          server TEXT NOT NULL,
+          account TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(push_token, server, account),
+          FOREIGN KEY (push_token) REFERENCES subscriptions(push_token) ON DELETE CASCADE
+        )
+      SQL
+      @db.execute(<<~SQL)
+        CREATE INDEX IF NOT EXISTS idx_announcement_subscriptions_server
+        ON announcement_subscriptions(server)
+      SQL
+      @db.execute(<<~SQL)
+        CREATE INDEX IF NOT EXISTS idx_announcement_subscriptions_push_token
+        ON announcement_subscriptions(push_token)
+      SQL
+    end
+
+    def create_seen_announcements_table!
+      @db.execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS seen_announcements (
+          server TEXT NOT NULL,
+          announcement_id TEXT NOT NULL,
+          seen_at TEXT NOT NULL,
+          PRIMARY KEY (server, announcement_id)
+        )
       SQL
     end
 

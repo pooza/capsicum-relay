@@ -127,6 +127,7 @@ module Relay
       {
         status: 'ok',
         subscriptions: settings.database.count,
+        announcement_subscriptions: settings.database.announcement_subscription_count,
       }.to_json
     end
 
@@ -163,6 +164,56 @@ module Relay
 
       settings.logger.info("Unregistered: #{sub['account']}")
       sub.to_json
+    end
+
+    # Register announcement push subscription (capsicum#477 / capsicum-relay#14)
+    post '/announcement_subscriptions' do
+      authenticate!
+
+      required = ['push_token', 'server', 'account']
+      missing = required.select {|k| json_body[k].nil? || json_body[k].empty?}
+      halt 400, {error: "Missing fields: #{missing.join(', ')}"}.to_json unless missing.empty?
+
+      # push_token は subscriptions テーブルに存在しなければ FK 制約で失敗する。
+      # 事前に存在確認して 404 を返す方が capsicum 側のエラーハンドリングが
+      # 簡潔になる。
+      parent = settings.database.find_by_push_token(json_body['push_token'])
+      halt 404, {error: 'Unknown push token'}.to_json unless parent
+
+      sub = settings.database.register_announcement_subscription(
+        push_token: json_body['push_token'],
+        server: json_body['server'],
+        account: json_body['account'],
+      )
+
+      settings.logger.info(
+        "Registered announcement: #{sub['account']}@#{sub['server']}",
+      )
+      status 201
+      sub.to_json
+    end
+
+    # Unregister announcement push subscription
+    delete '/announcement_subscriptions/:id' do
+      authenticate!
+
+      sub = settings.database.unregister_announcement_subscription(params[:id].to_i)
+      halt 404, {error: 'Not found'}.to_json unless sub
+
+      settings.logger.info(
+        "Unregistered announcement: #{sub['account']}@#{sub['server']}",
+      )
+      sub.to_json
+    end
+
+    # List announcement push subscriptions for a push token (state check)
+    get '/announcement_subscriptions/:push_token' do
+      authenticate!
+
+      subs = settings.database.find_announcement_subscriptions_by_push_token(
+        params[:push_token],
+      )
+      {subscriptions: subs}.to_json
     end
 
     # Receive Web Push from Mastodon / Misskey
