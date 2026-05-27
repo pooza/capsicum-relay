@@ -30,6 +30,9 @@ gem 'logger'
 # YAML config
 gem 'yaml'
 
+# エラーアラート (capsicum-relay#10)
+gem 'sentry-ruby'
+
 group :development do
   gem 'rubocop'
   gem 'rubocop-performance'

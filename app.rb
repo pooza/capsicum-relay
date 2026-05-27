@@ -5,10 +5,15 @@ require 'yaml'
 require_relative 'lib/relay/database'
 require_relative 'lib/relay/apns_client'
 require_relative 'lib/relay/fcm_client'
+require_relative 'lib/relay/sentry_setup'
+
+Relay::SentrySetup.init!
 
 module Relay
   class App < Sinatra::Base
     CONFIG_PATH = File.expand_path('config/settings.yml', __dir__)
+
+    use Sentry::Rack::CaptureExceptions if Relay::SentrySetup.enabled?
 
     configure do
       set :config, YAML.load_file(CONFIG_PATH)
