@@ -103,7 +103,20 @@ module Relay
         return handle_push_delivered(sub) if result[:success]
         return handle_push_oversized(sub, result) if result[:oversized]
         return handle_push_gone(sub, result) if result[:permanent]
-        return handle_push_failed(result)
+        return handle_push_failed(sub, result)
+      end
+
+      # Sentry に載せる push 失敗コンテキスト。token は部分マスクし、生のレスポンス
+      # body（FCM のエラー JSON 等）は status / reason に絞って送る (#10 Phase B/E)。
+      def push_context(sub, result)
+        {
+          device_type: sub['device_type'],
+          account: sub['account'],
+          server: sub['server'],
+          token: Relay::SentrySetup.mask_token(sub['token']),
+          status: result[:status],
+          reason: result[:reason],
+        }.compact
       end
 
       def handle_push_delivered(sub)
@@ -131,12 +144,27 @@ module Relay
           "Push oversized (subscription kept): #{sub['account']}" \
             " (#{sub['device_type']}): #{result}",
         )
+        # 健全な subscription を残したまま 1 通だけドロップする想定挙動だが、
+        # 多発は送信側のペイロード設計問題を示すので warning として件数観測する
+        # (#10 Phase B、#9 の後継観測)。
+        Relay::SentrySetup.capture_message(
+          "Push oversized dropped (#{sub['device_type']})",
+          level: :warning,
+          context: {push: push_context(sub, result)},
+        )
         status 413
         return {status: 'oversized', detail: result}.to_json
       end
 
-      def handle_push_failed(result)
+      def handle_push_failed(sub, result)
         settings.logger.error("Push failed: #{result}")
+        # 一過性でない送信失敗（APNs / FCM の 5xx 等）。低頻度・高インパクトなので
+        # journalctl 任せにせず Sentry で alert 駆動にする (#10 Phase B、#8 の後継観測)。
+        Relay::SentrySetup.capture_message(
+          "Push delivery failed (#{sub['device_type']})",
+          level: :error,
+          context: {push: push_context(sub, result)},
+        )
         status 502
         return {status: 'failed', detail: result}.to_json
       end
@@ -242,7 +270,17 @@ module Relay
       # Mastodon は 410 Gone で subscription を自動 destroy するため、
       # 見つからない push_token は stale と見なして 410 で返す（404 だと
       # Mastodon 側に古い subscription が残り続ける）。
-      halt 410, {error: 'Unknown push token'}.to_json unless sub
+      unless sub
+        # それ自体はエラーではない（stale subscription の自然な掃除）。同一
+        # リクエスト内で別の例外が捕捉された際の文脈として breadcrumb を残す
+        # に留める (#10 Phase D)。件数そのものの可視化は metrics (#2) 側で扱う。
+        Relay::SentrySetup.breadcrumb(
+          'Push for unknown token (410)',
+          category: 'push',
+          data: {push_token: Relay::SentrySetup.mask_token(params[:push_token])},
+        )
+        halt 410, {error: 'Unknown push token'}.to_json
+      end
 
       log_push_received(sub)
       payload = build_push_payload(sub)

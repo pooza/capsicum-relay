@@ -1,5 +1,6 @@
 require 'apnotic'
 require 'logger'
+require_relative 'sentry_setup'
 
 module Relay
   class ApnsClient
@@ -60,6 +61,9 @@ module Relay
         @logger.warn(
           "APNs connection error (background): #{error.class}: #{error.message}",
         )
+        # socket_loop スレッドの例外は Rack middleware の外（スレッド境界の先）で
+        # 起きるため、明示捕捉しないと Sentry に上がらない。#8 の本丸 (#10 Phase C)。
+        Relay::SentrySetup.capture_exception(error, context: {apns: {source: 'socket_loop'}})
       end
     end
 

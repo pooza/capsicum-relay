@@ -1,6 +1,7 @@
 require 'json'
 require 'net/http'
 require 'uri'
+require_relative 'sentry_setup'
 
 module Relay
   # お知らせ通知 (announcement push) の polling worker。capsicum-relay#14 Phase 2。
@@ -165,12 +166,9 @@ module Relay
       @logger.error(
         "AnnouncementWorker[#{context}]: #{error.class}: #{error.message}",
       )
-      return unless defined?(Sentry) && Sentry.initialized?
-
-      Sentry.with_scope do |scope|
-        scope.set_context('announcement_worker', {context: context})
-        Sentry.capture_exception(error)
-      end
+      Relay::SentrySetup.capture_exception(
+        error, context: {announcement_worker: {context: context}}
+      )
     end
   end
 end
