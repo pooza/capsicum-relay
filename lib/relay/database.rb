@@ -152,11 +152,21 @@ module Relay
 
       if existing.nil?
         create_subscriptions_table!
-      elsif !existing['sql'].include?('UNIQUE(token, account, server)')
-        # 旧スキーマ（UNIQUE(token) 単独）からの移行。1 デバイス = 1 行の
-        # 前提が崩れて N アカウント対応できないため、subscription-scoped に
-        # 組み替える。pooza/capsicum-relay#3。
-        migrate_to_subscription_scoped!
+      else
+        unless existing['sql'].include?('UNIQUE(token, account, server)')
+          # 旧スキーマ（UNIQUE(token) 単独）からの移行。1 デバイス = 1 行の
+          # 前提が崩れて N アカウント対応できないため、subscription-scoped に
+          # 組み替える。pooza/capsicum-relay#3。
+          migrate_to_subscription_scoped!
+        end
+        # device_type CHECK に 'macos' を足す移行 (capsicum#468)。SQLite は
+        # CHECK 制約の ALTER ができないためテーブルを組み替える。直前の
+        # subscription-scoped 移行が走った場合は新テーブルに既に 'macos' が
+        # 入っているので、最新スキーマを読み直して二重実行を避ける。
+        current = @db.execute(
+          "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'subscriptions'",
+        ).first
+        migrate_add_macos_device_type! unless current['sql'].include?("'macos'")
       end
 
       @db.execute(<<~SQL)
@@ -216,7 +226,7 @@ module Relay
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           token TEXT NOT NULL,
           push_token TEXT NOT NULL UNIQUE,
-          device_type TEXT NOT NULL CHECK(device_type IN ('ios', 'android')),
+          device_type TEXT NOT NULL CHECK(device_type IN ('ios', 'android', 'macos')),
           account TEXT NOT NULL,
           server TEXT NOT NULL,
           created_at TEXT NOT NULL,
@@ -239,6 +249,23 @@ module Relay
           SELECT id, token,
                  COALESCE(push_token, lower(hex(randomblob(32)))),
                  device_type, account, server, created_at, updated_at
+          FROM subscriptions_old
+        SQL
+        @db.execute('DROP TABLE subscriptions_old')
+      end
+    end
+
+    def migrate_add_macos_device_type!
+      # device_type CHECK に 'macos' を追加するためのテーブル組み替え
+      # (capsicum#468)。SQLite は CHECK の ALTER ができないため、新スキーマで
+      # 作り直して全行コピーする。subscription-scoped 移行と同じ手順。
+      @db.transaction do
+        @db.execute('ALTER TABLE subscriptions RENAME TO subscriptions_old')
+        create_subscriptions_table!
+        @db.execute(<<~SQL)
+          INSERT INTO subscriptions
+            (id, token, push_token, device_type, account, server, created_at, updated_at)
+          SELECT id, token, push_token, device_type, account, server, created_at, updated_at
           FROM subscriptions_old
         SQL
         @db.execute('DROP TABLE subscriptions_old')

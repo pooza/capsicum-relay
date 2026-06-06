@@ -83,6 +83,11 @@ module Relay
         when 'android'
           halt 503, {error: 'FCM not configured'}.to_json unless settings.respond_to?(:fcm)
           return settings.fcm.push(device_token: sub['token'], payload: payload)
+        when 'macos'
+          # macOS は iOS と同一 Bundle ID + 同一 APNs Auth Key で動くため
+          # iOS と同じ APNs クライアントに流す (capsicum#468)。
+          halt 503, {error: 'APNs not configured'}.to_json unless settings.respond_to?(:apns)
+          return settings.apns.push(device_token: sub['token'], payload: payload)
         end
       end
 
@@ -187,8 +192,8 @@ module Relay
       missing = required.select {|k| json_body[k].nil? || json_body[k].empty?}
       halt 400, {error: "Missing fields: #{missing.join(', ')}"}.to_json unless missing.empty?
 
-      unless ['ios', 'android'].include?(json_body['device_type'])
-        halt 400, {error: 'device_type must be ios or android'}.to_json
+      unless ['ios', 'android', 'macos'].include?(json_body['device_type'])
+        halt 400, {error: 'device_type must be ios, android or macos'}.to_json
       end
 
       sub = settings.database.register(
