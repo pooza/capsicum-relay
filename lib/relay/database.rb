@@ -199,6 +199,10 @@ module Relay
           FOREIGN KEY (push_token) REFERENCES subscriptions(push_token) ON DELETE CASCADE
         )
       SQL
+      # capsicum#468 リグレッションの自己修復。legacy_alter_table 未指定の
+      # subscriptions 組み替えを経た環境では FK が subscriptions_old を指したまま
+      # 壊れているので、正しい FK で作り直す（冪等。壊れていなければ何もしない）。
+      repair_announcement_subscriptions_fk!
       @db.execute(<<~SQL)
         CREATE INDEX IF NOT EXISTS idx_announcement_subscriptions_server
         ON announcement_subscriptions(server)
@@ -207,6 +211,51 @@ module Relay
         CREATE INDEX IF NOT EXISTS idx_announcement_subscriptions_push_token
         ON announcement_subscriptions(push_token)
       SQL
+    end
+
+    # capsicum#468 リグレッションの自己修復。announcement_subscriptions の FK が
+    # 存在しない subscriptions_old を参照している場合、正しい FK
+    # (subscriptions(push_token)) で作り直す。冪等で、壊れていなければ何もしない。
+    # 当テーブルを rename する際も legacy_alter_table=ON で FK の二次書き換えを
+    # 防ぐ（rebuild_subscriptions_table! と同じ理由）。
+    def repair_announcement_subscriptions_fk!
+      schema = @db.execute(<<~SQL).first
+        SELECT sql FROM sqlite_master
+        WHERE type = 'table' AND name = 'announcement_subscriptions'
+      SQL
+      return unless schema && schema['sql'].include?('subscriptions_old')
+
+      @db.execute('PRAGMA foreign_keys=OFF')
+      @db.execute('PRAGMA legacy_alter_table=ON')
+      begin
+        @db.transaction do
+          @db.execute(
+            'ALTER TABLE announcement_subscriptions RENAME TO announcement_subscriptions_broken',
+          )
+          @db.execute(<<~SQL)
+            CREATE TABLE announcement_subscriptions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              push_token TEXT NOT NULL,
+              server TEXT NOT NULL,
+              account TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE(push_token, server, account),
+              FOREIGN KEY (push_token) REFERENCES subscriptions(push_token) ON DELETE CASCADE
+            )
+          SQL
+          @db.execute(<<~SQL)
+            INSERT INTO announcement_subscriptions
+              (id, push_token, server, account, created_at, updated_at)
+            SELECT id, push_token, server, account, created_at, updated_at
+            FROM announcement_subscriptions_broken
+          SQL
+          @db.execute('DROP TABLE announcement_subscriptions_broken')
+        end
+      ensure
+        @db.execute('PRAGMA legacy_alter_table=OFF')
+        @db.execute('PRAGMA foreign_keys=ON')
+      end
     end
 
     def create_seen_announcements_table!
@@ -237,9 +286,7 @@ module Relay
     end
 
     def migrate_to_subscription_scoped!
-      @db.transaction do
-        @db.execute('ALTER TABLE subscriptions RENAME TO subscriptions_old')
-        create_subscriptions_table!
+      rebuild_subscriptions_table! do
         # 既存行は (device, account, server) のユニーク組（現スキーマ上
         # token UNIQUE なので 1:1 でコピー可能）。push_token は NULL 不許容に
         # 変わるため、万一 NULL のものがあれば埋める（運用上は 0 件想定）。
@@ -251,7 +298,6 @@ module Relay
                  device_type, account, server, created_at, updated_at
           FROM subscriptions_old
         SQL
-        @db.execute('DROP TABLE subscriptions_old')
       end
     end
 
@@ -259,16 +305,41 @@ module Relay
       # device_type CHECK に 'macos' を追加するためのテーブル組み替え
       # (capsicum#468)。SQLite は CHECK の ALTER ができないため、新スキーマで
       # 作り直して全行コピーする。subscription-scoped 移行と同じ手順。
-      @db.transaction do
-        @db.execute('ALTER TABLE subscriptions RENAME TO subscriptions_old')
-        create_subscriptions_table!
+      rebuild_subscriptions_table! do
         @db.execute(<<~SQL)
           INSERT INTO subscriptions
             (id, token, push_token, device_type, account, server, created_at, updated_at)
           SELECT id, token, push_token, device_type, account, server, created_at, updated_at
           FROM subscriptions_old
         SQL
-        @db.execute('DROP TABLE subscriptions_old')
+      end
+    end
+
+    # subscriptions テーブルの CHECK / UNIQUE 等 ALTER 不能な変更のための
+    # 組み替え共通処理。rename → 新スキーマ作成 → block でコピー → old drop。
+    #
+    # 子テーブル (announcement_subscriptions) が subscriptions(push_token) を FK
+    # 参照しているため、素朴に rename すると SQLite が子テーブルの FK 参照名を
+    # subscriptions_old へ自動書き換えし (legacy_alter_table OFF の既定動作)、
+    # subscriptions_old を drop した後に FK がダングリングして以後の
+    # announcement_subscriptions への INSERT が "no such table: subscriptions_old"
+    # で 500 になる (capsicum#468 で実際に発生・リグレッション)。
+    # legacy_alter_table=ON で rename を子テーブルに伝播させないことで防ぐ
+    # (SQLite 公式の table-rebuild 手順)。foreign_keys は transaction 内では
+    # 切り替えられないため transaction の外で OFF/ON する。
+    def rebuild_subscriptions_table!
+      @db.execute('PRAGMA foreign_keys=OFF')
+      @db.execute('PRAGMA legacy_alter_table=ON')
+      begin
+        @db.transaction do
+          @db.execute('ALTER TABLE subscriptions RENAME TO subscriptions_old')
+          create_subscriptions_table!
+          yield
+          @db.execute('DROP TABLE subscriptions_old')
+        end
+      ensure
+        @db.execute('PRAGMA legacy_alter_table=OFF')
+        @db.execute('PRAGMA foreign_keys=ON')
       end
     end
   end
