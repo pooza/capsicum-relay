@@ -8,8 +8,11 @@ module Relay
   #
   # announcement_subscriptions に登録された server を一定間隔で polling し、
   # 未送信の announcement を seen_announcements で dedup して APNs / FCM に
-  # 配信する。Mastodon `/api/v1/announcements` は認証不要 public endpoint な
-  # ので relay が直接観測できる。Misskey は Phase 3 で対応。
+  # 配信する。取得は各サーバーのモロヘイヤ公開キャッシュ
+  # `/mulukhiya/api/announcement/list` 経由（SNS の announcement API は認証
+  # 必須なため relay から直接は叩けない）。Mastodon / Misskey 両対応で、
+  # normalize_announcement が published_at / createdAt の差分を吸収する。
+  # 各サーバーの mulukhiya が features.announcement_push: true (5.24.0+) で有効。
   class AnnouncementWorker
     DEFAULT_INTERVAL = 60
     REQUEST_TIMEOUT = 10

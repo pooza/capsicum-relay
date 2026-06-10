@@ -239,9 +239,9 @@ module Relay
         account: json_body['account'],
       )
 
-      settings.logger.info(
-        "Registered announcement: #{sub['account']}@#{sub['server']}",
-      )
+      # account は既に user@host 形式なので server は付けない（@host が二重に
+      # 出るのを避ける）。push 登録ログ (handle_push_*) と表記を揃える。
+      settings.logger.info("Registered announcement: #{sub['account']} (#{sub['server']})")
       status 201
       sub.to_json
     end
