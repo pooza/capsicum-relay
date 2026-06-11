@@ -129,6 +129,38 @@ module Relay
       SQL
     end
 
+    # サポーター状態 (capsicum#596 / #18)。(account, server) 単位で 1 行。
+    # subscriptions とは独立（push 未登録の端末からも投げ銭は成立する）。
+    # tip_count は複数端末の合算で、再送による多少の過大計上を許容する近似値。
+    # バッジ判定は first_tipped_at の有無のみで行う。
+    def record_supporter_tip(account:, server:, sku: nil, tipped_at: nil, count: 1)
+      # tipped_at は ISO8601 を datetime() で正規化して保存する。
+      # datetime('now') と同じ 'YYYY-MM-DD HH:MM:SS' 形式に揃えないと、
+      # upsert の MIN() が文字列比較で破綻する。
+      @db.execute(<<~SQL, [account, server, tipped_at, count, sku])
+        INSERT INTO supporters
+          (account, server, first_tipped_at, tip_count, last_sku, created_at, updated_at)
+        VALUES (?, ?, COALESCE(datetime(?), datetime('now')), ?, ?, datetime('now'), datetime('now'))
+        ON CONFLICT(account, server) DO UPDATE SET
+          first_tipped_at = MIN(first_tipped_at, excluded.first_tipped_at),
+          tip_count = tip_count + excluded.tip_count,
+          last_sku = COALESCE(excluded.last_sku, last_sku),
+          updated_at = datetime('now')
+      SQL
+      return find_supporter(account: account, server: server)
+    end
+
+    def find_supporter(account:, server:)
+      return @db.execute(
+        'SELECT * FROM supporters WHERE account = ? AND server = ?',
+        [account, server],
+      ).first
+    end
+
+    def supporter_count
+      return @db.get_first_value('SELECT COUNT(*) FROM supporters')
+    end
+
     def announcement_seen?(server, announcement_id)
       return @db.get_first_value(<<~SQL, [server, announcement_id.to_s]).to_i.positive?
         SELECT COUNT(*) FROM seen_announcements
@@ -179,6 +211,26 @@ module Relay
       SQL
 
       create_announcement_tables!
+      create_supporters_table!
+    end
+
+    # サポーター状態 (capsicum#596 / #18)。将来の有償リレー利用権
+    # (capsicum#597) はこの account-keyed entitlement 行を課金判定に
+    # 格上げして再利用する想定。
+    def create_supporters_table!
+      @db.execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS supporters (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          account TEXT NOT NULL,
+          server TEXT NOT NULL,
+          first_tipped_at TEXT NOT NULL,
+          tip_count INTEGER NOT NULL DEFAULT 0,
+          last_sku TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(account, server)
+        )
+      SQL
     end
 
     def create_announcement_tables!
