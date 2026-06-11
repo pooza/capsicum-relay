@@ -6,6 +6,7 @@ require_relative 'lib/relay/database'
 require_relative 'lib/relay/apns_client'
 require_relative 'lib/relay/fcm_client'
 require_relative 'lib/relay/announcement_worker'
+require_relative 'lib/relay/push_dedup'
 require_relative 'lib/relay/sentry_setup'
 
 Relay::SentrySetup.init!
@@ -25,6 +26,13 @@ module Relay
         set :apns, Relay::ApnsClient.new(settings.config, logger: settings.logger)
       end
       set :fcm, Relay::FcmClient.new(settings.config) if settings.config.dig('fcm', 'project_id')
+
+      # 重複 push 抑止 (capsicum#692 / #16)。窓は ENV で調整可能、既定 1000ms。
+      # 観測された重複バーストの広がりは <500ms なので余裕を持たせつつ、別通知
+      # の誤マージを抑えるため過大にしない。0 以下なら無効化。
+      dedup_window = Integer(ENV.fetch('PUSH_DEDUP_WINDOW_MS', 1000))
+      set :push_dedup,
+        (dedup_window.positive? ? Relay::PushDedup.new(window_ms: dedup_window) : nil)
 
       # capsicum-relay#14 Phase 2: announcement polling worker。
       # interval が 0 / negative なら無効化 (テスト時等)。
@@ -98,9 +106,14 @@ module Relay
         encoding = request.env['HTTP_CONTENT_ENCODING'].to_s
         crypto_key = request.env['HTTP_CRYPTO_KEY'] ? '+ck' : ''
         encryption = request.env['HTTP_ENCRYPTION'] ? '+enc' : ''
+        # len / topic は dedup (#16) の判別材料の効きを後追いするための観測。
+        # 同一通知の重複バーストが同一 len かつ、別通知が別 len になっているかを
+        # ログで検証してから窓・キーを調整する。
+        topic = request.env['HTTP_TOPIC'] ? '+topic' : ''
         settings.logger.info(
           "Received push: #{sub['account']} (#{sub['device_type']}," \
-            " encoding=#{encoding.inspect}#{crypto_key}#{encryption})",
+            " encoding=#{encoding.inspect}#{crypto_key}#{encryption}" \
+            " len=#{request.content_length}#{topic})",
         )
       end
 
@@ -288,6 +301,23 @@ module Relay
       end
 
       log_push_received(sub)
+
+      # 上流の孤児購読蓄積による重複 push を抑止 (capsicum#692 / #16)。
+      # body を読まずに長さを得るため Content-Length を使う（build_push_payload
+      # の request.body.read と二重読みにならない）。
+      if settings.push_dedup&.duplicate?(
+        params[:push_token],
+        topic: request.env['HTTP_TOPIC'],
+        length: request.content_length,
+      )
+        settings.logger.info(
+          "Push deduped (#{sub['device_type']}): #{sub['account']}",
+        )
+        # 上流には配信成功として返す（4xx/5xx だと retry / subscription destroy
+        # を誘発しうるため）。
+        return {status: 'deduped'}.to_json
+      end
+
       payload = build_push_payload(sub)
       result = dispatch_push(sub, payload)
       handle_push_result(sub, result)
