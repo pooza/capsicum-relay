@@ -178,27 +178,11 @@ module Relay
     private
 
     def migrate!
-      existing = @db.execute(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'subscriptions'",
-      ).first
-
+      existing = subscriptions_schema
       if existing.nil?
         create_subscriptions_table!
       else
-        unless existing['sql'].include?('UNIQUE(token, account, server)')
-          # 旧スキーマ（UNIQUE(token) 単独）からの移行。1 デバイス = 1 行の
-          # 前提が崩れて N アカウント対応できないため、subscription-scoped に
-          # 組み替える。pooza/capsicum-relay#3。
-          migrate_to_subscription_scoped!
-        end
-        # device_type CHECK に 'macos' を足す移行 (capsicum#468)。SQLite は
-        # CHECK 制約の ALTER ができないためテーブルを組み替える。直前の
-        # subscription-scoped 移行が走った場合は新テーブルに既に 'macos' が
-        # 入っているので、最新スキーマを読み直して二重実行を避ける。
-        current = @db.execute(
-          "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'subscriptions'",
-        ).first
-        migrate_add_macos_device_type! unless current['sql'].include?("'macos'")
+        migrate_subscriptions!(existing)
       end
 
       @db.execute(<<~SQL)
@@ -212,6 +196,29 @@ module Relay
 
       create_announcement_tables!
       create_supporters_table!
+    end
+
+    def subscriptions_schema
+      return @db.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'subscriptions'",
+      ).first
+    end
+
+    # 既存 subscriptions テーブルへの段階的スキーマ移行。SQLite は UNIQUE / CHECK
+    # の ALTER ができないため、各移行はテーブル組み替え (rebuild_subscriptions_table!)
+    # で行う。各 migrate_* はスキーマを読み直してから走らせ、前段の組み替えが
+    # 最新スキーマを生成済みなら二重実行しない。
+    def migrate_subscriptions!(existing)
+      unless existing['sql'].include?('UNIQUE(token, account, server)')
+        # 旧スキーマ（UNIQUE(token) 単独）からの移行。1 デバイス = 1 行の
+        # 前提が崩れて N アカウント対応できないため、subscription-scoped に
+        # 組み替える。pooza/capsicum-relay#3。
+        migrate_to_subscription_scoped!
+      end
+      # device_type CHECK の enum 追加 (#468 macos / #474 windows)。最新スキーマで
+      # 作り直して全行コピー。前段が最新を生成済みならスキーマ判定で skip。
+      rebuild_with_all_rows! unless subscriptions_schema['sql'].include?("'macos'")
+      rebuild_with_all_rows! unless subscriptions_schema['sql'].include?("'windows'")
     end
 
     # サポーター状態 (capsicum#596 / #18)。将来の有償リレー利用権
@@ -327,7 +334,7 @@ module Relay
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           token TEXT NOT NULL,
           push_token TEXT NOT NULL UNIQUE,
-          device_type TEXT NOT NULL CHECK(device_type IN ('ios', 'android', 'macos')),
+          device_type TEXT NOT NULL CHECK(device_type IN ('ios', 'android', 'macos', 'windows')),
           account TEXT NOT NULL,
           server TEXT NOT NULL,
           created_at TEXT NOT NULL,
@@ -353,10 +360,9 @@ module Relay
       end
     end
 
-    def migrate_add_macos_device_type!
-      # device_type CHECK に 'macos' を追加するためのテーブル組み替え
-      # (capsicum#468)。SQLite は CHECK の ALTER ができないため、新スキーマで
-      # 作り直して全行コピーする。subscription-scoped 移行と同じ手順。
+    # device_type CHECK 拡張 (#468 macos / #474 windows) のための組み替え。最新
+    # スキーマで作り直し、旧テーブルの全行をそのままコピーする。
+    def rebuild_with_all_rows!
       rebuild_subscriptions_table! do
         @db.execute(<<~SQL)
           INSERT INTO subscriptions

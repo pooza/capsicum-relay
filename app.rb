@@ -5,6 +5,7 @@ require 'yaml'
 require_relative 'lib/relay/database'
 require_relative 'lib/relay/apns_client'
 require_relative 'lib/relay/fcm_client'
+require_relative 'lib/relay/wns_client'
 require_relative 'lib/relay/announcement_worker'
 require_relative 'lib/relay/push_dedup'
 require_relative 'lib/relay/sentry_setup'
@@ -26,6 +27,10 @@ module Relay
         set :apns, Relay::ApnsClient.new(settings.config, logger: settings.logger)
       end
       set :fcm, Relay::FcmClient.new(settings.config) if settings.config.dig('fcm', 'project_id')
+
+      if settings.config.dig('wns', 'package_sid')
+        set :wns, Relay::WnsClient.new(settings.config, logger: settings.logger)
+      end
 
       # 重複 push 抑止 (capsicum#692 / #16)。窓は ENV で調整可能、既定 1000ms。
       # 観測された重複バーストの広がりは <500ms なので余裕を持たせつつ、別通知
@@ -84,18 +89,25 @@ module Relay
       end
 
       def dispatch_push(sub, payload)
-        case sub['device_type']
-        when 'ios'
-          halt 503, {error: 'APNs not configured'}.to_json unless settings.respond_to?(:apns)
-          return settings.apns.push(device_token: sub['token'], payload: payload)
+        client, name = push_client_for(sub['device_type'])
+        halt 503, {error: "#{name} not configured"}.to_json unless client
+        return client.push(device_token: sub['token'], payload: payload)
+      end
+
+      # device_type ごとの送信クライアントと表示名を返す。各クライアントは
+      # push(device_token:, payload:) を共通 I/F に持つ。未設定なら client は nil。
+      def push_client_for(device_type)
+        case device_type
+        when 'ios', 'macos'
+          # macOS は iOS と同一 Bundle ID + 同一 APNs Auth Key で動くため、同じ
+          # APNs クライアントに流す (capsicum#468)。
+          [(settings.apns if settings.respond_to?(:apns)), 'APNs']
         when 'android'
-          halt 503, {error: 'FCM not configured'}.to_json unless settings.respond_to?(:fcm)
-          return settings.fcm.push(device_token: sub['token'], payload: payload)
-        when 'macos'
-          # macOS は iOS と同一 Bundle ID + 同一 APNs Auth Key で動くため
-          # iOS と同じ APNs クライアントに流す (capsicum#468)。
-          halt 503, {error: 'APNs not configured'}.to_json unless settings.respond_to?(:apns)
-          return settings.apns.push(device_token: sub['token'], payload: payload)
+          [(settings.fcm if settings.respond_to?(:fcm)), 'FCM']
+        when 'windows'
+          # Windows は WNS raw push。token は Channel URI。relay は暗号文を復号せず
+          # payload をそのまま転送し、bg task が復号する (capsicum#474)。
+          [(settings.wns if settings.respond_to?(:wns)), 'WNS']
         end
       end
 
@@ -206,8 +218,8 @@ module Relay
       missing = required.select {|k| json_body[k].nil? || json_body[k].empty?}
       halt 400, {error: "Missing fields: #{missing.join(', ')}"}.to_json unless missing.empty?
 
-      unless ['ios', 'android', 'macos'].include?(json_body['device_type'])
-        halt 400, {error: 'device_type must be ios, android or macos'}.to_json
+      unless ['ios', 'android', 'macos', 'windows'].include?(json_body['device_type'])
+        halt 400, {error: 'device_type must be ios, android, macos or windows'}.to_json
       end
 
       sub = settings.database.register(

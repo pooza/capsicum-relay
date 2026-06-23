@@ -18,6 +18,14 @@ fcm:
   project_id: "capsicum-xxxxx"
   service_account_path: "/path/to/service-account.json"
 
+# WNS (Windows) — capsicum#474
+# package_sid / client_secret は Microsoft Partner Center + Azure AD で発行する
+# Package SID（ms-app://S-1-15-...）と client secret（レガシー Package SID 方式）。
+# package_sid 未設定なら WNS クライアントは初期化されず、windows 宛 push は 503。
+wns:
+  package_sid: "ms-app://S-1-15-2-..."
+  client_secret: "CHANGE_ME"
+
 # お知らせ通知 push (capsicum-relay#14)
 # poll_interval を 0 にすると polling worker を無効化 (テスト用)
 announcement:
