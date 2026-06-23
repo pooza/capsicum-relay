@@ -130,7 +130,7 @@ module Relay
       end
 
       def handle_push_result(sub, result)
-        return handle_push_delivered(sub) if result[:success]
+        return handle_push_delivered(sub, result) if result[:success]
         return handle_push_oversized(sub, result) if result[:oversized]
         return handle_push_gone(sub, result) if result[:permanent]
         return handle_push_failed(sub, result)
@@ -149,7 +149,25 @@ module Relay
         }.compact
       end
 
-      def handle_push_delivered(sub)
+      def handle_push_delivered(sub, result = {})
+        # WNS は HTTP 200 でも X-WNS-NotificationStatus が received 以外
+        # （dropped: 端末オフライン等で破棄 / channelthrottled: 送信過多で抑制）の
+        # ことがある。配信は受理扱い（success）だが実質的な不達なので、多発を
+        # 検知できるよう warning として件数観測する。WNS 固有の静かな失敗モードで、
+        # ここを観測しないと Windows push 不達の切り分けで効かない (#474 レビュー)。
+        wns_status = result[:wns_status]
+        if wns_status && wns_status != 'received'
+          settings.logger.warn(
+            "WNS delivered but #{wns_status}: #{sub['account']}",
+          )
+          Relay::SentrySetup.capture_message(
+            "WNS notification #{wns_status} (windows)",
+            level: :warning,
+            context: {push: push_context(sub, result).merge(wns_status: wns_status)},
+          )
+          return {status: 'delivered', wns_status: wns_status}.to_json
+        end
+
         settings.logger.info("Pushed to #{sub['device_type']}: #{sub['account']}")
         return {status: 'delivered'}.to_json
       end
