@@ -228,6 +228,44 @@ module Relay
       }.to_json
     end
 
+    # Android App Links 用 Digital Asset Links (capsicum#276)。
+    # capsicum の OAuth callback を検証済み App Link (HTTPS) で受けるためのアンカー。
+    # capsicum.shrieker.net (GitHub Pages) は古い検証キャッシュが居座るため、
+    # キャッシュの無い relay 側で配信する。Play App Signing 証明書 (Play 配信) と
+    # upload 証明書 (直配ビルド) の両方を登録する。
+    get '/.well-known/assetlinks.json' do
+      content_type 'application/json'
+      [
+        {
+          relation: ['delegate_permission/common.handle_all_urls'],
+          target: {
+            namespace: 'android_app',
+            package_name: 'net.shrieker.capsicum',
+            sha256_cert_fingerprints: [
+              '96:DF:E2:0F:A7:60:74:16:05:B7:11:64:5F:8A:42:9D:9A:A5:B9:C2:92:95:07:54:C9:B6:5A:06:ED:EE:DA:F2',
+              '22:B1:58:32:9F:03:D7:0D:42:EB:3D:91:B1:3B:DA:99:F5:5F:0D:69:7F:0B:0B:53:F4:69:65:69:4B:18:1E:F0',
+            ],
+          },
+        },
+      ].to_json
+    end
+
+    # OAuth callback の着地ページ (capsicum#276)。
+    # App Link 検証が効いた端末では Android が手前で横取りするのでこのページは
+    # 表示されない。万一 autoVerify が効かない端末でも、生 404 でなく案内を出す。
+    get '/oauth/callback' do
+      content_type :html
+      <<~HTML
+        <!doctype html><html lang="ja"><head><meta charset="utf-8">
+        <meta name="viewport" content="width=device-width,initial-scale=1">
+        <title>capsicum ログイン</title></head>
+        <body style="font-family:sans-serif;text-align:center;padding:2em;line-height:1.7">
+        <h1>capsicum</h1>
+        <p>ログイン情報を受け取りました。<br>capsicum アプリに戻ってください。</p>
+        </body></html>
+      HTML
+    end
+
     # Register device token
     post '/register' do
       authenticate!
