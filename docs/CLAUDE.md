@@ -157,6 +157,38 @@ curl https://relay.capsicum.shrieker.net/health
 # => {"status":"ok","subscriptions":N}
 ```
 
+### 配信不達の切り分け（journald を読む）
+
+「プッシュが届かない」を疑ったとき、**Sentry のイベント数だけで判定してはいけない**。flauros の journald には成功も失敗も残っているので、必ず突き合わせる。
+
+#### なぜ Sentry だけでは足りないか
+
+- relay が Sentry へ上げているのは**失敗側だけ**。成功は `logger.info` にしか出ない（`Pushed to <device_type>: <account>`）ので、Sentry を見ると失敗だけが並び、母数が見えない
+- WNS の `dropped` は**端末がオフライン / スリープで受け取れなかった**という正常系。PC を消している時間が長い利用者ほど積み上がるので、件数の多さは不具合の証拠にならない
+- capsicum 側の `push.wns_bgtask: bgtask.shown` は、bg task が LocalState に書いた記録を**次回アプリ起動時に**回収して送る方式。**「出ていない ＝ トーストが出ていない」ではない**（アプリを起動していないだけ）
+
+#### 手順
+
+```bash
+ssh deploy@flauros.b-shock.co.jp
+journalctl -u capsicum-relay --no-pager --since "-14 days" -o short-iso \
+  | grep -E "Pushed to windows:|WNS delivered but dropped:"
+```
+
+`Pushed to <device_type>:` が成功、`WNS delivered but dropped:` が drop。アカウント別に数えて成功率を出し、さらに**時刻（JST）別の分布**を見る。
+
+#### 判定基準
+
+| 観測 | 読み方 |
+| --- | --- |
+| 成功が特定の時間帯に集中し、それ以外は drop 一色 | **端末の電源パターン**。正常 |
+| 全時間帯に成功が分散している | 常時通電の端末。正常 |
+| 成功が 1 件も無い | ここで初めて端末側（bgtask 登録・チャンネル失効）を疑う |
+
+成功率そのものは端末間で大きく開く（実測で 11%〜84%）が、**差の正体は「PC がついている時間の長さ」**であって端末の健全性ではない。低い成功率だけを見て不具合と判断しないこと。
+
+journald は 2026-04-17（サービス開始時）から全期間残っている。経緯は [pooza/capsicum#931](https://github.com/pooza/capsicum/issues/931)。
+
 ## ディレクトリ構成
 
 ```text
