@@ -255,14 +255,20 @@ module Relay
         halt 400, {error: 'device_type must be ios, android, macos or windows'}.to_json
       end
 
+      # device_id は任意。送ってこない旧クライアントは従来どおり token をキーに
+      # 登録される (#15 / capsicum#932)。
       sub = settings.database.register(
         token: json_body['token'],
         device_type: json_body['device_type'],
         account: json_body['account'],
         server: json_body['server'],
+        device_id: json_body['device_id'],
       )
 
-      settings.logger.info("Registered: #{sub['account']} (#{sub['device_type']})")
+      settings.logger.info(
+        "Registered: #{sub['account']} (#{sub['device_type']}," \
+          " device_id=#{sub['device_id'] ? 'yes' : 'none'})",
+      )
       status 201
       sub.to_json
     end
