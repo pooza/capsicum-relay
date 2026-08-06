@@ -156,6 +156,9 @@ module Relay
           token: Relay::SentrySetup.mask_token(sub['token']),
           status: result[:status],
           reason: result[:reason],
+          # reason を採れない非 JSON 応答のときだけ入る、切り詰めた生 body
+          # (#25)。compact されるので通常の失敗では出ない。
+          body_snippet: result[:body_snippet],
         }.compact
       end
 
