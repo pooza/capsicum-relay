@@ -68,6 +68,9 @@ Metrics/BlockLength:
     - helpers
 Metrics/ClassLength:
   Exclude:
+    # テストクラスはケースを足した分だけ伸びるもので、分割しても読みやすくは
+    # ならない。Metrics/AbcSize / Layout/LineLength と同じ扱いにする。
+    - test/**/*
   # クライアント系クラス (ApnsClient / WnsClient / AnnouncementWorker) の実態に
   # 合わせた上限。これを超える App / Database は個別に inline disable している。
   Max: 130
