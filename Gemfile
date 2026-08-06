@@ -36,4 +36,9 @@ gem 'sentry-ruby'
 group :development do
   gem 'rubocop'
   gem 'rubocop-performance'
+  # テスト (#25 / #26)。Ruby 4.0 では bundled gem も Gemfile に書かないと
+  # bundle 配下で require できないため明示する。flauros は
+  # BUNDLE_WITHOUT=development なので本番には入らない。
+  gem 'minitest'
+  gem 'rake'
 end

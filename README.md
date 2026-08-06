@@ -10,6 +10,17 @@ Ruby / Sinatra / Puma / SQLite。Linode Nanode で運用中。`relay.capsicum.sh
 
 補足として、暗号化された Web Push ペイロードはリレーでは復号せず、Base64 のままクライアント（iOS NSE / Android `FirebaseMessagingService`）に渡して端末側で復号する。リレーが秘密鍵を持たない設計のため、将来の外部ユーザー向け有償提供時も E2E 前提を維持できる。
 
+## テスト
+
+```bash
+bundle exec rake test
+bundle exec rubocop
+```
+
+実 APNs / FCM / WNS に繋がず、送信クライアントの分岐だけを検証する minitest。
+テスト用の gem は `development` グループにあり、flauros は `BUNDLE_WITHOUT=development`
+なので本番には入らない。
+
 ## デプロイ
 
 ```bash
