@@ -13,7 +13,11 @@ require_relative 'lib/relay/sentry_setup'
 Relay::SentrySetup.init!
 
 module Relay
-  class App < Sinatra::Base
+  # 全 route と helper を抱える単一 Sinatra クラス。重複 push 抑止 (#16) → サポー
+  # ター状態 (#18) → device-id dedup (#15) の register 分岐と、段階的に膨らんでい
+  # る。恒久的には push 処理・supporters の module 抽出が本筋だが、当面は
+  # Metrics/ClassLength をここだけ落として許容する。
+  class App < Sinatra::Base # rubocop:disable Metrics/ClassLength
     CONFIG_PATH = File.expand_path('config/settings.yml', __dir__)
 
     # WNS が HTTP 200 でも X-WNS-NotificationStatus に返しうる、received 以外の

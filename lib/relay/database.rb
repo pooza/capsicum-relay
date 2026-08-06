@@ -3,7 +3,10 @@ require 'securerandom'
 require 'sqlite3'
 
 module Relay
-  class Database
+  # スキーマ定義と移行 (device_type の macos #468 / windows #474 追加、FK 修復な
+  # ど) を全部抱えているため長い。恒久的には migration の module 抽出が本筋だが、
+  # 当面は Metrics/ClassLength をここだけ落として許容する。
+  class Database # rubocop:disable Metrics/ClassLength
     DB_PATH = File.expand_path('../../db/relay.sqlite3', __dir__)
 
     # テーブル組み替え (rebuild_with_all_rows!) でコピーする列。実際には旧テーブル
@@ -352,17 +355,26 @@ module Relay
       create_seen_announcements_table!
     end
 
+    # announcement_subscriptions の列定義。新規作成と FK 修復時の作り直しの両方が
+    # 同じ定義を使う必要がある（片方だけ直すと、修復が古いスキーマのテーブルを
+    # 生成してしまう）ため、1 箇所に集約する。
+    def announcement_subscriptions_columns
+      return <<~SQL
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        push_token TEXT NOT NULL,
+        server TEXT NOT NULL,
+        account TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(push_token, server, account),
+        FOREIGN KEY (push_token) REFERENCES subscriptions(push_token) ON DELETE CASCADE
+      SQL
+    end
+
     def create_announcement_subscriptions_table!
       @db.execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS announcement_subscriptions (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          push_token TEXT NOT NULL,
-          server TEXT NOT NULL,
-          account TEXT NOT NULL,
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL,
-          UNIQUE(push_token, server, account),
-          FOREIGN KEY (push_token) REFERENCES subscriptions(push_token) ON DELETE CASCADE
+          #{announcement_subscriptions_columns}
         )
       SQL
       # capsicum#468 リグレッションの自己修復。legacy_alter_table 未指定の
@@ -394,34 +406,31 @@ module Relay
       @db.execute('PRAGMA foreign_keys=OFF')
       @db.execute('PRAGMA legacy_alter_table=ON')
       begin
-        @db.transaction do
-          @db.execute(
-            'ALTER TABLE announcement_subscriptions RENAME TO announcement_subscriptions_broken',
-          )
-          @db.execute(<<~SQL)
-            CREATE TABLE announcement_subscriptions (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              push_token TEXT NOT NULL,
-              server TEXT NOT NULL,
-              account TEXT NOT NULL,
-              created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL,
-              UNIQUE(push_token, server, account),
-              FOREIGN KEY (push_token) REFERENCES subscriptions(push_token) ON DELETE CASCADE
-            )
-          SQL
-          @db.execute(<<~SQL)
-            INSERT INTO announcement_subscriptions
-              (id, push_token, server, account, created_at, updated_at)
-            SELECT id, push_token, server, account, created_at, updated_at
-            FROM announcement_subscriptions_broken
-          SQL
-          @db.execute('DROP TABLE announcement_subscriptions_broken')
-        end
+        @db.transaction {rebuild_announcement_subscriptions_with_valid_fk!}
       ensure
         @db.execute('PRAGMA legacy_alter_table=OFF')
         @db.execute('PRAGMA foreign_keys=ON')
       end
+    end
+
+    # repair_announcement_subscriptions_fk! の組み替え本体。PRAGMA と transaction
+    # は呼び出し側が張っているので、単体で呼んではいけない。
+    def rebuild_announcement_subscriptions_with_valid_fk!
+      @db.execute(
+        'ALTER TABLE announcement_subscriptions RENAME TO announcement_subscriptions_broken',
+      )
+      @db.execute(<<~SQL)
+        CREATE TABLE announcement_subscriptions (
+          #{announcement_subscriptions_columns}
+        )
+      SQL
+      @db.execute(<<~SQL)
+        INSERT INTO announcement_subscriptions
+          (id, push_token, server, account, created_at, updated_at)
+        SELECT id, push_token, server, account, created_at, updated_at
+        FROM announcement_subscriptions_broken
+      SQL
+      @db.execute('DROP TABLE announcement_subscriptions_broken')
     end
 
     def create_seen_announcements_table!
