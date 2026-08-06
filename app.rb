@@ -16,6 +16,16 @@ module Relay
   class App < Sinatra::Base
     CONFIG_PATH = File.expand_path('config/settings.yml', __dir__)
 
+    # WNS が HTTP 200 でも X-WNS-NotificationStatus に返しうる、received 以外の
+    # ステータスのうち **正常系** のもの。dropped は「端末がオフライン / スリープで
+    # 受け取れなかった」で、raw notification は queue されないため必ずこうなる。
+    # PC を消している時間の方が長い利用者ほど通知量に比例して積み上がり、Sentry へ
+    # 上げると本当の異常（channelthrottled・鍵不在・復号失敗）が埋もれる
+    # (#24。5.5 週で 4476 件たまった)。journald には残すので、成功ログ
+    # (Pushed to windows:) との突き合わせによる切り分けは引き続きできる
+    # （手順は docs/CLAUDE.md「配信不達の切り分け」）。
+    WNS_BENIGN_STATUSES = ['dropped'].freeze
+
     use Sentry::Rack::CaptureExceptions if Relay::SentrySetup.enabled?
 
     configure do
@@ -146,30 +156,38 @@ module Relay
           token: Relay::SentrySetup.mask_token(sub['token']),
           status: result[:status],
           reason: result[:reason],
+          # reason を採れない非 JSON 応答のときだけ入る、切り詰めた生 body
+          # (#25)。compact されるので通常の失敗では出ない。
+          body_snippet: result[:body_snippet],
         }.compact
       end
 
       def handle_push_delivered(sub, result = {})
-        # WNS は HTTP 200 でも X-WNS-NotificationStatus が received 以外
-        # （dropped: 端末オフライン等で破棄 / channelthrottled: 送信過多で抑制）の
-        # ことがある。配信は受理扱い（success）だが実質的な不達なので、多発を
-        # 検知できるよう warning として件数観測する。WNS 固有の静かな失敗モードで、
-        # ここを観測しないと Windows push 不達の切り分けで効かない (#474 レビュー)。
         wns_status = result[:wns_status]
-        if wns_status && wns_status != 'received'
-          settings.logger.warn(
-            "WNS delivered but #{wns_status}: #{sub['account']}",
-          )
+        return handle_wns_status(sub, result, wns_status) if wns_status && wns_status != 'received'
+
+        settings.logger.info("Pushed to #{sub['device_type']}: #{sub['account']}")
+        return {status: 'delivered'}.to_json
+      end
+
+      # 配信は受理扱い（success）だが実質的な不達。WNS 固有の静かな失敗モードで、
+      # ここを観測しないと Windows push 不達の切り分けで効かない (#474 レビュー)。
+      # ただし正常系（WNS_BENIGN_STATUSES）は件数が青天井なので Sentry へは上げず、
+      # ログだけに残す。
+      def handle_wns_status(sub, result, wns_status)
+        benign = WNS_BENIGN_STATUSES.include?(wns_status)
+        message = "WNS delivered but #{wns_status}: #{sub['account']}"
+        if benign
+          settings.logger.info(message)
+        else
+          settings.logger.warn(message)
           Relay::SentrySetup.capture_message(
             "WNS notification #{wns_status} (windows)",
             level: :warning,
             context: {push: push_context(sub, result).merge(wns_status: wns_status)},
           )
-          return {status: 'delivered', wns_status: wns_status}.to_json
         end
-
-        settings.logger.info("Pushed to #{sub['device_type']}: #{sub['account']}")
-        return {status: 'delivered'}.to_json
+        return {status: 'delivered', wns_status: wns_status}.to_json
       end
 
       def handle_push_gone(sub, result)
@@ -240,14 +258,20 @@ module Relay
         halt 400, {error: 'device_type must be ios, android, macos or windows'}.to_json
       end
 
+      # device_id は任意。送ってこない旧クライアントは従来どおり token をキーに
+      # 登録される (#15 / capsicum#932)。
       sub = settings.database.register(
         token: json_body['token'],
         device_type: json_body['device_type'],
         account: json_body['account'],
         server: json_body['server'],
+        device_id: json_body['device_id'],
       )
 
-      settings.logger.info("Registered: #{sub['account']} (#{sub['device_type']})")
+      settings.logger.info(
+        "Registered: #{sub['account']} (#{sub['device_type']}," \
+          " device_id=#{sub['device_id'] ? 'yes' : 'none'})",
+      )
       status 201
       sub.to_json
     end

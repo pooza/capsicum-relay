@@ -52,7 +52,7 @@ sequenceDiagram
   participant R as capsicum-relay
   participant P as APNs / FCM
   C->>C: APNs / FCM デバイストークン取得
-  C->>R: POST /register<br/>(token, device_type, account, server)
+  C->>R: POST /register<br/>(token, device_type, account, server, device_id?)
   R-->>C: 201 Created<br/>(push_token を返す)
   C->>S: Web Push subscription 登録<br/>endpoint = relay/push/{push_token}
   Note over S: 通知イベント発生
@@ -103,12 +103,33 @@ erDiagram
     TEXT device_type "ios or android"
     TEXT account "username@host"
     TEXT server "Mastodon/Misskey host"
+    TEXT device_id "client のインストール単位 ID（nullable）"
     TEXT created_at
     TEXT updated_at
   }
 ```
 
 `UNIQUE(token, account, server)` + `UNIQUE(push_token)`。`push_token` は `SecureRandom.hex(32)`（64 文字 hex）。旧スキーマ（`UNIQUE(token)`）からの移行は起動時に自動で走る。
+
+### device_id による dedup（[#15](https://github.com/pooza/capsicum-relay/issues/15)）
+
+`UNIQUE(token, account, server)` だけだと、**デバイスの push トークンが更新されたとき衝突せずに新しい行ができ、旧行が孤児として残る**。旧トークンがまだ生きていて上流が両方に送る間は同一デバイスに二重 push が届き、時間とともに悪化する。
+
+`(account, server, device_type)` に潰す案は採れない。実データに iPhone + iPad のように**全アカウントで 2 トークンを一貫保持して両方更新し続けている運用**があり、潰すと最後に登録した端末しか通知を受け取れなくなる。
+
+そこで client が[インストール単位の安定 ID](https://github.com/pooza/capsicum/issues/932)（乱数 UUID・`shared_preferences` 保存）を `device_id` として送り、relay はそれをキーに upsert する。
+
+- **列は nullable**。`device_id` を送らない旧クライアントは従来どおり `token` をキーに動く
+- 実質的な `UNIQUE(account, server, device_id)` は**部分インデックス** `idx_subscriptions_device ... WHERE device_id IS NOT NULL` で張る（SQLite はテーブル制約に `WHERE` を書けない）
+- 既存行は移行時に埋められないので `NULL` のまま。**次回 register で埋まる**のを待つ
+
+`device_id` 付き register がどの行を上書きするかは順序に意味がある。
+
+1. **今のトークンを持つ行**があればそれ。上流が現に push している行なので、`push_token` を保ったまま `device_id` を埋める。トークンを書き換えないので `UNIQUE(token, account, server)` に触れない。旧クライアントからの移行はここを通る
+2. 無ければ**同じ `device_id` の行**。これがトークン更新のケースで、行を増やさず `token` だけ差し替える
+3. どちらも無ければ新規 INSERT
+
+1 と 2 が別の行を指すのは、トークンが一度離れて戻る場合だけで実運用では起きない。起きたときは部分インデックス違反になるため、古い方（2 の行）を畳んで 1 を残す。畳んだ行の `announcement_subscriptions` は FK の CASCADE で消える点に注意。
 
 ## コーディング規約
 
@@ -156,6 +177,38 @@ sudo systemctl restart capsicum-relay
 curl https://relay.capsicum.shrieker.net/health
 # => {"status":"ok","subscriptions":N}
 ```
+
+### 配信不達の切り分け（journald を読む）
+
+「プッシュが届かない」を疑ったとき、**Sentry のイベント数だけで判定してはいけない**。flauros の journald には成功も失敗も残っているので、必ず突き合わせる。
+
+#### なぜ Sentry だけでは足りないか
+
+- relay が Sentry へ上げているのは**失敗側だけ**。成功は `logger.info` にしか出ない（`Pushed to <device_type>: <account>`）ので、Sentry を見ると失敗だけが並び、母数が見えない
+- WNS の `dropped` は**端末がオフライン / スリープで受け取れなかった**という正常系。PC を消している時間が長い利用者ほど積み上がるので、件数の多さは不具合の証拠にならない
+- capsicum 側の `push.wns_bgtask: bgtask.shown` は、bg task が LocalState に書いた記録を**次回アプリ起動時に**回収して送る方式。**「出ていない ＝ トーストが出ていない」ではない**（アプリを起動していないだけ）
+
+#### 手順
+
+```bash
+ssh deploy@flauros.b-shock.co.jp
+journalctl -u capsicum-relay --no-pager --since "-14 days" -o short-iso \
+  | grep -E "Pushed to windows:|WNS delivered but dropped:"
+```
+
+`Pushed to <device_type>:` が成功、`WNS delivered but dropped:` が drop。アカウント別に数えて成功率を出し、さらに**時刻（JST）別の分布**を見る。
+
+#### 判定基準
+
+| 観測 | 読み方 |
+| --- | --- |
+| 成功が特定の時間帯に集中し、それ以外は drop 一色 | **端末の電源パターン**。正常 |
+| 全時間帯に成功が分散している | 常時通電の端末。正常 |
+| 成功が 1 件も無い | ここで初めて端末側（bgtask 登録・チャンネル失効）を疑う |
+
+成功率そのものは端末間で大きく開く（実測で 11%〜84%）が、**差の正体は「PC がついている時間の長さ」**であって端末の健全性ではない。低い成功率だけを見て不具合と判断しないこと。
+
+journald は 2026-04-17（サービス開始時）から全期間残っている。経緯は [pooza/capsicum#931](https://github.com/pooza/capsicum/issues/931)。
 
 ## ディレクトリ構成
 
