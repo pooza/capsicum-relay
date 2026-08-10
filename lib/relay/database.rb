@@ -19,6 +19,11 @@ module Relay
       'device_id', 'created_at', 'updated_at'
     ].freeze
 
+    # device_id を持たない古い行を掃除してよいと判断するまでの猶予 (capsicum#949)。
+    # 生きている端末は起動のたびに register して updated_at が進むので、これを
+    # 超えるのは実際に使われていない行だけになる。詳細は purge_legacy_rows 参照。
+    LEGACY_ROW_GRACE_DAYS = 14
+
     def initialize(logger: Logger.new($stdout))
       @logger = logger
       @db = SQLite3::Database.new(DB_PATH)
@@ -44,10 +49,14 @@ module Relay
       return register_by_token(token, device_type, account, server) unless device_id
 
       row = adoptable_row(token, account, server, device_id)
-      return update_registration(row, token, device_type, device_id) if row
-
-      insert_registration(token, device_type, account, server, device_id)
-      return find_by_composite(token, account, server)
+      current = if row
+        update_registration(row, token, device_type, device_id)
+      else
+        insert_registration(token, device_type, account, server, device_id)
+        find_by_composite(token, account, server)
+      end
+      purge_legacy_rows(account, server, device_type, current['id'])
+      return current
     end
 
     def unregister(id)
@@ -249,6 +258,51 @@ module Relay
       )
       @db.execute('DELETE FROM subscriptions WHERE id = ?', [by_device['id']])
       return by_token
+    end
+
+    # device_id を持たない古い行のうち、**同じ端末の旧版が残したもの**を掃除する
+    # (capsicum#949)。
+    #
+    # device_id 導入前 (capsicum#932 以前) のクライアントは、push トークンが変わる
+    # たびに新しい行を作っていた。その行は上流 (Mastodon / Misskey) の購読が生きて
+    # いる限り push され続けるため、**1 通の通知が行数ぶん増殖する**。2026-08-10 に
+    # 実機で確認した例では windows 3 行 = 3 通で、行を消したら 1 通に戻った。
+    #
+    # 消す条件は 3 つ揃ったときだけ:
+    #
+    # 1. `device_id` が無い（＝旧版が作った行）
+    # 2. 同じ (account, server, device_type) に **device_id 付きの行が既にある**
+    #    ＝そのインストールは新版へ更新済みで、この行はもう誰も更新しない
+    # 3. [LEGACY_ROW_GRACE_DAYS] 以上更新されていない
+    #
+    # 3 が要るのは、**同じ OS の別の実機がまだ旧版で動いている**場合を巻き込まない
+    # ため。生きている端末は起動のたびに register して updated_at が進むので、
+    # 猶予を超えるのは実際に使われていない行だけになる。仮に巻き込んでも、その端末
+    # は次の起動で再登録されるので自己修復する（起動までの間だけ不達）。
+    #
+    # 上流の購読は消さない（消せない）が、行が無くなれば `/push/{push_token}` が
+    # 410 Gone を返し、上流がその購読を破棄する（app.rb 参照）。カスケードで消える。
+    #
+    # クライアントは起動ごとに register するので、専用のスイープ機構は置かない。
+    # 使われているインストールから順に、自然に掃除されていく。
+    def purge_legacy_rows(account, server, device_type, keep_id)
+      grace = "-#{LEGACY_ROW_GRACE_DAYS} days"
+      stale = @db.execute(<<~SQL, [account, server, device_type, keep_id, grace])
+        SELECT id, updated_at FROM subscriptions
+        WHERE account = ? AND server = ? AND device_type = ?
+          AND device_id IS NULL
+          AND id != ?
+          AND updated_at < datetime('now', ?)
+      SQL
+      return if stale.empty?
+
+      stale.each do |row|
+        @logger.info(
+          "Purging legacy subscription id=#{row['id']} (#{account}/#{device_type}," \
+            " last seen #{row['updated_at']})",
+        )
+        @db.execute('DELETE FROM subscriptions WHERE id = ?', [row['id']])
+      end
     end
 
     # push_token は維持する。上流に登録済みの endpoint (/push/{push_token}) が
