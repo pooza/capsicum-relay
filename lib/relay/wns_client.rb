@@ -26,7 +26,11 @@ module Relay
   #     / client_secret=<secret> / scope=notify.windows.com
   # で OAuth アクセストークンを取得し、Channel URI への POST に Bearer で添える。
   # トークンは expires_in までキャッシュし、401 を受けたら 1 回だけ強制更新する。
-  class WnsClient
+  #
+  # OAuth・トークンキャッシュ・送信・応答解釈・#21 の入力検証まで一つの WNS 送信
+  # 単位に凝集しており、130 行を数行超える。分割すると I/F がまたぐだけなので、
+  # App / Database と同様にここは ClassLength を inline で許容する。
+  class WnsClient # rubocop:disable Metrics/ClassLength
     OAUTH_ENDPOINT = 'https://login.live.com/accesstoken.srf'.freeze
     OAUTH_SCOPE = 'notify.windows.com'.freeze
     # アクセストークン有効期限の手前で失効扱いにするマージン (秒)。
@@ -40,6 +44,31 @@ module Relay
     # WNS raw payload の上限 5000 バイト超過 (413)。subscription は健全なので
     # unregister せず、該当 1 通だけドロップする（APNs / FCM の oversized と同じ）。
     OVERSIZED_STATUS = 413
+    # WNS raw notification の payload 上限 (バイト)。aes128gcm 暗号文を base64 化
+    # したエンベロープは元 payload の約 1.4 倍に膨らみ、長い Misskey ノート等で
+    # 4KB(APNs/FCM) より先に超過しうる。現状は POST して 413 を受けてから oversized
+    # 処理する事後対応だが、送信前に弾いて WNS への無駄打ちと round-trip を省く
+    # (#21)。倒れ方は 413 経路と同一なので観測（Sentry oversized 件数）も揃う。
+    RAW_PAYLOAD_LIMIT = 5000
+    # Channel URI として許可するホストの suffix。capsicum の Windows クライアント
+    # が classic PushNotificationChannel から得る Channel URI は必ず
+    # *.notify.windows.com に載る。device_type=windows の token は /register を
+    # 通れば任意ホストへ Bearer + payload 付き POST をさせられる（SSRF）ため、
+    # 送信先を WNS ホストへ限定する (#21 / capsicum#474 レビュー)。
+    CHANNEL_URI_HOST_SUFFIX = '.notify.windows.com'.freeze
+
+    # Channel URI が https かつ WNS ホストであることを検査する。register の入口
+    # (app.rb) と push 前 (defense-in-depth) の双方から使う class method。実 URI は
+    # 必ず region 付きサブドメイン (db5p / sg2p 等) なので suffix 一致で十分、かつ
+    # notify.windows.com.evil.com のような suffix なりすましは弾ける。
+    def self.valid_channel_uri?(channel_uri)
+      uri = URI(channel_uri.to_s)
+      return false unless uri.is_a?(URI::HTTPS) && uri.host
+
+      return uri.host.downcase.end_with?(CHANNEL_URI_HOST_SUFFIX)
+    rescue URI::InvalidURIError
+      return false
+    end
 
     def initialize(config, logger: Logger.new($stdout))
       @config = config
@@ -52,7 +81,18 @@ module Relay
     end
 
     def push(device_token:, payload:)
+      # 送信先ホストが WNS でなければ POST しない (#21)。register で弾いているので
+      # 通常は起きないが、既存行や将来の抜けに対する防御。invalid は subscription
+      # を消さない（permanent: false）— 誤 unregister より観測に倒す。
+      unless self.class.valid_channel_uri?(device_token)
+        return invalid_channel_uri_result(device_token)
+      end
+
       body = payload.to_json
+      # 5000B 超過は POST せず 413 経路に倒す (#21)。事後の 413 と同じ oversized
+      # 扱いなので上位（handle_push_oversized）の挙動・観測は変わらない。
+      return oversized_precheck_result(body.bytesize) if body.bytesize > RAW_PAYLOAD_LIMIT
+
       response = post_raw(device_token, body)
       # 401 はアクセストークン失効の可能性が高い。1 回だけ強制更新して再送する
       # （毎回更新すると login.live.com を過剰に叩くため、失敗起点でのみ）。
@@ -61,6 +101,37 @@ module Relay
     end
 
     private
+
+    # push が返す失敗ハッシュの共通形。handle_push_result が success / oversized /
+    # permanent を見て分岐するので、全経路でキーを揃える。
+    def failure(status:, reason:, permanent: false, oversized: false)
+      return {
+        success: false, status: status, reason: reason,
+        permanent: permanent, oversized: oversized
+      }
+    end
+
+    # 送信前 5000B 超過。interpret の 413 応答と同型 (oversized: true) を返し、
+    # handle_push_oversized の drop + 観測にそのまま乗せる。
+    def oversized_precheck_result(size)
+      @logger.warn("WNS payload too large (pre-check): #{size} > #{RAW_PAYLOAD_LIMIT}")
+      return failure(
+        status: OVERSIZED_STATUS, reason: 'PayloadTooLarge (pre-check)', oversized: true,
+      )
+    end
+
+    # WNS 以外のホストへ向いた Channel URI。送らずに失敗として返す。permanent:
+    # false で subscription は残し、Sentry に上げて件数を観測する（想定 0 件）。
+    def invalid_channel_uri_result(channel_uri)
+      host = URI(channel_uri.to_s).host rescue nil
+      @logger.warn("WNS channel URI rejected (non-WNS host): #{host.inspect}")
+      Relay::SentrySetup.capture_message(
+        'WNS channel URI rejected (non-WNS host)',
+        level: :warning,
+        context: {wns: {host: host}},
+      )
+      return failure(status: nil, reason: 'invalid_channel_uri')
+    end
 
     def post_raw(channel_uri, body, force_token_refresh: false)
       token = access_token(force_refresh: force_token_refresh)
@@ -82,11 +153,7 @@ module Relay
     end
 
     def interpret(response)
-      unless response
-        return {
-          success: false, status: nil, reason: 'no_response', permanent: false, oversized: false
-        }
-      end
+      return failure(status: nil, reason: 'no_response') unless response
 
       status = response.code.to_i
       if response.is_a?(Net::HTTPSuccess)
@@ -96,13 +163,12 @@ module Relay
         return {success: true, status: status, wns_status: response['X-WNS-NotificationStatus']}
       end
 
-      return {
-        success: false,
+      return failure(
         status: status,
         reason: response['X-WNS-Error-Description'] || response['X-WNS-Status'] || response.message,
         permanent: PERMANENT_STATUSES.include?(status),
         oversized: status == OVERSIZED_STATUS,
-      }
+      )
     end
 
     def access_token(force_refresh: false)
