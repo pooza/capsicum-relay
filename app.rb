@@ -262,6 +262,14 @@ module Relay
         halt 400, {error: 'device_type must be ios, android, macos or windows'}.to_json
       end
 
+      # windows の token は WNS Channel URI。任意ホストを保存すると /push で
+      # そこへ Bearer + payload 付き POST をさせられる (SSRF) ため、入口で WNS
+      # ホストに限定する (#21 / capsicum#474 レビュー)。
+      if json_body['device_type'] == 'windows' &&
+          !Relay::WnsClient.valid_channel_uri?(json_body['token'])
+        halt 400, {error: 'token must be a WNS channel URI (*.notify.windows.com)'}.to_json
+      end
+
       # device_id は任意。送ってこない旧クライアントは従来どおり token をキーに
       # 登録される (#15 / capsicum#932)。
       sub = settings.database.register(
