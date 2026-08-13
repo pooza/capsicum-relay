@@ -5,14 +5,16 @@ require 'lib/relay/apns_client'
 # Apnotic::Connection の代役。push が返すもの（あるいは raise するもの）を
 # 呼び出し順のスクリプトで与える。
 class FakeApnsConnection
-  attr_reader :closed
+  attr_reader :closed, :pushed
 
   def initialize(script)
     @script = script
     @closed = false
+    @pushed = []
   end
 
-  def push(_notification)
+  def push(notification)
+    @pushed << notification
     action = @script.shift
     raise HTTP2::Error::StreamLimitExceeded if action == :stream_limit
     return action
@@ -41,7 +43,10 @@ class FakeApnsResponse
   end
 end
 
-# 実 APNs へ繋がずに済むよう、接続の生成と Notification の組み立てだけ差し替える。
+# 実 APNs へ繋がずに済むよう、接続の生成だけ差し替える。Notification の組み立ては
+# 本物を使う（#17 の degrade 判定は組み立て済み payload のバイト数で決まるので、
+# ここを stub すると検証の意味が無くなる）。Apnotic::Notification は生成に I/O を
+# 伴わないため、そのまま組める。
 class StubbedApnsClient < Relay::ApnsClient
   attr_reader :connections
 
@@ -61,10 +66,6 @@ class StubbedApnsClient < Relay::ApnsClient
     connection = FakeApnsConnection.new(@scripts.fetch(@connections.size, []))
     @connections << connection
     return connection
-  end
-
-  def build_notification(*, **)
-    return :notification
   end
 end
 
@@ -153,6 +154,104 @@ class ApnsClientTest < Minitest::Test
     assert(results.all? {|result| result[:success]})
   end
 
+  # --- #17: oversized の degrade ---------------------------------------------
+
+  # 上限内の通常 payload は素通し。degrade の副作用で暗号化 body を落とさない。
+  def test_normal_payload_is_sent_untouched
+    client = build_client(0 => [OK_RESPONSE])
+    result = client.push(device_token: 't', payload: push_payload(body: 'x' * 100))
+
+    assert(result[:success])
+    refute(result[:degraded])
+    sent = sent_payload(client)
+    assert_equal('x' * 100, sent['body'])
+    assert_equal('aes128gcm', sent['encoding'])
+  end
+
+  # 以前はここで 413 を受けて 1 通まるごと drop していた（端末に何も出ない）。
+  def test_oversized_payload_is_degraded_and_delivered
+    original = push_payload(body: 'x' * 5000)
+    client = build_client(0 => [OK_RESPONSE])
+    result = client.push(device_token: 't', payload: original)
+
+    assert(result[:success])
+    assert(result[:degraded])
+    refute(result[:oversized])
+  end
+
+  # degrade は暗号化 payload 由来のキーだけを落とし、宛先の判別に要る
+  # account / server と aps.alert は残す（NSE はこの alert を出す）。
+  def test_degraded_payload_drops_only_the_encrypted_keys
+    client = build_client(0 => [OK_RESPONSE])
+    client.push(device_token: 't', payload: push_payload(body: 'x' * 5000))
+    sent = sent_payload(client)
+
+    assert_nil(sent['body'])
+    assert_nil(sent['encoding'])
+    assert_nil(sent['crypto_key'])
+    assert_nil(sent['encryption'])
+    assert_equal('user@example.com', sent['account'])
+    assert_equal('https://example.com', sent['server'])
+    assert_equal('user@example.com に通知があります', sent.dig('aps', 'alert', 'body'))
+  end
+
+  # 送った payload が上限を割っていること（degrade の目的そのもの）。
+  def test_degraded_notification_is_within_the_limit
+    client = build_client(0 => [OK_RESPONSE])
+    client.push(device_token: 't', payload: push_payload(body: 'x' * 5000))
+
+    assert_operator(
+      client.connections[0].pushed.first.body.bytesize,
+      :<=,
+      Relay::ApnsPayload::PAYLOAD_LIMIT,
+    )
+  end
+
+  # 観測用に「degrade 前のサイズ」を返す。Sentry の context に載る。
+  def test_degraded_result_reports_the_original_size
+    client = build_client(0 => [OK_RESPONSE])
+    result = client.push(device_token: 't', payload: push_payload(body: 'x' * 5000))
+
+    assert_operator(result[:original_size], :>, Relay::ApnsPayload::PAYLOAD_LIMIT)
+  end
+
+  # degrade しても割れない場合は送らずに 413 経路へ倒す（WNS の pre-check と同型）。
+  def test_still_oversized_after_degrade_falls_back_to_the_oversized_path
+    huge_account = 'a' * 5000
+    client = build_client(0 => [OK_RESPONSE])
+    result = client.push(
+      device_token: 't', payload: push_payload(body: 'x' * 5000, account: huge_account),
+    )
+
+    refute(result[:success])
+    assert(result[:oversized])
+    refute(result[:permanent])
+    assert_equal(413, result[:status])
+    assert_empty(client.connections[0].pushed, 'must not POST when it cannot fit')
+  end
+
+  # お知らせ通知 (capsicum#477) は元から body / encoding を持たない。degrade
+  # 判定に巻き込まれず、alert もそのまま維持されること。
+  def test_announcement_style_payload_without_body_is_untouched
+    client = build_client(0 => [OK_RESPONSE])
+    payload = {'notification_type' => 'announcement', 'account' => 'user@example.com'}
+    result = client.push(device_token: 't', payload: payload, alert: {title: 'お知らせ', body: '本文'})
+
+    assert(result[:success])
+    refute(result[:degraded])
+    assert_equal('本文', sent_payload(client).dig('aps', 'alert', 'body'))
+  end
+
+  # StreamLimit の再送でも degrade の判定結果を引き継ぐこと。
+  def test_degrade_survives_the_stream_limit_retry
+    client = build_client(0 => [:stream_limit], 1 => [OK_RESPONSE])
+    result = client.push(device_token: 't', payload: push_payload(body: 'x' * 5000))
+
+    assert(result[:success])
+    assert(result[:degraded])
+    assert_nil(sent_payload(client, connection: 1)['body'])
+  end
+
   private
 
   def build_client(scripts)
@@ -161,5 +260,19 @@ class ApnsClientTest < Minitest::Test
 
   def failure_response(status, body)
     return FakeApnsResponse.new(status: status, body: body)
+  end
+
+  # build_push_payload (push_helpers) が組む形。
+  def push_payload(body:, account: 'user@example.com')
+    return {
+      'body' => body,
+      'encoding' => 'aes128gcm',
+      'server' => 'https://example.com',
+      'account' => account,
+    }
+  end
+
+  def sent_payload(client, connection: 0)
+    return JSON.parse(client.connections[connection].pushed.last.body)
   end
 end

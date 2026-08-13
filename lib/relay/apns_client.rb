@@ -1,6 +1,7 @@
 require 'apnotic'
 require 'logger'
 require 'monitor'
+require_relative 'apns_payload'
 require_relative 'sentry_setup'
 
 module Relay
@@ -9,9 +10,15 @@ module Relay
     # これらを受けた場合、relay は Mastodon に HTTP 410 Gone を返して
     # subscription を destroy してもらい、自らの row も削除する。
     PERMANENT_REASONS = ['BadDeviceToken', 'Unregistered', 'DeviceTokenNotForTopic'].freeze
+    # degrade しても上限を割れず、送信前に倒したときの合成 reason (#17)。下流
+    # (handle_push_oversized) の扱いを APNs 実応答の 413 と揃えるため、下の
+    # OVERSIZED_REASONS に同居させる。
+    OVERSIZED_PRECHECK_REASON = 'PayloadTooLarge (pre-check)'.freeze
     # APNs payload 上限 (alert push 4KB) 超過。subscription は健全なので
     # unregister せず、該当 1 通だけドロップする (#9)。
-    OVERSIZED_REASONS = ['PayloadTooLarge'].freeze
+    OVERSIZED_REASONS = ['PayloadTooLarge', OVERSIZED_PRECHECK_REASON].freeze
+    # 送信前に倒すときに載せる HTTP ステータス。APNs の 413 に合わせる。
+    OVERSIZED_STATUS = 413
     # 非 JSON の失敗応答は HTML のエラーページ全文でありうるので、切り分けに
     # 足りる長さだけ残してログ / Sentry へ載せる (#25)。
     BODY_SNIPPET_LIMIT = 200
@@ -20,6 +27,7 @@ module Relay
       @config = config
       @logger = logger
       @mon = Monitor.new
+      @payload = Relay::ApnsPayload.new(config['apns']['bundle_id'])
       @connection = build_connection
     end
 
@@ -27,11 +35,18 @@ module Relay
     # 返し、上流に「配信失敗」ではなく「relay が壊れた」と見えるうえ、
     # permanent / oversized の判定（無効トークンの掃除・1 通ドロップ）にも
     # 到達しなくなるため (#25 / #26)。
+    # 上限超過時に暗号化 body を外した汎用文面へ倒す degrade は ApnsPayload が判断する
+    # (#17)。Notification は 1 回だけ組み立てて再送でも使い回す。apns-id が同じままに
+    # なり、StreamLimit 再送が二重配信に見えるのを避けられる。
     def push(device_token:, payload:, alert: nil)
       connection = @connection
-      return deliver(connection, device_token, payload, alert: alert)
+      built = @payload.build(device_token: device_token, payload: payload, alert: alert)
+      return oversized_precheck_result(built) unless built.notification
+
+      log_degrade(built) if built.degraded_from
+      return deliver(connection, built.notification, degraded_from: built.degraded_from)
     rescue HTTP2::Error::StreamLimitExceeded => e
-      return push_after_reset(connection, e, device_token, payload, alert)
+      return push_after_reset(connection, e, built)
     end
 
     def close
@@ -40,9 +55,9 @@ module Relay
 
     private
 
-    def deliver(connection, device_token, payload, alert: nil)
-      response = connection.push(build_notification(device_token, payload, alert: alert))
-      return {success: true, id: response.headers['apns-id']} if response&.ok?
+    def deliver(connection, notification, degraded_from: nil)
+      response = connection.push(notification)
+      return delivered(response, degraded_from) if response&.ok?
 
       return failure(
         status: response&.status,
@@ -51,16 +66,45 @@ module Relay
       )
     end
 
+    # degrade して送ったときだけ degraded / original_size を添える。上位
+    # (handle_push_delivered) が「届いたが本文は読めない」を観測するのに使う。
+    def delivered(response, degraded_from)
+      result = {success: true, id: response.headers['apns-id']}
+      return result unless degraded_from
+
+      return result.merge(degraded: true, original_size: degraded_from)
+    end
+
+    def log_degrade(built)
+      @logger.warn(
+        "APNs payload degraded to generic alert: #{built.degraded_from}B" \
+          " > #{Relay::ApnsPayload::PAYLOAD_LIMIT}B (sent #{built.byte_size}B)",
+      )
+    end
+
+    # degrade しても上限を割れない稀なケース（account 名だけで 4KB を超える等）。
+    # 事後の 413 応答と同型 (oversized: true) を返し、handle_push_oversized の
+    # drop + 観測へそのまま倒す。WNS の同名メソッド (#21) と役割を揃えている。
+    def oversized_precheck_result(built)
+      @logger.warn(
+        "APNs payload too large after degrade: #{built.byte_size}B" \
+          " > #{Relay::ApnsPayload::PAYLOAD_LIMIT}B",
+      )
+      return failure(status: OVERSIZED_STATUS, reason: OVERSIZED_PRECHECK_REASON)
+    end
+
     # ストリーム上限は接続を張り直さないと戻らないので、作り直して 1 回だけ
     # 送り直す。`HTTP2::Connection#new_stream` はバイトを 1 つも送る前に raise
     # するため、この再送で二重配信にはならない。2 回目も上限に当たったら
     # failure に落として上流の再送に委ねる（handle_push_failed → 502）。
-    def push_after_reset(stale, error, device_token, payload, alert)
+    def push_after_reset(stale, error, built)
       @logger.warn(
         'APNs stream limit reached; reconnecting and retrying once:' \
           " #{error.class}: #{error.message}",
       )
-      return deliver(reset_connection(stale), device_token, payload, alert: alert)
+      return deliver(
+        reset_connection(stale), built.notification, degraded_from: built.degraded_from
+      )
     rescue HTTP2::Error::StreamLimitExceeded
       return failure(status: nil, reason: 'StreamLimitExceeded')
     end
@@ -155,20 +199,6 @@ module Relay
         # 起きるため、明示捕捉しないと Sentry に上がらない。#8 の本丸 (#10 Phase C)。
         Relay::SentrySetup.capture_exception(error, context: {apns: {source: 'socket_loop'}})
       end
-    end
-
-    def build_notification(device_token, payload, alert: nil)
-      notification = Apnotic::Notification.new(device_token)
-      notification.topic = @config['apns']['bundle_id']
-      notification.alert = alert || {
-        title: 'capsicum',
-        body: "#{payload['account']} に通知があります",
-      }
-      notification.sound = 'default'
-      notification.mutable_content = true
-      notification.custom_payload = payload
-      notification.push_type = 'alert'
-      return notification
     end
   end
 end
