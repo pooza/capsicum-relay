@@ -102,9 +102,29 @@ module Relay
     def handle_push_delivered(sub, result = {})
       wns_status = result[:wns_status]
       return handle_wns_status(sub, result, wns_status) if wns_status && wns_status != 'received'
+      return handle_push_degraded(sub, result) if result[:degraded]
 
       settings.logger.info("Pushed to #{sub['device_type']}: #{sub['account']}")
       return {status: 'delivered'}.to_json
+    end
+
+    # 暗号化 payload が上限を超えたため汎用文面だけ届けた (#17)。以前は 1 通まるごと
+    # drop していた（端末に何も出ない）ので、**ここに来るのは改善後の正常系**。ただし
+    # 「本文の読めない通知」ではあり、送信側の payload 設計が肥大していないかを追う
+    # 材料になるので warning として件数を観測する。drop (Push oversized dropped) とは
+    # 別メッセージにして、本当の不達が 0 になったことを確認できるようにする。件数が
+    # 青天井になるようなら WNS_BENIGN_STATUSES と同じくログのみへ落とす。
+    def handle_push_degraded(sub, result)
+      settings.logger.warn(
+        "Push degraded to generic alert: #{sub['account']}" \
+          " (#{sub['device_type']}, #{result[:original_size]}B)",
+      )
+      Relay::SentrySetup.capture_message(
+        "Push oversized degraded (#{sub['device_type']})",
+        level: :warning,
+        context: {push: push_context(sub, result).merge(original_size: result[:original_size])},
+      )
+      return {status: 'delivered', degraded: true}.to_json
     end
 
     # 配信は受理扱い（success）だが実質的な不達。WNS 固有の静かな失敗モードで、

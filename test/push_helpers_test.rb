@@ -8,7 +8,7 @@ class PushHelpersTest < Minitest::Test
   EXPECTED_METHODS = [
     :build_push_payload, :dispatch_push, :push_client_for, :log_push_received,
     :handle_push_result, :push_context, :handle_push_delivered, :handle_wns_status,
-    :handle_push_gone, :handle_push_oversized, :handle_push_failed
+    :handle_push_gone, :handle_push_oversized, :handle_push_degraded, :handle_push_failed
   ].freeze
 
   def test_is_a_module_for_sinatra_helpers_mixin
