@@ -1,4 +1,5 @@
 require 'sentry-ruby'
+require_relative 'revision'
 
 module Relay
   # Sentry 初期化と、計装コードから使う薄いヘルパ群。SENTRY_DSN が未設定なら
@@ -32,12 +33,10 @@ module Relay
       return Sentry.initialized?
     end
 
+    # `/health` の revision と同じ文字列を返す (#37)。取得ロジックの実体は
+    # [Relay::Revision] にあり、ここは Sentry 側の呼び名を残しているだけ。
     def self.detect_release
-      explicit = ENV.fetch('SENTRY_RELEASE', nil)
-      return explicit if explicit
-
-      sha = `git rev-parse HEAD 2>/dev/null`.strip
-      return sha.empty? ? nil : sha
+      return Relay::Revision.current
     end
 
     # device token / push token を部分マスクして Sentry に送る (#10 Phase E)。

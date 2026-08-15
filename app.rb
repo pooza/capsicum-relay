@@ -9,6 +9,7 @@ require_relative 'lib/relay/wns_client'
 require_relative 'lib/relay/announcement_worker'
 require_relative 'lib/relay/push_dedup'
 require_relative 'lib/relay/push_helpers'
+require_relative 'lib/relay/revision'
 require_relative 'lib/relay/sentry_setup'
 
 Relay::SentrySetup.init!
@@ -85,9 +86,13 @@ module Relay
     end
 
     # Health check
+    # 監視と、デプロイ差分の確認 (#37) の入口。`revision` は Sentry の release と
+    # 同じ文字列（[Relay::Revision]）なので、変換せずに突き合わせられる。
+    # 名乗れないときは null（git チェックアウト外での実行等）。
     get '/health' do
       {
         status: 'ok',
+        revision: Relay::Revision.current,
         subscriptions: settings.database.count,
         announcement_subscriptions: settings.database.announcement_subscription_count,
         supporters: settings.database.supporter_count,
