@@ -8,15 +8,20 @@ require 'tmpdir'
 # クラス定義時に走るので、ここで指しておかないと本番の settings.yml / DB を
 # 掴もうとする（無ければそのまま落ちる）。これが #34 で「app.rb は
 # config/settings.yml 依存で require できない」と書かれていたブロッカーの実体。
-ENV['RELAY_CONFIG_PATH'] ||= File.expand_path('../fixtures/settings.yml', __dir__)
-unless ENV['RELAY_DB_PATH']
-  dir = Dir.mktmpdir('capsicum-relay-request-test')
-  # ⚠ **`at_exit` は使えない。** minitest/autorun が先に at_exit を登録して
-  # いるので、後から登録したハンドラの方が**先に**走る＝テストが 1 件も動く前に
-  # 一時ディレクトリが消える。`Minitest.after_run` はテスト完了後に走る。
-  Minitest.after_run {FileUtils.remove_entry(dir)}
-  ENV['RELAY_DB_PATH'] = File.join(dir, 'relay.sqlite3')
-end
+# 🔴 **既存の値を尊重しない（Codex P1・PR #40）。** `RequestTestCase#setup` は
+# 毎回 `DELETE FROM` でテーブルを空にするので、シェルに `RELAY_DB_PATH` が
+# 設定された環境（サービスを動かすために export してあるなど）で
+# `rake test` を叩くと**そのデータベースを消す**。テストプロセスは常に
+# 自分で作った一時ファイルだけを見る。設定ファイルも同じ理由で固定する
+# （本番の秘密情報をテストに読ませない）。
+ENV['RELAY_CONFIG_PATH'] = File.expand_path('../fixtures/settings.yml', __dir__)
+
+# ⚠ **`at_exit` は使えない。** minitest/autorun が先に at_exit を登録して
+# いるので、後から登録したハンドラの方が**先に**走る＝テストが 1 件も動く前に
+# 一時ディレクトリが消える。`Minitest.after_run` はテスト完了後に走る。
+RELAY_TEST_DB_DIR = Dir.mktmpdir('capsicum-relay-request-test')
+Minitest.after_run {FileUtils.remove_entry(RELAY_TEST_DB_DIR)}
+ENV['RELAY_DB_PATH'] = File.join(RELAY_TEST_DB_DIR, 'relay.sqlite3')
 
 require 'rack/test'
 require 'app'
@@ -51,11 +56,23 @@ class RequestTestCase < Minitest::Test
   end
 
   def setup
-    db = SQLite3::Database.new(ENV.fetch('RELAY_DB_PATH'))
+    db = SQLite3::Database.new(safe_db_path)
     # 子から先に消す（subscriptions を先に消すと FK ON DELETE CASCADE 頼みに
     # なり、意図せず「消えたこと」を検証してしまう）。
     TABLES.each {|table| db.execute("DELETE FROM #{table}")}
     db.close
+  end
+
+  # 🔴 消してよい DB かを毎回確かめる（Codex P1・PR #40 の多重防御）。
+  # 上の env 固定が将来ほどけても、**このプロセスが作った一時ディレクトリの
+  # 外を DELETE しない**。
+  def safe_db_path
+    path = ENV.fetch('RELAY_DB_PATH')
+    unless path.start_with?("#{RELAY_TEST_DB_DIR}/")
+      raise "refusing to truncate a database outside the test tmpdir: #{path}"
+    end
+
+    return path
   end
 
   # 認証つきの JSON POST / DELETE / GET。ヘッダ名を各ケースで書かない。
