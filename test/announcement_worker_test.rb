@@ -108,42 +108,68 @@ class AnnouncementWorkerTest < Minitest::Test
     assert_empty(@wns.pushes)
   end
 
-  # --- windows 宛だけ payload を削る (#36 Phase 2) ---
+  # --- windows 宛だけの payload 変形 (#36 Phase 2) ---
 
-  def deliver_with_content(device_type)
+  def deliver_with_content(device_type, content: "<p>#{'あ' * 3000}</p>")
     return deliver(
       device_type,
       payload: {
         'notification_type' => 'announcement',
         'announcement_id' => '42',
-        'announcement_content' => "<p>#{'あ' * 3000}</p>",
-        'announcement_body' => 'あああ',
+        'announcement_content' => content,
       },
     )
   end
 
-  # ⚠ **本題**: WNS raw の上限は 5000B。Windows は announcement_content を
+  def windows_payload(content: "<p>#{'あ' * 3000}</p>")
+    deliver_with_content('windows', content: content)
+    return @wns.pushes.first[:payload]
+  end
+
+  # ⚠ **本題その 1**: WNS raw の上限は 5000B。Windows は announcement_content を
   # 1 バイトも読まない（capsicum の TryBuildAnnouncementDisplay）ので、載せた
   # ままだと長文のお知らせが「表示に使わないデータのせいで」まるごと落ちる。
   def test_windows_payload_drops_html_content
-    deliver_with_content('windows')
+    payload = windows_payload
 
-    payload = @wns.pushes.first[:payload]
     refute(payload.key?('announcement_content'))
     assert_operator(payload.to_json.bytesize, :<, Relay::WnsClient::RAW_PAYLOAD_LIMIT)
   end
 
-  # 削るのは content だけ。表示に要る本文・宛先・Tag 用の id は残す。
-  def test_windows_payload_keeps_display_fields
-    deliver_with_content('windows')
+  # ⚠ **本題その 2**: bg task はこの整形済み本文でトーストを組む。無いと
+  # `bgtask.announcement_no_body` に落ちて何も表示されない。
+  def test_windows_payload_carries_summarized_body
+    payload = windows_payload(content: '<p>こんにちは <b>世界</b></p>')
 
-    payload = @wns.pushes.first[:payload]
-    assert_equal('あああ', payload['announcement_body'])
+    assert_equal('こんにちは 世界', payload['announcement_body'])
+  end
+
+  # プレビュー長で切る。切った印（…）が付くことまで見る — 付かないと
+  # 「本文が短い」のか「切れている」のか端末側で区別できない。
+  def test_windows_payload_body_is_truncated_with_ellipsis
+    payload = windows_payload(content: "<p>#{'あ' * 100}</p>")
+
+    assert_equal(81, payload['announcement_body'].length)
+    assert(payload['announcement_body'].end_with?('…'))
+  end
+
+  # 全部が空になっても nil にしない（capsicum 側は空文字なら表示しない判断を
+  # するので、キー自体が消えると「旧 relay」と区別できなくなる）。
+  def test_windows_payload_body_is_string_even_when_content_is_empty
+    payload = windows_payload(content: '')
+
+    assert_equal('', payload['announcement_body'])
+  end
+
+  # 削るのは content だけ。宛先・Tag 用の id は残す。
+  def test_windows_payload_keeps_display_fields
+    payload = windows_payload
+
     assert_equal('42', payload['announcement_id'])
     assert_equal('alice@example', payload['account'])
   end
 
-  # ⚠ 逆向きの固定。iOS / macOS / Android は content からフル HTML を
+  # ⚠ 逆向きの固定 その 1。iOS / macOS / Android は content からフル HTML を
   # レンダリングする経路 (#477) を持っているので、削ると既存表示が壊れる。
   def test_apns_and_fcm_payloads_keep_html_content
     deliver_with_content('macos')
@@ -151,6 +177,19 @@ class AnnouncementWorkerTest < Minitest::Test
 
     assert(@apns.pushes.first[:payload].key?('announcement_content'))
     assert(@fcm.pushes.first[:payload].key?('announcement_content'))
+  end
+
+  # ⚠ 逆向きの固定 その 2（Codex P1 / PR #43）。**windows 以外の payload は
+  # Phase 2 の前後で不変**でなければならない。announcement_body を全 device_type
+  # に足すと、4KB 上限に近いお知らせが APNs / FCM で新たに上限超えになりうる。
+  # degrade は暗号化キーしか落とさないので救えず、poll_server は dispatch 後に
+  # mark_announcement_seen を打つので**再送もされない**（その 1 通が永久に消える）。
+  def test_apns_and_fcm_payloads_do_not_gain_the_windows_preview
+    deliver_with_content('macos')
+    deliver_with_content('android')
+
+    refute(@apns.pushes.first[:payload].key?('announcement_body'))
+    refute(@fcm.pushes.first[:payload].key?('announcement_body'))
   end
 
   # account は payload へ混ぜて送る（capsicum 側が宛先アカウントを解決する）。
@@ -229,38 +268,18 @@ class AnnouncementWorkerTest < Minitest::Test
     )
   end
 
-  # Windows の bg task はこの整形済み本文でトーストを組む。HTML のままの
-  # `announcement_content` しか無いと、C++/WinRT 側に HTML 剥がしを 3 つ目の
-  # 実装として書くことになる。
-  def test_payload_carries_summarized_body
-    payload = build_payload('<p>こんにちは <b>世界</b></p>')
-
-    assert_equal('こんにちは 世界', payload['announcement_body'])
-  end
-
-  # HTML のままの content も従来どおり残す（capsicum 側がタップ後に
-  # フルレンダリングする経路が使っている）。落とすと既存挙動が壊れる。
+  # HTML のままの content を載せる（capsicum がタップ後にフルレンダリング
+  # する経路が使っている）。落とすと既存挙動が壊れる。
   def test_payload_keeps_raw_html_content
     payload = build_payload('<p>こんにちは</p>')
 
     assert_equal('<p>こんにちは</p>', payload['announcement_content'])
   end
 
-  # プレビュー長で切る。切った印（…）が付くことまで見る — 付かないと
-  # 「本文が短い」のか「切れている」のか端末側で区別できない。
-  def test_payload_body_is_truncated_with_ellipsis
-    payload = build_payload("<p>#{'あ' * 100}</p>")
-
-    assert_equal(81, payload['announcement_body'].length)
-    assert(payload['announcement_body'].end_with?('…'))
-  end
-
-  # 全部が空になっても nil にしない（capsicum 側は空文字なら表示しない判断を
-  # するので、キー自体が消えると「旧 relay」と区別できなくなる）。
-  def test_payload_body_is_string_even_when_content_is_empty
-    payload = build_payload('')
-
-    assert_equal('', payload['announcement_body'])
+  # ⚠ **共通 payload は Phase 2 で 1 バイトも増やさない**（Codex P1 / PR #43）。
+  # Windows 用の announcement_body は wns_payload が配送時に足す。
+  def test_payload_has_no_windows_preview
+    refute(build_payload('<p>こんにちは</p>').key?('announcement_body'))
   end
 
   # ⚠ title は載せない。サーバーから来ないので capsicum 側の統一ラベル表で

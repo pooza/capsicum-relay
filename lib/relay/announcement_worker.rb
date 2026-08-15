@@ -190,45 +190,51 @@ module Relay
       report_error("deliver(#{sub['device_type']})", e)
     end
 
-    # WNS raw の payload 上限は 5000 バイトで、超えると [Relay::WnsClient] の
-    # 送信前チェックが 1 通まるごと落とす（端末には何も出ない）。
+    # Windows 宛だけの payload 変形 (#36 Phase 2 / capsicum#978)。
     #
-    # ⚠ **Windows が読むのは `account` / `announcement_body` / `announcement_id`
-    # だけで、HTML のままの `announcement_content` は 1 バイトも使わない**
-    # （capsicum `web_push_receive.cpp` の TryBuildAnnouncementDisplay）。載せた
-    # ままだと「表示に使わないデータのせいで通知そのものが消える」形になるので、
-    # windows 宛だけ落とす。残るのは 80 文字に切った本文とメタだけなので、長文の
-    # お知らせでも上限に近づかない。
+    # **`announcement_body` を足す。** WNS raw push には `aps.alert` に相当する
+    # OS 側の表示機構が無く、トーストは capsicum の bg task が自分で組む。
+    # `announcement_content` は HTML のままなので、整形済みの本文をここで渡さないと
+    # C++/WinRT 側に HTML 剥がしと UTF-8 の文字数え（バイトで切ると日本語が壊れる）を
+    # **3 つ目の実装として**書くことになる（Ruby の summarize_content / Dart の
+    # PushMessageDispatcher.synthesizeAnnouncementBody に続いて）。
     #
-    # iOS / macOS / Android では落とさない。あちらは capsicum が
-    # `announcement_content` からフル HTML をレンダリングする経路 (#477) を
-    # 持っており、落とすと既存の表示が壊れる。
+    # **`announcement_content` は落とす。** Windows が読むのは `account` /
+    # `announcement_body` / `announcement_id` だけで、HTML は 1 バイトも使わない
+    # （capsicum `web_push_receive.cpp` の TryBuildAnnouncementDisplay）。WNS raw の
+    # 上限 5000 バイトを超えると [Relay::WnsClient] の送信前チェックが 1 通まるごと
+    # 落とすので、載せたままだと「表示に使わないデータのせいで通知そのものが消える」。
+    # 落とせば残るのは 80 文字の本文とメタだけで、長文のお知らせでも上限に近づかない。
+    #
+    # ⚠ **どちらの変形も windows 宛に閉じている**（Codex P1 / PR #43）。
+    # - content を落とすのは windows だけ。iOS / macOS / Android は capsicum が
+    #   そこからフル HTML をレンダリングする経路 (#477) を持っており、落とすと壊れる。
+    # - body を足すのも windows だけ。全 device_type に足すと、4KB 上限に近い
+    #   お知らせが APNs / FCM で**新たに**上限超えになりうる。しかも
+    #   `ApnsPayload#degraded_payload` が落とすのは暗号化 Web Push 由来のキーだけ
+    #   なので degrade で救えず、`poll_server` は dispatch 後に
+    #   `mark_announcement_seen` を打つため**再送もされない**（その 1 通が永久に
+    #   失われる）。他の 3 種の payload は Phase 2 の前後でバイト単位で不変にする。
     def wns_payload(payload)
-      return payload.except('announcement_content')
+      return payload
+          .except('announcement_content')
+          .merge('announcement_body' => summarize_content(payload['announcement_content'].to_s))
     end
 
     # APNs custom_payload / FCM data は capsicum 側で notification_type を見て
     # NotificationType.announcement に routing される (#477)。FCM の data は
     # transform_values(&:to_s) されるため flat な文字列値で構成する。
     #
-    # `announcement_body` は整形済み（HTML 剥がし + プレビュー長）の本文で、
-    # **Windows の bg task 用**に足した (#36 Phase 2 / capsicum#978)。WNS raw
-    # push には `aps.alert` に相当する OS 側の表示機構が無く、トーストは
-    # capsicum が自分で組む。`announcement_content` は HTML のままなので、これが
-    # 無いと C++/WinRT 側に HTML 剥がしと UTF-8 の文字数え（バイトで切ると
-    # 日本語が壊れる）を **3 つ目の実装として**書くことになる。整形はここ 1 箇所
-    # に留める。iOS / Android / macOS には無害な追加フィールド。
-    #
-    # ⚠ **title は載せない。** サーバーから来ない（normalize_announcement が
-    # id / content / published_at に落としている）ので、capsicum 側の統一ラベル表
-    # （`notification_type_label.cpp` の `announcement` →「お知らせ」）で解決する。
+    # ⚠ **ここは全 device_type 共通の最小形に保つ。** Windows 用の
+    # `announcement_body` は [wns_payload] が配送時に足す。ここに足すと 4KB 上限に
+    # 近いお知らせが APNs / FCM で新たに上限超えになりうるうえ、degrade でも救えず
+    # 再送もされない（Codex P1 / PR #43。詳細は wns_payload のコメント）。
     def build_payload(server, announcement)
       {
         'notification_type' => 'announcement',
         'server' => server,
         'announcement_id' => announcement['id'].to_s,
         'announcement_content' => announcement['content'].to_s,
-        'announcement_body' => summarize_content(announcement['content'].to_s),
         'announcement_published_at' => announcement['published_at'].to_s,
       }
     end
