@@ -30,7 +30,7 @@ class AnnouncementSubscriptionRouteTest < RequestTestCase
   end
 
   def test_rejects_missing_fields
-    post_json('/announcement_subscriptions', @body.reject {|k, _| k == :account})
+    post_json('/announcement_subscriptions', @body.except(:account))
 
     assert_equal(400, last_response.status)
     assert_match('account', json_response['error'])

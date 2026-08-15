@@ -41,7 +41,7 @@ class RegisterRouteTest < RequestTestCase
   end
 
   def test_rejects_missing_fields
-    post_json('/register', VALID.reject {|k, _| k == :server})
+    post_json('/register', VALID.except(:server))
 
     assert_equal(400, last_response.status)
     assert_match('server', json_response['error'])

@@ -25,11 +25,11 @@ require 'app'
 # localhost 系に絞る。Rack::Test は `example.org` を名乗るので、そのままだと
 # **全リクエストが 403** になる。本番は `RACK_ENV=production` で素通しなので、
 # ここだけテスト側で開ける（アプリの設定は変えない）。
-Relay::App.set(:host_authorization, {permitted_hosts: []})
+Relay::BaseApp.set(:host_authorization, {permitted_hosts: []})
 
 # route は登録・配信のたびに info ログを吐く。テスト出力に混ぜても読めないので
 # 捨てる（ログの内容そのものを検証するケースは今のところ無い）。
-Relay::App.set(:logger, Logger.new(File::NULL))
+Relay::BaseApp.set(:logger, Logger.new(File::NULL))
 
 # route の request テストの土台 (#34)。
 #
