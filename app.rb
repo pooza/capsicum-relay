@@ -1,6 +1,7 @@
 require_relative 'lib/relay/base_app'
 require_relative 'lib/relay/routes/announcement_subscriptions'
 require_relative 'lib/relay/routes/health'
+require_relative 'lib/relay/routes/metrics'
 require_relative 'lib/relay/routes/push'
 require_relative 'lib/relay/routes/register'
 require_relative 'lib/relay/routes/supporters'
@@ -23,6 +24,7 @@ module Relay
 
     use Routes::AnnouncementSubscriptions
     use Routes::Health
+    use Routes::Metrics
     use Routes::Push
     use Routes::Register
     use Routes::Supporters

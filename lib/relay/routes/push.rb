@@ -49,7 +49,10 @@ module Relay
             length: request.content_length,
           )
 
-          settings.logger.info("Push deduped (#{sub['device_type']}): #{sub['account']}")
+          record_push_outcome(
+            sub, 'deduped',
+            msg: "Push deduped (#{sub['device_type']}): #{sub['account']}"
+          )
           return true
         end
       end

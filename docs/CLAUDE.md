@@ -184,19 +184,40 @@ curl https://relay.capsicum.shrieker.net/health
 
 #### なぜ Sentry だけでは足りないか
 
-- relay が Sentry へ上げているのは**失敗側だけ**。成功は `logger.info` にしか出ない（`Pushed to <device_type>: <account>`）ので、Sentry を見ると失敗だけが並び、母数が見えない
+- relay が Sentry へ上げているのは**失敗側だけ**。成功は journald と `/metrics` にしか出ないので、Sentry を見ると失敗だけが並び、母数が見えない
 - WNS の `dropped` は**端末がオフライン / スリープで受け取れなかった**という正常系。PC を消している時間が長い利用者ほど積み上がるので、件数の多さは不具合の証拠にならない
 - capsicum 側の `push.wns_bgtask: bgtask.shown` は、bg task が LocalState に書いた記録を**次回アプリ起動時に**回収して送る方式。**「出ていない ＝ トーストが出ていない」ではない**（アプリを起動していないだけ）
 
 #### 手順
 
+まず `/metrics` で母数と内訳を見る（#2）。14 日ぶんの journald を走査する前に、「そもそも relay に届いているか / 送れているか」がここで分かる。
+
+```bash
+curl -s -H "X-Relay-Secret: $SECRET" https://relay.capsicum.shrieker.net/metrics \
+  | grep relay_push_total
+```
+
+`relay_push_total{device_type,outcome}` の `outcome` は `success` / `deduped` / `degraded` / `gone` / `oversized` / `failed` / `wns_<status>`。⚠ **counter はプロセス再起動でゼロに戻る**（in-memory）。再起動の位置は `/health` の `revision` の変化で分かる。
+
+期間や個別アカウントを見るときは journald を読む。ログは **1 行 = 1 JSON**（#2）。
+
 ```bash
 ssh deploy@flauros.b-shock.co.jp
+journalctl -u capsicum-relay --no-pager --since "-14 days" -o cat \
+  | grep '"event":"push.result"' \
+  | jq -r '[.ts, .device_type, .outcome, .account] | @tsv'
+```
+
+⚠ **従来の grep もそのまま効く。** JSON の中に人間向けの `msg`（`Pushed to windows: <account>` / `WNS delivered but dropped: <account>`）を同じ文言で残してあるため。
+
+```bash
 journalctl -u capsicum-relay --no-pager --since "-14 days" -o short-iso \
   | grep -E "Pushed to windows:|WNS delivered but dropped:"
 ```
 
-`Pushed to <device_type>:` が成功、`WNS delivered but dropped:` が drop。アカウント別に数えて成功率を出し、さらに**時刻（JST）別の分布**を見る。
+`outcome=success`（＝`Pushed to <device_type>:`）が成功、`outcome=wns_dropped`（＝`WNS delivered but dropped:`）が drop。アカウント別に数えて成功率を出し、さらに**時刻（JST）別の分布**を見る。
+
+`request_id` は応答の `X-Request-Id` と同じ値で、Sentry イベントにも同名の tag が乗る。特定の 1 リクエストを追うときはこれで 3 者を突き合わせる。
 
 #### 判定基準
 
