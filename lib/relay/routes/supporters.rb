@@ -23,8 +23,12 @@ module Relay
           count: count,
         )
 
-        settings.logger.info(
-          "Supporter tip recorded: #{supporter['account']} (count=#{count})",
+        metrics.increment('relay_supporter_tip_total', {}, by: count)
+        log_event(
+          'supporter.tip',
+          msg: "Supporter tip recorded: #{supporter['account']} (count=#{count})",
+          account: supporter['account'], server: supporter['server'],
+          count: count, latency_ms: latency_ms
         )
         status 201
         supporter.to_json

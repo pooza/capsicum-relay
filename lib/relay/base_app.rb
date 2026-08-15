@@ -1,13 +1,17 @@
 require 'json'
 require 'logger'
+require 'securerandom'
 require 'sinatra/base'
 require 'yaml'
 require_relative 'announcement_worker'
 require_relative 'apns_client'
 require_relative 'database'
 require_relative 'fcm_client'
+require_relative 'metrics'
 require_relative 'push_dedup'
 require_relative 'push_helpers'
+require_relative 'sentry_setup'
+require_relative 'structured_log'
 require_relative 'wns_client'
 
 module Relay
@@ -39,8 +43,14 @@ module Relay
 
     configure do
       set :config, YAML.load_file(config_path)
-      set :database, Relay::Database.new(path: database_path)
-      set :logger, Logger.new($stdout)
+      # ⚠ **logger を先に作る。** Database / 各クライアントは construct 時の
+      # logger を握るので、あとから set しても差し替わらない。順番を崩すと
+      # 孤児 subscription の掃除 (Database#purge_legacy_rows 等) だけが素の
+      # Logger で出て、「1 行 = 1 JSON」の約束が破れる (Codex P2 / PR #42)。
+      # 1 行 = 1 JSON。人間向けの msg も同じ行に残す (#2・StructuredLog 参照)。
+      set :logger, Logger.new($stdout, formatter: Relay::StructuredLog::FORMATTER)
+      set :database, Relay::Database.new(path: database_path, logger: settings.logger)
+      set :metrics, Relay::Metrics.new
 
       if settings.config.dig('apns', 'key_path')
         set :apns, Relay::ApnsClient.new(settings.config, logger: settings.logger)
@@ -75,6 +85,14 @@ module Relay
 
     before do
       content_type :json
+      start_request!
+    end
+
+    # 応答に request_id を返す。capsicum 側の Sentry breadcrumb と journald を
+    # 突き合わせるための取っ手 (#2)。⚠ **middleware として連なった route クラスの
+    # after も走る**ので、既に付いていれば上書きしない。
+    after do
+      headers['X-Request-Id'] = request_id
     end
 
     # push 送信・結果ハンドリング系（build_push_payload / dispatch_push /
@@ -100,6 +118,53 @@ module Relay
         return if missing.empty?
 
         halt 400, {error: "Missing fields: #{missing.join(', ')}"}.to_json
+      end
+
+      # request_id と開始時刻を env に置く (#2)。
+      #
+      # ⚠ **route クラスを middleware として連ねているので before が何度も走る**
+      # （一致しない route クラスも before を回してから forward する）。既に
+      # 置いてあれば触らない。
+      #
+      # 現状ログを書くのは一致した route だけなので、これが無くても出力される
+      # id は揃う。それでも先に置くのは 2 点のため:
+      # - `latency_ms` が**チェーン全体**を測る（毎回上書きすると、最後の
+      #   middleware から route までの区間しか測らなくなる）
+      # - Sentry の scope へ同じ tag を連鎖のぶん何度も投げない
+      def start_request!
+        return if request.env['relay.request_id']
+
+        # 上流 (nginx) が採番していればそれに乗る。無ければここで採る。
+        id = request.env['HTTP_X_REQUEST_ID'].to_s
+        id = SecureRandom.uuid if id.empty?
+        request.env['relay.request_id'] = id
+        request.env['relay.started_at'] = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        Relay::SentrySetup.tag_request(id)
+      end
+
+      def request_id
+        return request.env['relay.request_id']
+      end
+
+      def latency_ms
+        started_at = request.env['relay.started_at']
+        return nil unless started_at
+
+        elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at
+        return (elapsed * 1000).round
+      end
+
+      # 構造化ログの入口 (#2)。`msg` は人間向けの 1 行で、grep 手順を壊さないため
+      # 従来と同じ文言を渡す。それ以外は jq で集計するためのフィールド。
+      def log_event(event, msg:, level: :info, **fields)
+        settings.logger.public_send(
+          level,
+          {event: event, request_id: request_id, msg: msg}.merge(fields),
+        )
+      end
+
+      def metrics
+        return settings.metrics
       end
     end
   end

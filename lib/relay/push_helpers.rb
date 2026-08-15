@@ -18,6 +18,29 @@ module Relay
     # （手順は docs/CLAUDE.md「配信不達の切り分け」）。
     WNS_BENIGN_STATUSES = ['dropped'].freeze
 
+    # push 1 通の結末を、構造化ログ 1 行と counter 1 つに落とす (#2)。
+    #
+    # ⚠ **outcome はここを唯一の出口にする。** 従来は結末ごとに logger 呼び出しが
+    # 散っていて、新しい結末を足すたびに計装を書き忘れる形だった（WNS の
+    # `dropped` が長らく件数として見えなかったのがそれ）。
+    #
+    # `msg` は従来と同じ文言。docs/CLAUDE.md「配信不達の切り分け」の grep 手順を
+    # 壊さないため（Relay::StructuredLog 参照）。
+    def record_push_outcome(sub, outcome, msg:, level: :info, **fields)
+      metrics.increment(
+        'relay_push_total', {device_type: sub['device_type'], outcome: outcome}
+      )
+      log_event(
+        'push.result', msg: msg, level: level,
+        outcome: outcome,
+        device_type: sub['device_type'],
+        account: sub['account'],
+        server: sub['server'],
+        latency_ms: latency_ms,
+        **fields
+      )
+    end
+
     def build_push_payload(sub)
       payload = {
         'body' => Base64.strict_encode64(request.body.read),
@@ -59,21 +82,44 @@ module Relay
     end
 
     def log_push_received(sub)
-      # 各サーバーがどの暗号化形式で送ってくるかを diagnose できるよう、
-      # Content-Encoding と関連ヘッダの有無をログに残す (#5)。機密情報は
-      # 含まないため常時出力。capsicum 側の復号 (#336) 検証時に役立つ。
-      encoding = request.env['HTTP_CONTENT_ENCODING'].to_s
-      crypto_key = request.env['HTTP_CRYPTO_KEY'] ? '+ck' : ''
-      encryption = request.env['HTTP_ENCRYPTION'] ? '+enc' : ''
-      # len / topic は dedup (#16) の判別材料の効きを後追いするための観測。
-      # 同一通知の重複バーストが同一 len かつ、別通知が別 len になっているかを
-      # ログで検証してから窓・キーを調整する。
-      topic = request.env['HTTP_TOPIC'] ? '+topic' : ''
-      settings.logger.info(
-        "Received push: #{sub['account']} (#{sub['device_type']}," \
-          " encoding=#{encoding.inspect}#{crypto_key}#{encryption}" \
-          " len=#{request.content_length}#{topic})",
+      log_event(
+        'push.received',
+        msg: push_received_message(sub),
+        device_type: sub['device_type'],
+        account: sub['account'],
+        server: sub['server'],
+        # ⚠ push_token は capability secret。指紋だけ残す。
+        push_token: Relay::StructuredLog.fingerprint(sub['push_token']),
+        **push_received_fields,
       )
+    end
+
+    # 各サーバーがどの暗号化形式で送ってくるかを diagnose できるようにする (#5)。
+    # len / topic は dedup (#16) の判別材料の効きを後追いするための観測で、同一
+    # 通知の重複バーストが同一 len かつ別通知が別 len になっているかを見てから
+    # 窓・キーを調整する。機密情報は含まないため常時出力。
+    def push_received_fields
+      return {
+        encoding: request.env['HTTP_CONTENT_ENCODING'].to_s,
+        has_crypto_key: !request.env['HTTP_CRYPTO_KEY'].nil?,
+        has_encryption: !request.env['HTTP_ENCRYPTION'].nil?,
+        has_topic: !request.env['HTTP_TOPIC'].nil?,
+        # Rack は String で返す。jq で数値比較したいので整数に寄せる。
+        length: request.content_length&.to_i,
+      }
+    end
+
+    # 従来と同じ 1 行。docs/CLAUDE.md「配信不達の切り分け」の grep 手順を壊さない。
+    def push_received_message(sub)
+      fields = push_received_fields
+      flags = [
+        (fields[:has_crypto_key] ? '+ck' : ''),
+        (fields[:has_encryption] ? '+enc' : ''),
+      ].join
+      topic = fields[:has_topic] ? '+topic' : ''
+      return "Received push: #{sub['account']} (#{sub['device_type']}," \
+        " encoding=#{fields[:encoding].inspect}#{flags}" \
+        " len=#{fields[:length]}#{topic})"
     end
 
     def handle_push_result(sub, result)
@@ -104,7 +150,7 @@ module Relay
       return handle_wns_status(sub, result, wns_status) if wns_status && wns_status != 'received'
       return handle_push_degraded(sub, result) if result[:degraded]
 
-      settings.logger.info("Pushed to #{sub['device_type']}: #{sub['account']}")
+      record_push_outcome(sub, 'success', msg: "Pushed to #{sub['device_type']}: #{sub['account']}")
       return {status: 'delivered'}.to_json
     end
 
@@ -115,9 +161,11 @@ module Relay
     # 別メッセージにして、本当の不達が 0 になったことを確認できるようにする。件数が
     # 青天井になるようなら WNS_BENIGN_STATUSES と同じくログのみへ落とす。
     def handle_push_degraded(sub, result)
-      settings.logger.warn(
-        "Push degraded to generic alert: #{sub['account']}" \
+      record_push_outcome(
+        sub, 'degraded', level: :warn,
+        msg: "Push degraded to generic alert: #{sub['account']}" \
           " (#{sub['device_type']}, #{result[:original_size]}B)",
+        original_size: result[:original_size]
       )
       Relay::SentrySetup.capture_message(
         "Push oversized degraded (#{sub['device_type']})",
@@ -134,10 +182,11 @@ module Relay
     def handle_wns_status(sub, result, wns_status)
       benign = WNS_BENIGN_STATUSES.include?(wns_status)
       message = "WNS delivered but #{wns_status}: #{sub['account']}"
-      if benign
-        settings.logger.info(message)
-      else
-        settings.logger.warn(message)
+      record_push_outcome(
+        sub, "wns_#{wns_status}", level: benign ? :info : :warn,
+        msg: message, wns_status: wns_status
+      )
+      unless benign
         Relay::SentrySetup.capture_message(
           "WNS notification #{wns_status} (windows)",
           level: :warning,
@@ -153,7 +202,10 @@ module Relay
       # relay 側の行も掃除する。
       settings.database.unregister(sub['id'])
       reason = result[:reason] || result[:status]
-      settings.logger.info("Subscription gone: #{sub['account']} (#{reason})")
+      record_push_outcome(
+        sub, 'gone',
+        msg: "Subscription gone: #{sub['account']} (#{reason})", reason: reason
+      )
       status 410
       return {status: 'gone', detail: result}.to_json
     end
@@ -163,9 +215,11 @@ module Relay
       # subscription は健全なので unregister せず、Mastodon にも 413 を
       # 返してこの 1 通だけドロップさせる。permanent: false のままだと
       # Mastodon が retry を続けてログを汚すため、ここで明示的に止める (#9)。
-      settings.logger.warn(
-        "Push oversized (subscription kept): #{sub['account']}" \
+      record_push_outcome(
+        sub, 'oversized', level: :warn,
+        msg: "Push oversized (subscription kept): #{sub['account']}" \
           " (#{sub['device_type']}): #{result}",
+        reason: result[:reason] || result[:status]
       )
       # 健全な subscription を残したまま 1 通だけドロップする想定挙動だが、
       # 多発は送信側のペイロード設計問題を示すので warning として件数観測する
@@ -180,7 +234,10 @@ module Relay
     end
 
     def handle_push_failed(sub, result)
-      settings.logger.error("Push failed: #{result}")
+      record_push_outcome(
+        sub, 'failed', level: :error,
+        msg: "Push failed: #{result}", reason: result[:reason] || result[:status]
+      )
       # 一過性でない送信失敗（APNs / FCM の 5xx 等）。低頻度・高インパクトなので
       # journalctl 任せにせず Sentry で alert 駆動にする (#10 Phase B、#8 の後継観測)。
       Relay::SentrySetup.capture_message(

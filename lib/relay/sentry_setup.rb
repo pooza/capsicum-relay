@@ -49,6 +49,14 @@ module Relay
       return "#{str[0, 6]}…#{str[-4, 4]}"
     end
 
+    # relay の journald と Sentry イベントを突き合わせるための request_id (#2)。
+    # 以降このリクエストで送るイベントに tag として乗る。
+    def self.tag_request(request_id)
+      return unless Sentry.initialized?
+
+      Sentry.configure_scope {|scope| scope.set_tag('request_id', request_id)}
+    end
+
     # 以下の capture 系 / breadcrumb は Sentry 未初期化時 (development / test) は
     # no-op。呼び出し側のガードをここに集約し、計装コードを簡潔に保つ。
 

@@ -22,9 +22,16 @@ module Relay
           device_id: json_body['device_id'],
         )
 
-        settings.logger.info(
-          "Registered: #{sub['account']} (#{sub['device_type']}," \
+        metrics.increment('relay_register_total', {action: 'created'})
+        log_event(
+          'register.created',
+          msg: "Registered: #{sub['account']} (#{sub['device_type']}," \
             " device_id=#{sub['device_id'] ? 'yes' : 'none'})",
+          device_type: sub['device_type'],
+          account: sub['account'],
+          server: sub['server'],
+          has_device_id: !sub['device_id'].nil?,
+          latency_ms: latency_ms,
         )
         status 201
         sub.to_json
@@ -36,7 +43,12 @@ module Relay
         sub = settings.database.unregister(params[:id].to_i)
         halt 404, {error: 'Not found'}.to_json unless sub
 
-        settings.logger.info("Unregistered: #{sub['account']}")
+        metrics.increment('relay_register_total', {action: 'deleted'})
+        log_event(
+          'register.deleted', msg: "Unregistered: #{sub['account']}",
+          device_type: sub['device_type'], account: sub['account'],
+          server: sub['server'], latency_ms: latency_ms
+        )
         sub.to_json
       end
 
