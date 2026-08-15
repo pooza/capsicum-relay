@@ -72,11 +72,14 @@ module Relay
       # interval が 0 / negative なら無効化 (テスト時等)。
       interval = settings.config.dig('announcement', 'poll_interval')
       if interval.nil? || interval.to_i.positive?
-        set :announcement_worker, Relay::AnnouncementWorker.new(
+        # ⚠ **push クライアントの配線は worker 側 (from_settings) が持つ** (#36
+        # Phase 2)。ここに列挙していたときは、`deliver` に device_type を足しても
+        # 渡し忘れれば「購読行はあるのに 1 通も届かない」形になり、例外にならない
+        # ぶんテストにもログにも出なかった。
+        set :announcement_worker, Relay::AnnouncementWorker.from_settings(
+          settings,
           database: settings.database,
           logger: settings.logger,
-          apns: (settings.respond_to?(:apns) ? settings.apns : nil),
-          fcm: (settings.respond_to?(:fcm) ? settings.fcm : nil),
           interval: interval&.to_i || Relay::AnnouncementWorker::DEFAULT_INTERVAL,
         )
         settings.announcement_worker.start!
