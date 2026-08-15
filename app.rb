@@ -23,13 +23,25 @@ module Relay
   # だが、request テストの土台が無く回帰を検知できない（Database の migration 抽出
   # を見送ったのと同じ理由・#27 スコープ外）。土台が入ってから別 issue で。
   class App < Sinatra::Base # rubocop:disable Metrics/ClassLength
-    CONFIG_PATH = File.expand_path('config/settings.yml', __dir__)
+    DEFAULT_CONFIG_PATH = File.expand_path('config/settings.yml', __dir__)
+
+    # 読み込む設定ファイル。`RELAY_CONFIG_PATH` で差し替えられる (#34)。
+    # request テストは本番の秘密情報を持たないので、fixture を指して起動する。
+    def self.config_path
+      return ENV.fetch('RELAY_CONFIG_PATH', DEFAULT_CONFIG_PATH)
+    end
+
+    # 開く DB。`RELAY_DB_PATH` で差し替えられる (#34)。request テストは
+    # 一時ファイルを指す。
+    def self.database_path
+      return ENV.fetch('RELAY_DB_PATH', Relay::Database::DB_PATH)
+    end
 
     use Sentry::Rack::CaptureExceptions if Relay::SentrySetup.enabled?
 
     configure do
-      set :config, YAML.load_file(CONFIG_PATH)
-      set :database, Relay::Database.new
+      set :config, YAML.load_file(config_path)
+      set :database, Relay::Database.new(path: database_path)
       set :logger, Logger.new($stdout)
 
       if settings.config.dig('apns', 'key_path')

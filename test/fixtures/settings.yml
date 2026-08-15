@@ -1,0 +1,10 @@
+# request テスト (#34) 用の設定。本番の秘密情報は一切持たない。
+#
+# apns / fcm / wns は **意図的に空**。クライアントが構築されないので、
+# /push は実送信まで行かず 503 (not configured) で止まる。実送信の検証は
+# 各クライアントの unit テストの担当で、ここは route の責務だけを見る。
+shared_secret: "test-secret"
+
+# 0 で polling worker を無効化する。テストプロセスに常駐スレッドを残さない。
+announcement:
+  poll_interval: 0
