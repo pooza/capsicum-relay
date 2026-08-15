@@ -160,6 +160,29 @@ class ObservabilityRouteTest < RequestTestCase
     assert_equal(1, records('push.received').size)
   end
 
+  # ⚠ Database / 各クライアントは construct 時の logger を握る。あとから set
+  # しても差し替わらないので、logger を先に作る順序が守られていないと孤児掃除の
+  # ログだけ素の Logger で出て「1 行 = 1 JSON」が破れる (Codex P2 / PR #42)。
+  # ⚠ setup がこのテスト用に settings.logger を差し替えているので、Database が
+  # 握っているのは configure 時の実体。同一性ではなく **formatter が構造化ログの
+  # ものであること** を見る（それが「1 行 = 1 JSON」の実体）。
+  def test_database_logs_through_the_structured_logger
+    assert_same(
+      Relay::StructuredLog::FORMATTER,
+      settings.database.instance_variable_get(:@logger).formatter,
+    )
+  end
+
+  # 出力された行がすべて JSON であること（未計装の呼び出しも formatter が包む）。
+  def test_every_line_is_json
+    register_subscription
+    settings.logger.info('uninstrumented line')
+
+    @log.string.each_line do |line|
+      JSON.parse(line)
+    end
+  end
+
   ## /metrics
 
   def test_metrics_requires_secret

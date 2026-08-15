@@ -43,9 +43,13 @@ module Relay
 
     configure do
       set :config, YAML.load_file(config_path)
-      set :database, Relay::Database.new(path: database_path)
+      # ⚠ **logger を先に作る。** Database / 各クライアントは construct 時の
+      # logger を握るので、あとから set しても差し替わらない。順番を崩すと
+      # 孤児 subscription の掃除 (Database#purge_legacy_rows 等) だけが素の
+      # Logger で出て、「1 行 = 1 JSON」の約束が破れる (Codex P2 / PR #42)。
       # 1 行 = 1 JSON。人間向けの msg も同じ行に残す (#2・StructuredLog 参照)。
       set :logger, Logger.new($stdout, formatter: Relay::StructuredLog::FORMATTER)
+      set :database, Relay::Database.new(path: database_path, logger: settings.logger)
       set :metrics, Relay::Metrics.new
 
       if settings.config.dig('apns', 'key_path')
