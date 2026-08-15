@@ -41,4 +41,6 @@ group :development do
   # BUNDLE_WITHOUT=development なので本番には入らない。
   gem 'minitest'
   gem 'rake'
+  # route の request テスト (#34)。app.rb を Rack app として直接叩く。
+  gem 'rack-test'
 end

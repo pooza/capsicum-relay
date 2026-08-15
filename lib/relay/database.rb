@@ -24,9 +24,14 @@ module Relay
     # 超えるのは実際に使われていない行だけになる。詳細は purge_legacy_rows 参照。
     LEGACY_ROW_GRACE_DAYS = 14
 
-    def initialize(logger: Logger.new($stdout))
+    # [path] は開く DB ファイル。省略時は [DB_PATH]（既定の評価は呼び出し時
+    # なので、既存テストの `const_set(:DB_PATH, ...)` 差し替えも従来どおり効く）。
+    #
+    # ⚠ **env をここで読まない。** 「どのテストが先に require したか」で本番 DB を
+    # 掴む形になりうる。テスト用の差し替えは呼び出し側（App）が明示的に渡す (#34)。
+    def initialize(logger: Logger.new($stdout), path: DB_PATH)
       @logger = logger
-      @db = SQLite3::Database.new(DB_PATH)
+      @db = SQLite3::Database.new(path)
       @db.results_as_hash = true
       @db.execute('PRAGMA journal_mode=WAL')
       @db.execute('PRAGMA foreign_keys=ON')
