@@ -13,17 +13,53 @@ module Relay
   # 必須なため relay から直接は叩けない）。Mastodon / Misskey 両対応で、
   # normalize_announcement が published_at / createdAt の差分を吸収する。
   # 各サーバーの mulukhiya が features.announcement_push: true (5.24.0+) で有効。
-  class AnnouncementWorker
+  #
+  # ⚠ ClassLength を inline で許容している。#36 Phase 2 で 4 つ目の配送先
+  # (WNS) が入り、.rubocop.yml の 130 行（クライアント系クラスの実態に合わせた
+  # 上限）を数行超えた。polling → 正規化 → payload 組み立て → 配送は 1 つの
+  # 凝集した単位で、切るなら ApnsClient / ApnsPayload と同じ「payload の seam」
+  # だが、それは Phase 2 の範囲外。共有の上限を全クラスぶん緩めるより、
+  # .rubocop.yml が明記している「超えるクラスは個別に inline disable」に倣う。
+  class AnnouncementWorker # rubocop:disable Metrics/ClassLength
     DEFAULT_INTERVAL = 60
     REQUEST_TIMEOUT = 10
 
-    def initialize(database:, logger:, apns: nil, fcm: nil, interval: DEFAULT_INTERVAL)
+    # ⚠ ParameterLists を inline で許容している。6 つすべて**キーワード引数**で、
+    # このコップが狙う「順序を覚えられない位置引数の列」にはあたらない。増えたのは
+    # push クライアントが 4 種そろったためで、束ねると base_app 側の
+    # `settings.respond_to?` の分岐が別の入れ物へ移るだけになる。
+    # rubocop:disable Metrics/ParameterLists
+    def initialize(database:, logger:, apns: nil, fcm: nil, wns: nil, interval: DEFAULT_INTERVAL)
       @database = database
       @logger = logger
       @apns = apns
       @fcm = fcm
+      @wns = wns
       @interval = interval
       @stop = false
+    end
+    # rubocop:enable Metrics/ParameterLists
+
+    # Sinatra の settings から push クライアントを拾って組み立てる (#36 Phase 2)。
+    #
+    # ⚠ **「どのクライアントを渡すか」を `deliver` の case と同じファイルに置く**
+    # のが目的。base_app 側に配線を散らしていたときは、`deliver` に `windows` を
+    # 足しても渡し忘れれば「購読行はあるのに 1 通も届かない」形になり、しかも
+    # 例外にならないので**テストにもログにも出なかった**（実測で確認した）。
+    # ここに寄せたので、下の from_settings のテストが 4 種すべての導通を見る。
+    #
+    # 各クライアントは config に鍵が無ければ `set` されない（base_app 参照）ので、
+    # respond_to? で存在を確かめてから渡す。未設定なら nil のまま = その device_type
+    # へは送らない。
+    def self.from_settings(settings, database:, logger:, interval: DEFAULT_INTERVAL)
+      return new(
+        database: database,
+        logger: logger,
+        interval: interval,
+        apns: (settings.respond_to?(:apns) ? settings.apns : nil),
+        fcm: (settings.respond_to?(:fcm) ? settings.fcm : nil),
+        wns: (settings.respond_to?(:wns) ? settings.wns : nil),
+      )
     end
 
     def start!
@@ -131,11 +167,9 @@ module Relay
     # 持たない push を早期 guard で素通しし、ここで付ける `aps.alert` が
     # そのまま表示される（#17 で実測済みの挙動）。
     #
-    # ⚠ **`windows` はまだ足さない**（Phase 2）。WNS raw push には `aps.alert`
-    # に相当する OS 側の表示機構が無く、capsicum の bg task は Web Push の
-    # 暗号化ペイロードしか解釈しない（無暗号化は `bgtask.not_encrypted` で
-    # 捨てる）。ここだけ足しても **Windows では黙って捨てられる**ので、
-    # capsicum#978 が入ってから対にする。
+    # `windows` は WNS raw push（Phase 2 / capsicum#978）。`aps.alert` に相当する
+    # OS 側の表示機構が無いので、トーストは capsicum の bg task が
+    # `announcement_body` から自分で組む。alert はここでは使わない。
     def deliver(sub:, payload:, alert:)
       enriched = payload.merge('account' => sub['account'])
       case sub['device_type']
@@ -147,14 +181,54 @@ module Relay
         return unless @fcm
 
         @fcm.push(device_token: sub['token'], payload: enriched)
+      when 'windows'
+        return unless @wns
+
+        @wns.push(device_token: sub['token'], payload: wns_payload(enriched))
       end
     rescue StandardError => e
       report_error("deliver(#{sub['device_type']})", e)
     end
 
+    # Windows 宛だけの payload 変形 (#36 Phase 2 / capsicum#978)。
+    #
+    # **`announcement_body` を足す。** WNS raw push には `aps.alert` に相当する
+    # OS 側の表示機構が無く、トーストは capsicum の bg task が自分で組む。
+    # `announcement_content` は HTML のままなので、整形済みの本文をここで渡さないと
+    # C++/WinRT 側に HTML 剥がしと UTF-8 の文字数え（バイトで切ると日本語が壊れる）を
+    # **3 つ目の実装として**書くことになる（Ruby の summarize_content / Dart の
+    # PushMessageDispatcher.synthesizeAnnouncementBody に続いて）。
+    #
+    # **`announcement_content` は落とす。** Windows が読むのは `account` /
+    # `announcement_body` / `announcement_id` だけで、HTML は 1 バイトも使わない
+    # （capsicum `web_push_receive.cpp` の TryBuildAnnouncementDisplay）。WNS raw の
+    # 上限 5000 バイトを超えると [Relay::WnsClient] の送信前チェックが 1 通まるごと
+    # 落とすので、載せたままだと「表示に使わないデータのせいで通知そのものが消える」。
+    # 落とせば残るのは 80 文字の本文とメタだけで、長文のお知らせでも上限に近づかない。
+    #
+    # ⚠ **どちらの変形も windows 宛に閉じている**（Codex P1 / PR #43）。
+    # - content を落とすのは windows だけ。iOS / macOS / Android は capsicum が
+    #   そこからフル HTML をレンダリングする経路 (#477) を持っており、落とすと壊れる。
+    # - body を足すのも windows だけ。全 device_type に足すと、4KB 上限に近い
+    #   お知らせが APNs / FCM で**新たに**上限超えになりうる。しかも
+    #   `ApnsPayload#degraded_payload` が落とすのは暗号化 Web Push 由来のキーだけ
+    #   なので degrade で救えず、`poll_server` は dispatch 後に
+    #   `mark_announcement_seen` を打つため**再送もされない**（その 1 通が永久に
+    #   失われる）。他の 3 種の payload は Phase 2 の前後でバイト単位で不変にする。
+    def wns_payload(payload)
+      return payload
+          .except('announcement_content')
+          .merge('announcement_body' => summarize_content(payload['announcement_content'].to_s))
+    end
+
     # APNs custom_payload / FCM data は capsicum 側で notification_type を見て
     # NotificationType.announcement に routing される (#477)。FCM の data は
     # transform_values(&:to_s) されるため flat な文字列値で構成する。
+    #
+    # ⚠ **ここは全 device_type 共通の最小形に保つ。** Windows 用の
+    # `announcement_body` は [wns_payload] が配送時に足す。ここに足すと 4KB 上限に
+    # 近いお知らせが APNs / FCM で新たに上限超えになりうるうえ、degrade でも救えず
+    # 再送もされない（Codex P1 / PR #43。詳細は wns_payload のコメント）。
     def build_payload(server, announcement)
       {
         'notification_type' => 'announcement',
