@@ -22,9 +22,10 @@ class AnnouncementWorkerTest < Minitest::Test
       @pushes = []
     end
 
+    # 返り値は deliver 側で使われない。真偽だけを返すと
+    # Naming/PredicateMethod に引っかかるので記録した配列をそのまま返す。
     def push(**kwargs)
-      @pushes << kwargs
-      return true
+      return @pushes << kwargs
     end
   end
 
@@ -109,7 +110,7 @@ class AnnouncementWorkerTest < Minitest::Test
     worker.send(
       :deliver,
       sub: {'device_type' => 'macos', 'token' => 'tok', 'account' => 'a@b'},
-      payload: {}, alert: {},
+      payload: {}, alert: {}
     )
   end
 end
