@@ -122,10 +122,24 @@ module Relay
       end
     end
 
+    # device_type ごとの配送先。分岐は通常の push 経路
+    # ([Relay::PushHelpers#push_client_for]) と**同じ形に揃える**（#36）。
+    #
+    # `macos` は iOS と同一 Bundle ID・同一 APNs Auth Key で送れるので、同じ
+    # クライアントに流すだけでよい (capsicum#468)。**capsicum 側の変更は不要**:
+    # iOS/macOS の Notification Service Extension は `body` / `encoding` を
+    # 持たない push を早期 guard で素通しし、ここで付ける `aps.alert` が
+    # そのまま表示される（#17 で実測済みの挙動）。
+    #
+    # ⚠ **`windows` はまだ足さない**（Phase 2）。WNS raw push には `aps.alert`
+    # に相当する OS 側の表示機構が無く、capsicum の bg task は Web Push の
+    # 暗号化ペイロードしか解釈しない（無暗号化は `bgtask.not_encrypted` で
+    # 捨てる）。ここだけ足しても **Windows では黙って捨てられる**ので、
+    # capsicum#978 が入ってから対にする。
     def deliver(sub:, payload:, alert:)
       enriched = payload.merge('account' => sub['account'])
       case sub['device_type']
-      when 'ios'
+      when 'ios', 'macos'
         return unless @apns
 
         @apns.push(device_token: sub['token'], payload: enriched, alert: alert)
