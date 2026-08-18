@@ -215,4 +215,61 @@ class ObservabilityRouteTest < RequestTestCase
 
     assert_includes(last_response.body, "relay_subscriptions 1\n")
   end
+
+  ## 認証の拒否 (#47)
+
+  # 以前は無言で halt しており、サーバー側から「リクエストが来ていない」と
+  # 「来たが弾いた」を区別できなかった。2026-08-18 に staging の journald が
+  # 空なのを見て「クライアントが投げていない」と誤診している (capsicum#994)。
+  def test_rejected_request_is_logged
+    get '/metrics'
+
+    assert_equal(401, last_response.status)
+    refute_empty(records('auth.rejected'), '401 がログに残っていない')
+  end
+
+  # ⚠ ヘッダ欠落と値違いを区別する。missing はビルド時に値を渡し忘れた形
+  # (capsicum#994 がこれ)、mismatch は値が古い形で、対処が違う。
+  def test_missing_secret_is_distinguished_from_a_wrong_one
+    get '/metrics'
+    assert_equal('missing', records('auth.rejected').last['reason'])
+
+    get('/metrics', {}, {'HTTP_X_RELAY_SECRET' => 'not-the-secret'})
+    assert_equal('mismatch', records('auth.rejected').last['reason'])
+  end
+
+  # 空文字は「送っていない」と同じ扱い。ヘッダの有無で分けると、空値を送って
+  # くるクライアント (dart-define が空のまま焼き込まれた形) が mismatch 側へ
+  # 落ちて、原因の読み違いにつながる。
+  def test_empty_secret_counts_as_missing
+    get('/metrics', {}, {'HTTP_X_RELAY_SECRET' => ''})
+
+    assert_equal('missing', records('auth.rejected').last['reason'])
+  end
+
+  # ⚠ secret そのものは絶対に残さない。
+  def test_rejection_log_never_contains_the_secret
+    get('/metrics', {}, {'HTTP_X_RELAY_SECRET' => 'super-secret-value'})
+
+    refute_includes(@log.string, 'super-secret-value')
+    refute_includes(@log.string, SECRET)
+  end
+
+  # 切り分けに要るのは「どのエンドポイントが弾かれたか」。
+  def test_rejection_log_carries_the_path
+    get '/metrics'
+
+    record = records('auth.rejected').last
+    assert_equal('/metrics', record['path'])
+    assert_equal('GET', record['method'])
+    refute_empty(record['request_id'].to_s)
+  end
+
+  # 通ったリクエストでは出さない（正常系がログを埋めない）。
+  def test_authorised_request_is_not_logged_as_rejected
+    get('/metrics', {}, auth_headers)
+
+    assert_equal(200, last_response.status)
+    assert_empty(records('auth.rejected'))
+  end
 end

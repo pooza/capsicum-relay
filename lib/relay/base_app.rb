@@ -103,10 +103,39 @@ module Relay
     helpers Relay::PushHelpers
 
     helpers do
+      # 共有シークレットによる認証 (#47)。
+      #
+      # ⚠ **弾いたことを必ずログに残す。** 以前は無言で halt しており、
+      # サーバー側から「リクエストが来ていない」と「来たが弾いた」を区別できな
+      # かった。2026-08-18 に staging の journald が空なのを見て「クライアントが
+      # 投げていない」と誤診している（実際は capsicum の debug ビルドが
+      # `--dart-define=RELAY_SECRET` 無しでビルドされ、空の secret を送っていた。
+      # pooza/capsicum#994）。原因はまったく別（向け先 / 資格情報）なので、
+      # ここが無音だと切り分けが端末側の画面頼みになる。
+      #
+      # ⚠ **secret そのものは絶対に出さない。**残すのは `missing`（ヘッダが無い
+      # / 空）か `mismatch`（値が違う）かの 2 値だけ。この区別に意味がある —
+      # `missing` はビルド時に値を渡し忘れた形、`mismatch` は値が古い形で、
+      # 対処が違う。
       def authenticate!
         secret = settings.config['shared_secret']
         provided = request.env['HTTP_X_RELAY_SECRET']
-        halt 401, {error: 'Unauthorized'}.to_json unless provided == secret
+        return if provided == secret
+
+        log_auth_rejected(provided)
+        halt 401, {error: 'Unauthorized'}.to_json
+      end
+
+      def log_auth_rejected(provided)
+        reason = provided.to_s.empty? ? 'missing' : 'mismatch'
+        log_event(
+          'auth.rejected',
+          level: :warn,
+          msg: "Rejected unauthenticated request: #{request.path_info} (#{reason})",
+          reason: reason,
+          path: request.path_info,
+          method: request.request_method,
+        )
       end
 
       def json_body
