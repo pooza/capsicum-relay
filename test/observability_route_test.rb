@@ -265,6 +265,36 @@ class ObservabilityRouteTest < RequestTestCase
     refute_empty(record['request_id'].to_s)
   end
 
+  # ⚠ path 自体に capability secret が載る route がある
+  # (`/push/:push_token` / `/announcement_subscriptions/:push_token`)。
+  # StructuredLog.fingerprint が push_token を指紋にしているのと同じ理由で、
+  # ここも生では出せない (PR #48 の Codex P1)。
+  #
+  # ⚠ `POST /push/:push_token` は **authenticate! を通らない**（送り手は shared
+  # secret を知らない Mastodon / Misskey サーバー）ので、この経路には来ない。
+  # 認証が要るのは register / announcement_subscriptions / supporters / metrics。
+  def test_rejection_log_redacts_the_token_in_the_path
+    get '/announcement_subscriptions/super-secret-push-token'
+
+    assert_equal(401, last_response.status)
+    refute_includes(@log.string, 'super-secret-push-token')
+    assert_equal('/announcement_subscriptions/…', records('auth.rejected').last['path'])
+  end
+
+  # id も同様に落とす（誰の subscription を消そうとしたかを残さない）。
+  def test_rejection_log_redacts_ids_too
+    delete '/register/12345'
+
+    assert_equal('/register/…', records('auth.rejected').last['path'])
+  end
+
+  # 可変部の無い route は畳まない。畳むとどのエンドポイントか分からなくなる。
+  def test_rejection_log_keeps_single_segment_paths_intact
+    post '/register'
+
+    assert_equal('/register', records('auth.rejected').last['path'])
+  end
+
   # 通ったリクエストでは出さない（正常系がログを埋めない）。
   def test_authorised_request_is_not_logged_as_rejected
     get('/metrics', {}, auth_headers)

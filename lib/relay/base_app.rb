@@ -128,14 +128,31 @@ module Relay
 
       def log_auth_rejected(provided)
         reason = provided.to_s.empty? ? 'missing' : 'mismatch'
+        path = redacted_path
         log_event(
           'auth.rejected',
           level: :warn,
-          msg: "Rejected unauthenticated request: #{request.path_info} (#{reason})",
+          msg: "Rejected unauthenticated request: #{path} (#{reason})",
           reason: reason,
-          path: request.path_info,
+          path: path,
           method: request.request_method,
         )
+      end
+
+      # ⚠ **`path_info` をそのまま残さない** (PR #48 の Codex P1)。
+      # `/push/:push_token` と `/announcement_subscriptions/:push_token` は
+      # **path 自体に capability secret が載る**。[Relay::StructuredLog.fingerprint]
+      # が push_token を指紋にしているのと同じ理由で、ここも生では出せない。
+      #
+      # 先頭セグメントだけ残せば「どのエンドポイントが弾かれたか」という切り分けに
+      # 要る情報は保てる。⚠ **allow-list ではなく既定で落とす形にするのが要点。**
+      # route が増えたときに自動で安全側へ倒れる（`/supporters/tip` のように可変部が
+      # 無い 2 段の route も畳まれるが、`method` で区別できる）。
+      def redacted_path
+        head = request.path_info.to_s.split('/')[1].to_s
+        return '/' if head.empty?
+
+        return request.path_info.to_s.count('/') > 1 ? "/#{head}/…" : "/#{head}"
       end
 
       def json_body
