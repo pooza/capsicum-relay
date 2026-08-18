@@ -103,10 +103,56 @@ module Relay
     helpers Relay::PushHelpers
 
     helpers do
+      # 共有シークレットによる認証 (#47)。
+      #
+      # ⚠ **弾いたことを必ずログに残す。** 以前は無言で halt しており、
+      # サーバー側から「リクエストが来ていない」と「来たが弾いた」を区別できな
+      # かった。2026-08-18 に staging の journald が空なのを見て「クライアントが
+      # 投げていない」と誤診している（実際は capsicum の debug ビルドが
+      # `--dart-define=RELAY_SECRET` 無しでビルドされ、空の secret を送っていた。
+      # pooza/capsicum#994）。原因はまったく別（向け先 / 資格情報）なので、
+      # ここが無音だと切り分けが端末側の画面頼みになる。
+      #
+      # ⚠ **secret そのものは絶対に出さない。**残すのは `missing`（ヘッダが無い
+      # / 空）か `mismatch`（値が違う）かの 2 値だけ。この区別に意味がある —
+      # `missing` はビルド時に値を渡し忘れた形、`mismatch` は値が古い形で、
+      # 対処が違う。
       def authenticate!
         secret = settings.config['shared_secret']
         provided = request.env['HTTP_X_RELAY_SECRET']
-        halt 401, {error: 'Unauthorized'}.to_json unless provided == secret
+        return if provided == secret
+
+        log_auth_rejected(provided)
+        halt 401, {error: 'Unauthorized'}.to_json
+      end
+
+      def log_auth_rejected(provided)
+        reason = provided.to_s.empty? ? 'missing' : 'mismatch'
+        path = redacted_path
+        log_event(
+          'auth.rejected',
+          level: :warn,
+          msg: "Rejected unauthenticated request: #{path} (#{reason})",
+          reason: reason,
+          path: path,
+          method: request.request_method,
+        )
+      end
+
+      # ⚠ **`path_info` をそのまま残さない** (PR #48 の Codex P1)。
+      # `/push/:push_token` と `/announcement_subscriptions/:push_token` は
+      # **path 自体に capability secret が載る**。[Relay::StructuredLog.fingerprint]
+      # が push_token を指紋にしているのと同じ理由で、ここも生では出せない。
+      #
+      # 先頭セグメントだけ残せば「どのエンドポイントが弾かれたか」という切り分けに
+      # 要る情報は保てる。⚠ **allow-list ではなく既定で落とす形にするのが要点。**
+      # route が増えたときに自動で安全側へ倒れる（`/supporters/tip` のように可変部が
+      # 無い 2 段の route も畳まれるが、`method` で区別できる）。
+      def redacted_path
+        head = request.path_info.to_s.split('/')[1].to_s
+        return '/' if head.empty?
+
+        return request.path_info.to_s.count('/') > 1 ? "/#{head}/…" : "/#{head}"
       end
 
       def json_body
