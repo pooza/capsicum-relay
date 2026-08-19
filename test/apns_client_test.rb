@@ -164,6 +164,7 @@ class ApnsClientTest < Minitest::Test
     assert(result[:success])
     refute(result[:degraded])
     sent = sent_payload(client)
+
     assert_equal('x' * 100, sent['body'])
     assert_equal('aes128gcm', sent['encoding'])
   end

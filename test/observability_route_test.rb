@@ -232,9 +232,11 @@ class ObservabilityRouteTest < RequestTestCase
   # (capsicum#994 がこれ)、mismatch は値が古い形で、対処が違う。
   def test_missing_secret_is_distinguished_from_a_wrong_one
     get '/metrics'
+
     assert_equal('missing', records('auth.rejected').last['reason'])
 
     get('/metrics', {}, {'HTTP_X_RELAY_SECRET' => 'not-the-secret'})
+
     assert_equal('mismatch', records('auth.rejected').last['reason'])
   end
 
@@ -260,6 +262,7 @@ class ObservabilityRouteTest < RequestTestCase
     get '/metrics'
 
     record = records('auth.rejected').last
+
     assert_equal('/metrics', record['path'])
     assert_equal('GET', record['method'])
     refute_empty(record['request_id'].to_s)
