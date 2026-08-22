@@ -173,7 +173,7 @@ Windows 実機（capsicum の Windows 機能検証機）に Ruby を入れて `r
 | SSH | `deploy@flauros.b-shock.co.jp` |
 | デプロイパス | `/home/deploy/repos/capsicum-relay` |
 | Ruby | rbenv 管理 |
-| プロセス管理 | systemd (`capsicum-relay.service`) |
+| プロセス管理 | systemd (`capsicum-relay.service`)。⚠ **unit の正本は chubo2 の cookbook**（`app/cookbooks/capsicum-relay/templates/capsicum-relay.service.erb`）。本リポジトリの `config/capsicum-relay.service.sample` はサンプルで、直しても実機には反映されない（#29） |
 | リバースプロキシ | nginx（HTTPS 終端、Let's Encrypt 自動更新） |
 | Puma | `127.0.0.1:9292`（nginx 背後） |
 
@@ -290,7 +290,7 @@ capsicum-relay/
   config/
     settings.yml.sample    # 設定ファイルテンプレート
     puma.rb                # Puma 設定
-    capsicum-relay.service # systemd ユニットファイル
+    capsicum-relay.service.sample # systemd ユニットの雛形（⚠ 稼働機の正本は chubo2 cookbook・#29）
     nginx.conf.sample      # nginx 設定テンプレート
   db/                  # SQLite データベース格納先
   Gemfile              # 依存 gem
