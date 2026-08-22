@@ -244,12 +244,46 @@ module Relay
     def push_to(client, sub, enriched, alert)
       case sub['device_type']
       when 'ios', 'macos'
-        return client.push(device_token: sub['token'], payload: enriched, alert: alert)
+        return client.push(device_token: sub['token'], payload: apns_payload(enriched),
+          alert: alert)
       when 'android'
         return client.push(device_token: sub['token'], payload: enriched)
       when 'windows'
         return client.push(device_token: sub['token'], payload: wns_payload(enriched))
       end
+    end
+
+    # iOS / macOS 宛だけの payload 変形 (#45)。dedup の手掛かり
+    # `capsicum_notification_id` を足す。
+    #
+    # **macOS でお知らせが二重に通知センターへ残る**のを掃除するためのキー。
+    # 背面のアプリでは `willPresent` が呼ばれず（プラグインの doc に 2026-06-12 の
+    # 実測として明記）OS 既定の banner が出るが、後始末役の capsicum
+    # `DeliveredPushCleaner` は**暗号化 `body` を持たない通知を解決不能＝削除対象外**
+    # にしている。お知らせは body を持たないので掃除されず、WebSocket 経路
+    # (capsicum#569) が出したローカル通知と 2 通並んだまま残る。
+    #
+    # 値を `announcement:<id>` にすると **capsicum 側は変更不要**で噛み合う:
+    # - ネイティブは `userInfo["capsicum_notification_id"]` を `stampedId` として拾う
+    # - `DeliveredPushCleaner._resolve` は `stampedId` があれば復号せず
+    #   `<account>|<stampedId>` を返す
+    # - WebSocket 側が登録するキーは `<account>|<notification id>` で、Mastodon /
+    #   Misskey の両 streaming ともお知らせの id を `announcement:<id>` にしている
+    #
+    # ⚠ **これで消えるのは通知センターの残骸だけ。** banner が 2 枚出ること自体は
+    # 消えない（macOS は NSE に didReceive を渡さず kill する・capsicum#673）。
+    # 通常の通知でも以前から同じ状態なので、これは**お知らせを通常通知と同水準に
+    # 揃える**変更。
+    #
+    # ⚠ **iOS / macOS に閉じる**（windows の変形と同じ理由）。キー 1 つで 50 バイト強
+    # 増え、APNs / FCM は 4KB 上限に対して degrade も再送も効かない（#44）。増分は
+    # 小さいが、上限に近いお知らせの余裕はそのぶん減るので、必要な経路にだけ足す。
+    # android は WebSocket 経路の dedup を持たないため、足しても使い道が無い。
+    def apns_payload(payload)
+      id = payload['announcement_id'].to_s
+      return payload if id.empty?
+
+      return payload.merge('capsicum_notification_id' => "announcement:#{id}")
     end
 
     # Windows 宛だけの payload 変形 (#36 Phase 2 / capsicum#978)。
