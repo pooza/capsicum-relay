@@ -263,6 +263,64 @@ class AnnouncementWorkerTest < Minitest::Test
     assert_empty(@wns.pushes)
   end
 
+  # --- iOS / macOS 宛だけの dedup stamp (#45) ---
+
+  def apns_payload(device_type: 'macos', announcement_id: '42')
+    deliver(
+      device_type,
+      payload: {'notification_type' => 'announcement', 'announcement_id' => announcement_id},
+    )
+    return @apns.pushes.first[:payload]
+  end
+
+  # ⚠ **本題**。macOS 背面では willPresent が呼ばれず OS 既定の banner が出るが、
+  # DeliveredPushCleaner は body を持たない通知を「解決不能＝削除対象外」にする。
+  # このキーがあると復号せず `<account>|announcement:<id>` を返せるので、
+  # WebSocket 経路 (capsicum#569) が登録した同じキーと一致して掃除される。
+  def test_apns_payload_carries_the_dedup_stamp
+    assert_equal('announcement:42', apns_payload['capsicum_notification_id'])
+  end
+
+  # iOS も同じ payload（同一 Bundle ID・同一 APNs Auth Key）。
+  def test_ios_payload_carries_the_dedup_stamp
+    assert_equal('announcement:42', apns_payload(device_type: 'ios')['capsicum_notification_id'])
+  end
+
+  # ⚠ **値の形は capsicum 側と噛み合う契約**。両 streaming がお知らせの通知 id を
+  # `announcement:<id>` にしているので、prefix を変えるとキーが一致しなくなり、
+  # 「残骸が消えない」に静かに戻る（例外にもテスト失敗にもならない）。
+  def test_dedup_stamp_uses_the_announcement_prefix
+    assert_equal(
+      'announcement:xyz', apns_payload(announcement_id: 'xyz')['capsicum_notification_id']
+    )
+  end
+
+  # id が無い（想定外の入力）ときは足さない。`announcement:` だけのキーは
+  # capsicum 側の別のお知らせと衝突しうる。
+  def test_dedup_stamp_is_omitted_without_an_id
+    deliver('macos', payload: {'notification_type' => 'announcement'})
+
+    refute(@apns.pushes.first[:payload].key?('capsicum_notification_id'))
+  end
+
+  # ⚠ 逆向きの固定。**android / windows には足さない。** キー 1 つで 50 バイト強
+  # 増え、APNs / FCM は 4KB 上限に対して degrade も再送も効かない (#44)。android は
+  # WebSocket 経路の dedup を持たず使い道が無い。windows は in-process 側が raw push
+  # を食い止めるので二重表示自体が起きない。
+  def test_other_device_types_do_not_gain_the_dedup_stamp
+    deliver('android', payload: {'notification_type' => 'announcement', 'announcement_id' => '42'})
+    deliver('windows', payload: {'notification_type' => 'announcement', 'announcement_id' => '42'})
+
+    refute(@fcm.pushes.first[:payload].key?('capsicum_notification_id'))
+    refute(@wns.pushes.first[:payload].key?('capsicum_notification_id'))
+  end
+
+  # 共通 payload そのものは増やさない（Windows 用の announcement_body と同じ扱いで、
+  # 配送時の変形として足す）。
+  def test_common_payload_has_no_dedup_stamp
+    refute(build_payload('<p>x</p>').key?('capsicum_notification_id'))
+  end
+
   # --- 配送の結末を観測に落とす (#44) ---
   #
   # reporter 単体の分岐は announcement_delivery_reporter_test が持つ。ここで見るのは
