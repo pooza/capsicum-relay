@@ -20,6 +20,12 @@ module Relay
     # 出す counter の定義。`# HELP` / `# TYPE` を書くために名前と説明を持つ。
     COUNTERS = {
       'relay_push_total' => 'Web Push received from upstream, by device_type and outcome.',
+      # ⚠ relay_push_total とは**別系列**にする (#44)。あちらは上流 (Mastodon /
+      # Misskey) から来た Web Push の中継で、こちらは worker が polling して自分で
+      # 送るお知らせ配信。混ぜると「上流から来ていない」と「送って失敗した」が
+      # 同じ数字に溶ける。outcome のラベル値は両者で揃えてあるので比較はできる。
+      'relay_announcement_push_total' =>
+        'Announcement pushes sent by the polling worker, by device_type and outcome.',
       'relay_register_total' => 'Device registration changes, by action.',
       'relay_announcement_subscription_total' =>
         'Announcement subscription changes, by action.',

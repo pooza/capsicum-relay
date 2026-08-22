@@ -247,6 +247,33 @@ journalctl -u capsicum-relay --no-pager --since "-14 days" -o short-iso \
 
 journald は 2026-04-17（サービス開始時）から全期間残っている。経緯は [pooza/capsicum#931](https://github.com/pooza/capsicum/issues/931)。
 
+#### お知らせ（announcement）が届かないとき
+
+⚠ **通常の push とは別経路・別 counter**。上流から来た Web Push を中継する通常経路と違い、お知らせは worker が各サーバーを polling して自分で送る。`relay_push_total` には**乗らない**（#44）。
+
+見分けたい 3 択は「① そもそも購読が無い」「② 送ったが失敗した」「③ 送って成功した」で、どれも journald だけで分かる。
+
+```bash
+# ① server ごとの fan-out。購読 0 件でも 1 行出る
+journalctl -u capsicum-relay --no-pager -o cat \
+  | grep '"event":"announcement.dispatch"' \
+  | jq -r '[.ts, .server, .announcement_id, .subscriptions, (.device_types | tostring)] | @tsv'
+
+# ②③ 配送 1 通ごとの結末
+journalctl -u capsicum-relay --no-pager -o cat \
+  | grep '"event":"announcement.push.result"' \
+  | jq -r '[.ts, .device_type, .outcome, .account, .reason] | @tsv'
+```
+
+`/metrics` 側は `relay_announcement_push_total{device_type,outcome}`。`outcome` のラベル値は `relay_push_total` と揃えてあるので、「中継は成功しているのにお知らせ配信だけ落ちている」を並べて比較できる。お知らせ固有の値は次の 2 つ:
+
+| outcome | 読み方 |
+| --- | --- |
+| `unconfigured` | その device_type の push クライアントが未設定（`reason=client_unset`）か、register が受け付ける種別に配送が追いついていない（`reason=unknown_device_type`）。**購読行はあるのに 1 通も届かない**状態で、設定漏れ・配線漏れを疑う |
+| `no_result` | push クライアントが結果 Hash を返さなかった。実装の不整合 |
+
+⚠ **失敗しても再送はされない。** `mark_announcement_seen` は server 単位なので、現状は「失敗した 1 通が失われたことが数字とログに残る」ところまで（#44 の C 案）。購読単位の再送は失敗率を見てから設計する。
+
 ## ディレクトリ構成
 
 ```text
