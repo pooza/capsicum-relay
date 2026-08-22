@@ -1,0 +1,39 @@
+# ⚠⚠ **これはサンプル。稼働機の unit の正本ではない。**
+#
+# prod (flauros) / staging (triton) とも、実際の
+# `/etc/systemd/system/capsicum-relay.service` は **chubo2 の cookbook が置く**
+# （`app/cookbooks/capsicum-relay/templates/capsicum-relay.service.erb`）。
+# 2026-08-22 に flauros も `deploy: true` でレシピ管理下へ移り、正本が 1 本に
+# なった（pooza/chubo2#187 / 本リポジトリ #29）。
+#
+# **稼働機の unit を変えたいときは、このファイルではなく cookbook を直すこと。**
+# ここを直しても実機には反映されず、片方だけがズレる（それが #29 の状態だった）。
+#
+# このファイルを残しているのは、cookbook を持たない環境（自前でホストする人・
+# 手元での動作確認）向けの雛形として。ユーザー名とパスを読み替えて
+# /etc/systemd/system/ へ置けば動く。
+#
+# ⚠ SENTRY_DSN はここに書かない。drop-in
+# （/etc/systemd/system/capsicum-relay.service.d/sentry.conf）で注入する。
+# DSN を unit に書くと、この雛形をコピーした先へ一緒に運ばれる。
+
+[Unit]
+Description=capsicum push notification relay
+After=network.target
+
+[Service]
+Type=simple
+User=deploy
+WorkingDirectory=/home/deploy/repos/capsicum-relay
+# ⚠ shims 経由で起動する。これにより .ruby-version を変えるだけで Ruby が
+# 切り替わる。直接 ~/.rbenv/versions/... を書くと版を上げるたびに unit を直す
+# ことになる。
+ExecStart=/home/deploy/.rbenv/shims/bundle exec puma -C config/puma.rb
+Restart=on-failure
+RestartSec=5
+# ⚠ staging でも RACK_ENV は production。Sinatra の動作モード（例外を画面に
+# 出さない・静的ファイルを配らない）の話で、prod / staging の区別ではない。
+Environment=RACK_ENV=production
+
+[Install]
+WantedBy=multi-user.target
