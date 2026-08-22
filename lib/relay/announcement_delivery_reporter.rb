@@ -130,9 +130,20 @@ module Relay
       @database.unregister_announcement_subscription(id)
     end
 
+    # ⚠ **判定は `LEVELS` の引きではなく [AnnouncementPushOutcome.level] で行う**
+    # （Codex P2 / PR #51）。`wns_channelthrottled` のような **動的に組む outcome は
+    # `LEVELS` に載っていない**ので、Hash を直接引くと nil になり Sentry へ 1 件も
+    # 上がらなかった。通常 push 側 ([Relay::PushHelpers#handle_wns_status]) は
+    # 非正常な WNS ステータスを明示的に capture しており、そこと非対称になる。
+    #
+    # 除外は 2 つ:
+    # - `:info`（success / gone / `wns_dropped` 等の正常系）。通常 push 側も
+    #   handle_push_gone で Sentry へは上げていない
+    # - `unconfigured`（設定漏れ・配線漏れ）。直るまで定常的に出続けるので alert に
+    #   向かない。journald と counter には残る
     def capture(sub:, about:, outcome:, result:)
-      level = Relay::AnnouncementPushOutcome::LEVELS[outcome]
-      return unless level && outcome != 'unconfigured'
+      level = Relay::AnnouncementPushOutcome.level(outcome)
+      return if level == :info || outcome == 'unconfigured'
 
       Relay::SentrySetup.capture_message(
         "Announcement push #{outcome} (#{sub['device_type']})",

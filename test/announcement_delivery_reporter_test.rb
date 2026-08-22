@@ -152,6 +152,74 @@ class AnnouncementDeliveryReporterTest < Minitest::Test
     assert_includes(Relay::PushHelpers::WNS_BENIGN_STATUSES, 'dropped')
   end
 
+  # --- Sentry へ上げる / 上げない ---
+
+  # capture_message を差し替えて、上がった件数と level を見る。
+  # ⚠ minitest 6 に `stub` は無い（mock/stub は本体から外れた）ので、singleton を
+  # 自前で差し替えて ensure で戻す。gem を 1 つ増やすほどの用途ではない。
+  def capture_messages
+    captured = []
+    original = Relay::SentrySetup.method(:capture_message)
+    Relay::SentrySetup.define_singleton_method(:capture_message) do |message, level: :error, context: {}|
+      next captured << {message: message, level: level, context: context}
+    end
+    yield
+    return captured
+  ensure
+    Relay::SentrySetup.define_singleton_method(:capture_message, original)
+  end
+
+  # ⚠ **回帰テスト（Codex P2 / PR #51）。** `wns_channelthrottled` のような動的に
+  # 組む outcome は LEVELS に載っていないため、Hash を直接引く実装では Sentry へ
+  # 1 件も上がらなかった。通常 push 側 (handle_wns_status) は上げているので、
+  # ここが漏れると**お知らせだけ静かに alert が消える**。
+  def test_non_benign_wns_status_is_captured
+    captured = capture_messages do
+      record({success: true, wns_status: 'channelthrottled'}, sub: SUB.merge('device_type' => 'windows'))
+    end
+
+    assert_equal(1, captured.size)
+    assert_equal(:warning, captured.first[:level])
+  end
+
+  def test_benign_wns_status_is_not_captured
+    captured = capture_messages do
+      record({success: true, wns_status: 'dropped'}, sub: SUB.merge('device_type' => 'windows'))
+    end
+
+    assert_empty(captured)
+  end
+
+  def test_failure_is_captured_as_error
+    captured = capture_messages {record({success: false, status: 502})}
+
+    assert_equal(:error, captured.first[:level])
+  end
+
+  # 正常系は上げない（通常 push 側と同じ扱い。gone は handle_push_gone も
+  # Sentry へ上げていない）。
+  def test_success_and_gone_are_not_captured
+    captured = capture_messages do
+      record({success: true})
+      record({success: false, permanent: true})
+    end
+
+    assert_empty(captured)
+  end
+
+  # 設定漏れは直るまで定常的に出続けるので alert に向かない。journald と
+  # counter には残る。
+  def test_unconfigured_is_not_captured
+    captured = capture_messages do
+      @reporter.record_unconfigured(
+        sub: SUB, server: 'mstdn.example', announcement_id: '170', reason: 'client_unset',
+      )
+    end
+
+    assert_empty(captured)
+    assert_equal(1, counter('unconfigured'))
+  end
+
   # --- ログの中身（切り分けに要る軸） ---
 
   def test_log_carries_the_triage_fields
