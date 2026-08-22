@@ -4,6 +4,8 @@ require 'logger'
 require 'lib/relay/announcement_worker'
 # 上限は WnsClient が持つ定数を参照する（テスト側に数値を写さない）。
 require 'lib/relay/wns_client'
+# 配送結果の counter (#44)。
+require 'lib/relay/metrics'
 
 # #36: お知らせ通知の配送先を macOS (Phase 1) / Windows (Phase 2) へ広げる。
 #
@@ -20,14 +22,17 @@ class AnnouncementWorkerTest < Minitest::Test
   class RecordingClient
     attr_reader :pushes
 
-    def initialize
+    def initialize(result = {success: true})
       @pushes = []
+      @result = result
     end
 
-    # 返り値は deliver 側で使われない。真偽だけを返すと
-    # Naming/PredicateMethod に引っかかるので記録した配列をそのまま返す。
+    # ⚠ **戻り値は deliver が見る** (#44)。以前は記録した配列を返していたが、
+    # 現在は push クライアントの契約どおり結果 Hash を返す必要がある
+    # （Hash でないものは outcome `no_result` として観測に出る）。
     def push(**kwargs)
-      return @pushes << kwargs
+      @pushes << kwargs
+      return @result
     end
   end
 
@@ -256,6 +261,106 @@ class AnnouncementWorkerTest < Minitest::Test
     )
 
     assert_empty(@wns.pushes)
+  end
+
+  # --- 配送の結末を観測に落とす (#44) ---
+  #
+  # reporter 単体の分岐は announcement_delivery_reporter_test が持つ。ここで見るのは
+  # **worker から reporter まで実際に配線されているか**（#36 の from_settings と同じ
+  # 理由 — 途中で落ちていても例外にならず、購読行はあるのに何も残らない形になる）。
+
+  def metrics_worker(result: {success: true})
+    @metrics = Relay::Metrics.new
+    @apns = RecordingClient.new(result)
+    return Relay::AnnouncementWorker.new(
+      database: nil, logger: Logger.new(IO::NULL), apns: @apns, metrics: @metrics,
+    )
+  end
+
+  def announcement_counter(outcome, device_type: 'macos')
+    return @metrics.value(
+      'relay_announcement_push_total', {device_type: device_type, outcome: outcome}
+    )
+  end
+
+  def deliver_via(worker, device_type: 'macos')
+    return worker.send(
+      :deliver,
+      sub: {'device_type' => device_type, 'token' => 'tok', 'account' => 'a@b'},
+      payload: {}, alert: {}, server: 'mstdn.example', announcement_id: '170'
+    )
+  end
+
+  def test_successful_delivery_is_counted
+    worker = metrics_worker
+
+    assert_equal('success', deliver_via(worker))
+    assert_equal(1, announcement_counter('success'))
+  end
+
+  # ⚠ **この Issue の主題。** 以前はここで戻り値を捨てていたため、失敗しても
+  # journald にも /metrics にも Sentry にも何も残らなかった（そのうえ poll_server は
+  # dispatch の後で無条件に mark_announcement_seen を打つので再送もされない）。
+  def test_failed_delivery_is_counted
+    worker = metrics_worker(result: {success: false, status: 502, reason: 'Unavailable'})
+
+    assert_equal('failed', deliver_via(worker))
+    assert_equal(1, announcement_counter('failed'))
+  end
+
+  # 長文のお知らせは degrade で救えず 1 通ドロップする（#44 の 2026-08-16 コメント）。
+  # 再送はこの Issue の範囲外なので、**落ちたことが数字で見える**ところまでを見る。
+  def test_oversized_delivery_is_counted
+    worker = metrics_worker(result: {success: false, oversized: true, status: 413})
+
+    assert_equal('oversized', deliver_via(worker))
+    assert_equal(1, announcement_counter('oversized'))
+  end
+
+  def test_client_exception_is_counted
+    worker = metrics_worker
+    @apns.define_singleton_method(:push) {|**_kwargs| raise(IOError, 'broken pipe')}
+
+    assert_equal('exception', deliver_via(worker))
+    assert_equal(1, announcement_counter('exception'))
+  end
+
+  # クライアント未設定は「設定漏れ」、未知の device_type は「配送が register に
+  # 追いついていない」印。どちらも従来は黙って捨てていた。
+  def test_missing_client_is_recorded_as_unconfigured
+    worker = Relay::AnnouncementWorker.new(
+      database: nil, logger: Logger.new(IO::NULL), metrics: (@metrics = Relay::Metrics.new),
+    )
+
+    assert_equal('unconfigured', deliver_via(worker))
+    assert_equal(1, announcement_counter('unconfigured'))
+  end
+
+  def test_unknown_device_type_is_recorded_as_unconfigured
+    worker = metrics_worker
+
+    assert_equal('unconfigured', deliver_via(worker, device_type: 'symbian'))
+    assert_equal(1, announcement_counter('unconfigured', device_type: 'symbian'))
+    assert_empty(@apns.pushes)
+  end
+
+  # `/metrics` の counter は App と同じインスタンスを共有する（同一プロセスの
+  # 別スレッド）。ここを渡し忘れると counter が永久に 0 のままになる。
+  def test_from_settings_wires_metrics
+    metrics = Relay::Metrics.new
+    settings = Struct.new(:apns, :metrics).new(@apns, metrics)
+    worker = Relay::AnnouncementWorker.from_settings(
+      settings, database: nil, logger: Logger.new(IO::NULL), interval: 0
+    )
+    worker.send(
+      :deliver,
+      sub: {'device_type' => 'macos', 'token' => 'tok', 'account' => 'a@b'},
+      payload: {}, alert: {}
+    )
+
+    assert_equal(
+      1, metrics.value('relay_announcement_push_total', {device_type: 'macos', outcome: 'success'})
+    )
   end
 
   # --- payload の組み立て (#36 Phase 2 / capsicum#978) ---
