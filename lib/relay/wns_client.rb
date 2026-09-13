@@ -2,6 +2,7 @@ require 'net/http'
 require 'json'
 require 'uri'
 require 'logger'
+require_relative 'http_connection_pool'
 require_relative 'sentry_setup'
 
 module Relay
@@ -56,6 +57,14 @@ module Relay
     # 通れば任意ホストへ Bearer + payload 付き POST をさせられる（SSRF）ため、
     # 送信先を WNS ホストへ限定する (#21 / capsicum#474 レビュー)。
     CHANNEL_URI_HOST_SUFFIX = '.notify.windows.com'.freeze
+    # 再利用した接続が相手に閉じられていたときに飛ぶ例外 (#54)。⚠ **アイドル時間で
+    # 見切っても取りこぼす**（[Relay::HttpConnectionPool#usable?] は相手の切断を
+    # 知れない）ので、ここを 1 回だけ張り直して再送する。`EOFError` は `IOError`
+    # の仲間なので個別に並べない。`Net::HTTPBadResponse` は切られた socket から
+    # 空応答を読んだときに来る。
+    STALE_CONNECTION_ERRORS = [
+      IOError, Errno::ECONNRESET, Errno::EPIPE, Net::HTTPBadResponse
+    ].freeze
 
     # Channel URI が https かつ WNS ホストであることを検査する。register の入口
     # (app.rb) と push 前 (defense-in-depth) の双方から使う class method。実 URI は
@@ -70,7 +79,14 @@ module Relay
       return false
     end
 
-    def initialize(config, logger: Logger.new($stdout))
+    # 1 回の送信の結果。⚠ **接続を再利用したかを instance 変数で持たない**
+    # （puma の 2 スレッド + お知らせ worker から同時に入るので、共有すると
+    # 別の送信の値をログに載せる）。
+    Sent = Struct.new(:response, :conn)
+
+    # [pool] はテスト用の差し替え口。既定は Channel URI のホスト別に keep-alive
+    # を持つ実物のプール (#54)。
+    def initialize(config, logger: Logger.new($stdout), pool: nil)
       @config = config
       @logger = logger
       @package_sid = config['wns']['package_sid']
@@ -78,6 +94,13 @@ module Relay
       @token_mutex = Mutex.new
       @access_token = nil
       @token_expires_at = nil
+      @pool = pool || Relay::HttpConnectionPool.new(logger: logger)
+    end
+
+    # プロセス終了時にアイドル接続を閉じる。⚠ 呼ばなくても壊れないが、
+    # 呼べば FIN をこちらから送れる（相手のタイムアウト待ちにしない）。
+    def close
+      return @pool.close_all
     end
 
     def push(device_token:, payload:)
@@ -93,21 +116,21 @@ module Relay
       # 扱いなので上位（handle_push_oversized）の挙動・観測は変わらない。
       return oversized_precheck_result(body.bytesize) if body.bytesize > RAW_PAYLOAD_LIMIT
 
-      response = post_raw(device_token, body)
+      sent = post_raw(device_token, body)
       # 401 はアクセストークン失効の可能性が高い。1 回だけ強制更新して再送する
       # （毎回更新すると login.live.com を過剰に叩くため、失敗起点でのみ）。
-      response = post_raw(device_token, body, force_token_refresh: true) if response&.code == '401'
-      return interpret(response)
+      sent = post_raw(device_token, body, force_token_refresh: true) if sent.response&.code == '401'
+      return interpret(sent)
     end
 
     private
 
     # push が返す失敗ハッシュの共通形。handle_push_result が success / oversized /
     # permanent を見て分岐するので、全経路でキーを揃える。
-    def failure(status:, reason:, permanent: false, oversized: false)
+    def failure(status:, reason:, permanent: false, oversized: false, conn: nil)
       return {
         success: false, status: status, reason: reason,
-        permanent: permanent, oversized: oversized
+        permanent: permanent, oversized: oversized, conn: conn
       }
     end
 
@@ -135,32 +158,81 @@ module Relay
 
     def post_raw(channel_uri, body, force_token_refresh: false)
       token = access_token(force_refresh: force_token_refresh)
-      return nil unless token
+      return Sent.new(nil, nil) unless token
 
       uri = URI(channel_uri)
+      return send_pooled(uri, build_request(uri, token, body))
+    rescue StandardError => e
+      @logger.warn("WNS push error: #{e.class}: #{e.message}")
+      Relay::SentrySetup.capture_exception(e, context: {wns: {source: 'push'}})
+      return Sent.new(nil, nil)
+    end
+
+    def build_request(uri, token, body)
       request = Net::HTTP::Post.new(uri)
       request['Authorization'] = "Bearer #{token}"
       request['Content-Type'] = 'application/octet-stream'
       request['X-WNS-Type'] = 'wns/raw'
       request.body = body
-      return Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) do |http|
-        http.request(request)
-      end
-    rescue StandardError => e
-      @logger.warn("WNS push error: #{e.class}: #{e.message}")
-      Relay::SentrySetup.capture_exception(e, context: {wns: {source: 'push'}})
-      return nil
+      return request
     end
 
-    def interpret(response)
-      return failure(status: nil, reason: 'no_response') unless response
+    # プールから接続を借りて 1 通送る (#54)。
+    #
+    # ⚠⚠ **再送してよいのは「再利用した接続が閉じられていた」ときだけ。**新規接続
+    # での失敗を再送すると、相手が受理した直後に応答だけ失った場合に**二重配信**を
+    # 作る。stale keep-alive は書き込み前に落ちるので、この 1 回だけは安全。
+    def send_pooled(uri, request)
+      http, reused = @pool.checkout(uri.hostname, uri.port)
+      begin
+        response = http.request(request)
+        @pool.checkin(uri.hostname, uri.port, http)
+        return Sent.new(response, reused ? 'reused' : 'opened')
+      rescue *STALE_CONNECTION_ERRORS => e
+        @pool.discard(http)
+        raise unless reused
+
+        return retry_on_fresh(uri, request, e)
+      rescue StandardError
+        @pool.discard(http)
+        raise
+      end
+    end
+
+    # 張り直して 1 回だけ送り直す。2 回目も落ちたら通常の失敗として上へ返す
+    # （`post_raw` の rescue が拾って Sentry へ上げる）。
+    def retry_on_fresh(uri, request, error)
+      @logger.warn(
+        'WNS connection was stale; reconnecting and retrying once:' \
+          " #{error.class}: #{error.message}",
+      )
+      http, = @pool.checkout(uri.hostname, uri.port)
+      begin
+        response = http.request(request)
+        @pool.checkin(uri.hostname, uri.port, http)
+        return Sent.new(response, 'reopened')
+      rescue StandardError
+        @pool.discard(http)
+        raise
+      end
+    end
+
+    # [conn] は接続の使い回しの結末 (`reused` / `opened` / `reopened`)。⚠ push.result
+    # の 1 行に載せてヒット率と latency を突き合わせるための計装 (#54)。APNs / FCM
+    # は nil なので、構造化ログの compact で落ちる。
+    def interpret(sent)
+      response = sent.response
+      return failure(status: nil, reason: 'no_response', conn: sent.conn) unless response
 
       status = response.code.to_i
       if response.is_a?(Net::HTTPSuccess)
         # WNS は 200 でも X-WNS-NotificationStatus が dropped / channelthrottled の
         # ことがある。配信自体は受理されたものとして success 扱いにし、観測のため
         # ステータスだけ残す。
-        return {success: true, status: status, wns_status: response['X-WNS-NotificationStatus']}
+        return {
+          success: true, status: status,
+          wns_status: response['X-WNS-NotificationStatus'], conn: sent.conn
+        }
       end
 
       return failure(
@@ -168,6 +240,7 @@ module Relay
         reason: response['X-WNS-Error-Description'] || response['X-WNS-Status'] || response.message,
         permanent: PERMANENT_STATUSES.include?(status),
         oversized: status == OVERSIZED_STATUS,
+        conn: sent.conn,
       )
     end
 

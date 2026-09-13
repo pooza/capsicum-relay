@@ -150,7 +150,12 @@ module Relay
       return handle_wns_status(sub, result, wns_status) if wns_status && wns_status != 'received'
       return handle_push_degraded(sub, result) if result[:degraded]
 
-      record_push_outcome(sub, 'success', msg: "Pushed to #{sub['device_type']}: #{sub['account']}")
+      # conn は WNS だけが持つ「接続を使い回せたか」(#54)。⚠ **latency_ms と同じ
+      # 行に出すのが眼目** — ヒット率と 690ms の削減を突き合わせるため。
+      record_push_outcome(
+        sub, 'success',
+        msg: "Pushed to #{sub['device_type']}: #{sub['account']}", conn: result[:conn]
+      )
       return {status: 'delivered'}.to_json
     end
 
@@ -184,7 +189,7 @@ module Relay
       message = "WNS delivered but #{wns_status}: #{sub['account']}"
       record_push_outcome(
         sub, "wns_#{wns_status}", level: benign ? :info : :warn,
-        msg: message, wns_status: wns_status
+        msg: message, wns_status: wns_status, conn: result[:conn]
       )
       unless benign
         Relay::SentrySetup.capture_message(
@@ -204,7 +209,8 @@ module Relay
       reason = result[:reason] || result[:status]
       record_push_outcome(
         sub, 'gone',
-        msg: "Subscription gone: #{sub['account']} (#{reason})", reason: reason
+        msg: "Subscription gone: #{sub['account']} (#{reason})", reason: reason,
+        conn: result[:conn]
       )
       status 410
       return {status: 'gone', detail: result}.to_json
@@ -236,7 +242,8 @@ module Relay
     def handle_push_failed(sub, result)
       record_push_outcome(
         sub, 'failed', level: :error,
-        msg: "Push failed: #{result}", reason: result[:reason] || result[:status]
+        msg: "Push failed: #{result}", reason: result[:reason] || result[:status],
+        conn: result[:conn]
       )
       # 一過性でない送信失敗（APNs / FCM の 5xx 等）。低頻度・高インパクトなので
       # journalctl 任せにせず Sentry で alert 駆動にする (#10 Phase B、#8 の後継観測)。
