@@ -201,12 +201,18 @@ module Relay
 
     # 張り直して 1 回だけ送り直す。2 回目も落ちたら通常の失敗として上へ返す
     # （`post_raw` の rescue が拾って Sentry へ上げる）。
+    #
+    # ⚠⚠ **借り先は `checkout_fresh` でなければならない (#64)。**`checkout` は
+    # アイドルがあればそれを返すので、**相手が keep-alive をまとめて閉じている
+    # とき、張り直したつもりで「もう 1 本の stale」を借りて同じ理由で落ちる**。
+    # 本番で実際に起きた（`ECONNRESET` が 2 本連なり、2 本とも
+    # `begin_transport` → `eof?` ＝ 再利用した接続でしか通らない分岐）。
     def retry_on_fresh(uri, request, error)
       @logger.warn(
         'WNS connection was stale; reconnecting and retrying once:' \
           " #{error.class}: #{error.message}",
       )
-      http, = @pool.checkout(uri.hostname, uri.port)
+      http = @pool.checkout_fresh(uri.hostname, uri.port)
       begin
         response = http.request(request)
         @pool.checkin(uri.hostname, uri.port, http)

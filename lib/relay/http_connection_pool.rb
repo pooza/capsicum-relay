@@ -75,6 +75,22 @@ module Relay
       return [build(host, port), false]
     end
 
+    # **必ず新品**を返す (#64)。戻り値は接続そのもの（再利用したかは常に false）。
+    #
+    # ⚠⚠ **stale の張り直しで [checkout] を使ってはいけない。**あちらはアイドルが
+    # あればそれを返すので、**相手が keep-alive をまとめて閉じているとき、
+    # 張り直したつもりで「もう 1 本の stale」を借りる**。本番でそれが起きた ——
+    # `ECONNRESET` が 2 本連なり、**2 本とも `begin_transport` → `eof?`**
+    # （＝過去にリクエストを通した接続でしか通らない分岐）だった。
+    #
+    # ⚠ **同じホストのアイドルは道連れに捨てる。**1 本が閉じられていたなら、
+    # 隣で同じだけ寝ていた残りも閉じられている蓋然性が高い。次の送信が
+    # また stale を踏んで往復を 1 回余計に払うのを避ける。
+    def checkout_fresh(host, port)
+      discard_idle(host, port)
+      return build(host, port)
+    end
+
     # 使い終わった接続を返す。閉じられていた / 上限を超えたぶんは閉じる。
     def checkin(host, port, http)
       return close_quietly(http) unless http
@@ -104,6 +120,13 @@ module Relay
         @idle.clear
         all
       end
+      entries.each {|entry| close_quietly(entry.http)}
+      return entries.size
+    end
+
+    # 1 ホストぶんのアイドルを閉じて捨てる (#64)。[close_all] のホスト限定版。
+    def discard_idle(host, port)
+      entries = @mon.synchronize {@idle.delete(key_for(host, port)) || []}
       entries.each {|entry| close_quietly(entry.http)}
       return entries.size
     end

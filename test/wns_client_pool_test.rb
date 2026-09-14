@@ -1,5 +1,6 @@
 require_relative 'test_helper'
 require 'logger'
+require 'lib/relay/http_connection_pool'
 require 'lib/relay/wns_client'
 
 # #54: WNS 送信の接続再利用と、stale keep-alive の 1 回だけの張り直し。
@@ -28,9 +29,42 @@ class WnsClientPoolTest < Minitest::Test
     end
   end
 
+  # 実物の [Relay::HttpConnectionPool] へ差し込む接続。プールが触る
+  # `started?` / `finish` と、クライアントが触る `request` を持つ。
+  class PoolableHttp
+    attr_reader :host, :port, :requests, :finish_count
+
+    def initialize(host, port, script)
+      @host = host
+      @port = port
+      @script = script
+      @requests = []
+      @started = true
+      @finish_count = 0
+    end
+
+    def started?
+      return @started
+    end
+
+    def finish
+      @finish_count += 1
+      @started = false
+      return @finish_count
+    end
+
+    def request(req)
+      @requests << req
+      outcome = @script.shift
+      raise outcome if outcome.is_a?(Exception)
+
+      return outcome
+    end
+  end
+
   # checkout / checkin / discard を記録するプール。1 本ずつ台本を渡す。
   class FakePool
-    attr_reader :checked_in, :discarded, :connections
+    attr_reader :checked_in, :discarded, :connections, :fresh_checkouts
 
     def initialize(scripts, reused:)
       @scripts = scripts
@@ -45,6 +79,16 @@ class WnsClientPoolTest < Minitest::Test
       @connections << http
       # 1 本目だけ「再利用した接続」として渡し、2 本目以降は新規扱いにする。
       return [http, @reused && @connections.size == 1]
+    end
+
+    # ⚠ #64: 張り直しはこちらを通る。⚠⚠ **この double は「新品を返す」ことを
+    # 前提に書けてしまう**ので、実物のプールを使う検査を別に置いてある
+    # （[test_retry_does_not_borrow_another_idle_connection]）。
+    def checkout_fresh(_host, _port)
+      @fresh_checkouts = (@fresh_checkouts || 0) + 1
+      http = FakeHttp.new(@scripts.shift || [])
+      @connections << http
+      return http
     end
 
     def checkin(_host, _port, http)
@@ -92,6 +136,52 @@ class WnsClientPoolTest < Minitest::Test
     assert_equal(2, pool.connections.size, '張り直して 2 本目で送る')
     assert_equal([pool.connections.first], pool.discarded, '落ちた接続はプールに戻さない')
     assert_equal([pool.connections.last], pool.checked_in)
+  end
+
+  # ⚠ #64: 張り直しは `checkout` ではなく `checkout_fresh` を通る。
+  def test_retry_borrows_through_checkout_fresh
+    pool = FakePool.new([[EOFError.new('stale')], [ok_response]], reused: true)
+    push(pool)
+
+    assert_equal(1, pool.fresh_checkouts, '張り直しがプールの通常経路を使っている')
+  end
+
+  # ⚠⚠ **実物のプールで確かめる (#64)。**上の double は「`checkout_fresh` は
+  # 新品を返す」と書いた自分自身に同意するだけなので、**本番で起きた形**
+  # （アイドルが 2 本とも閉じられている）は再現できない。
+  #
+  # 本番のイベントは `ECONNRESET` が 2 本連なり、**2 本とも
+  # `begin_transport` → `eof?`** だった。この分岐は「過去にリクエストを通した
+  # 接続」でしか通らないので、**張り直したはずの 2 本目もプールのアイドル**
+  # だったと分かる。
+  def test_retry_does_not_borrow_another_idle_connection
+    built = []
+    pool = Relay::HttpConnectionPool.new(
+      logger: Logger.new(File::NULL),
+      factory: lambda {|host, port|
+        # 先に積む 2 本は stale（相手に切られている）、張り直しの 1 本は健全。
+        http = PoolableHttp.new(host, port, built.size < 2 ? [Errno::ECONNRESET.new('reset')] : [ok_response])
+        built << http
+        next http
+      },
+    )
+    # アイドルを 2 本（= MAX_IDLE_PER_HOST）積む。⚠ **先に 2 本とも借りてから
+    # 返す。**1 本ずつ借りて返すと、2 本目の checkout が 1 本目を再利用して
+    # しまい、アイドルは 1 本しか積まれない（本番の形にならない）。
+    borrowed = Array.new(2) {pool.checkout('db5p.notify.windows.com', 443).first}
+    borrowed.each {|http| pool.checkin('db5p.notify.windows.com', 443, http)}
+
+    assert_equal(2, pool.idle_count)
+
+    result = push(pool)
+
+    assert(result[:success], '張り直しが新品を借りていれば通る')
+    assert_equal('reopened', result[:conn])
+    assert_equal(3, built.size, '2 本の stale を使い切らずに 3 本目を開く')
+    assert_predicate(built[1].requests, :any?, '1 本目の stale は実際に踏んでいる（空振りの検査にしない）')
+    assert_empty(built[0].requests, '⚠ 残っていたもう 1 本の stale を借りていない')
+    assert_equal(1, built[0].finish_count, '道連れのアイドルは閉じる')
+    assert_equal(1, pool.idle_count, '成功した新品だけがプールへ戻る')
   end
 
   def test_stale_error_is_retried_for_connection_reset_too
