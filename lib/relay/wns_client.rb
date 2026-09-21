@@ -50,7 +50,19 @@ module Relay
     # 4KB(APNs/FCM) より先に超過しうる。現状は POST して 413 を受けてから oversized
     # 処理する事後対応だが、送信前に弾いて WNS への無駄打ちと round-trip を省く
     # (#21)。倒れ方は 413 経路と同一なので観測（Sentry oversized 件数）も揃う。
+    # ⚠ #65 以降、暗号化通知はまず body を落とした汎用 payload へ degrade し、
+    # 413 経路に倒れるのは degrade しても割れないものだけになった。
     RAW_PAYLOAD_LIMIT = 5000
+    # 上限を超えたときに落とす、暗号化 Web Push 由来のキー (#65)。
+    # [Relay::ApnsPayload::ENCRYPTED_KEYS] と同じ集合（テストで一致を固定している）。
+    # ⚠ apns_payload を require すると apnotic まで引き込むので、ここでは写しを持つ。
+    ENCRYPTED_KEYS = ['body', 'encoding', 'crypto_key', 'encryption'].freeze
+    # degrade した payload に付ける目印 (#65)。capsicum の Windows 受信側はこれを見て
+    # 「復号せず汎用文面を出す」経路へ入る。⚠⚠ **値は文字列にする。**capsicum の
+    # エンベロープ解析 (web_push_receive.cpp の ParseFlatObject) は**値が文字列でない
+    # キーが 1 つでもあると全体を不正として捨てる**ので、`true` を載せると汎用文面
+    # どころか何も出なくなる。
+    DEGRADED_MARKER = {'degraded' => '1'}.freeze
     # Channel URI として許可するホストの suffix。capsicum の Windows クライアント
     # が classic PushNotificationChannel から得る Channel URI は必ず
     # *.notify.windows.com に載る。device_type=windows の token は /register を
@@ -112,18 +124,51 @@ module Relay
       end
 
       body = payload.to_json
-      # 5000B 超過は POST せず 413 経路に倒す (#21)。事後の 413 と同じ oversized
-      # 扱いなので上位（handle_push_oversized）の挙動・観測は変わらない。
+      degraded_from = nil
+      # 5000B 超過は暗号化 body を落とした汎用 payload へ倒す (#65)。APNs の #17 と
+      # 同じ考え方で、以前は 1 通まるごと drop していた（端末に何も出ない）。
+      if body.bytesize > RAW_PAYLOAD_LIMIT && (fallback = degraded_payload(payload))
+        degraded_from = body.bytesize
+        body = fallback.to_json
+        log_degrade(degraded_from, body.bytesize)
+      end
+      # degrade しても割れない（暗号化キーを持たない payload 等）ときは、従来どおり
+      # POST せず 413 経路に倒す (#21)。事後の 413 と同じ oversized 扱いなので
+      # 上位（handle_push_oversized）の挙動・観測は変わらない。
       return oversized_precheck_result(body.bytesize) if body.bytesize > RAW_PAYLOAD_LIMIT
 
       sent = post_raw(device_token, body)
       # 401 はアクセストークン失効の可能性が高い。1 回だけ強制更新して再送する
       # （毎回更新すると login.live.com を過剰に叩くため、失敗起点でのみ）。
       sent = post_raw(device_token, body, force_token_refresh: true) if sent.response&.code == '401'
-      return interpret(sent)
+      return mark_degraded(interpret(sent), degraded_from)
     end
 
     private
+
+    # 暗号化キーを落とし、目印を付けた payload。暗号化キーを 1 つも持たない payload
+    # （お知らせ等）は落とすものが無いので nil を返し、従来の drop に任せる。⚠ お知らせに
+    # 目印を付けると、capsicum 側で「通知があります」の汎用文面として出てしまう。
+    def degraded_payload(payload)
+      return nil unless payload.keys.any? {|key| ENCRYPTED_KEYS.include?(key.to_s)}
+
+      return payload.reject {|key, _| ENCRYPTED_KEYS.include?(key.to_s)}.merge(DEGRADED_MARKER)
+    end
+
+    def log_degrade(original_size, degraded_size)
+      @logger.warn(
+        "WNS payload degraded to generic notification: #{original_size}B" \
+          " -> #{degraded_size}B (limit #{RAW_PAYLOAD_LIMIT}B)",
+      )
+    end
+
+    # degrade して送れたときだけ degraded / original_size を添える。上位の
+    # handle_push_delivered が APNs (#17) と同じ handle_push_degraded へ振り分ける。
+    def mark_degraded(result, degraded_from)
+      return result unless degraded_from && result[:success]
+
+      return result.merge(degraded: true, original_size: degraded_from)
+    end
 
     # push が返す失敗ハッシュの共通形。handle_push_result が success / oversized /
     # permanent を見て分岐するので、全経路でキーを揃える。
