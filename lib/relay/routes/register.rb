@@ -1,4 +1,6 @@
 require_relative '../base_app'
+require_relative '../entitlement_observation'
+require_relative '../preset_servers'
 require_relative '../wns_client'
 
 module Relay
@@ -21,18 +23,10 @@ module Relay
           server: json_body['server'],
           device_id: json_body['device_id'],
         )
+        # 利用権の観測 (capsicum#597 / #59)。⚠⚠ **ここでは何も拒まない。**
+        observation = observe_entitlement(sub)
 
-        metrics.increment('relay_register_total', {action: 'created'})
-        log_event(
-          'register.created',
-          msg: "Registered: #{sub['account']} (#{sub['device_type']}," \
-            " device_id=#{sub['device_id'] ? 'yes' : 'none'})",
-          device_type: sub['device_type'],
-          account: sub['account'],
-          server: sub['server'],
-          has_device_id: !sub['device_id'].nil?,
-          latency_ms: latency_ms,
-        )
+        record_registration(sub, observation)
         status 201
         sub.to_json
       end
@@ -53,6 +47,49 @@ module Relay
       end
 
       helpers do
+        def record_registration(sub, observation)
+          metrics.increment('relay_register_total', {action: 'created'})
+          metrics.increment('relay_register_entitlement_total', observation)
+          log_event(
+            'register.created',
+            msg: "Registered: #{sub['account']} (#{sub['device_type']}," \
+              " device_id=#{sub['device_id'] ? 'yes' : 'none'})",
+            device_type: sub['device_type'],
+            account: sub['account'],
+            server: sub['server'],
+            has_device_id: !sub['device_id'].nil?,
+            # ⚠ **`server` は既に上の行に出ている**ので、プリセットかどうかが
+            # 食い違っていたら（一覧のズレ）ログだけで気付ける。
+            preset: observation[:preset],
+            entitlement: observation[:entitlement],
+            entitlement_token: observation[:token],
+            latency_ms: latency_ms,
+          )
+        end
+
+        # この登録が「非プリセット かつ 利用権なし」かを言えるようにする (#59)。
+        #
+        # ⚠⚠ **判定はしない。**フェーズ 3 でゲートを閉じたときに誰が影響を受けるかを
+        # 先に知るための記録で、⚠ **戻り値は metrics のラベル**なので値の集合を
+        # 小さく保つ（`server` や `account` を混ぜない）。
+        #
+        # ⚠ **利用権は `subscriptions.device_id` から引く**（設計書 2-4 の経路）。
+        # クライアントが送ってきた token をそのまま信じるのではなく、**ゲートが
+        # 実際に通る経路で引く**ことに意味がある —— 送れているのに引けない端末
+        # （[Relay::EntitlementObservation::TOKEN_MISMATCH]）を見つけられる。
+        def observe_entitlement(sub)
+          claimed = json_body['entitlement_token'].to_s
+          return Relay::EntitlementObservation.classify(
+            preset: Relay::PresetServers.preset?(
+              sub['server'], extra: settings.config['extra_preset_hosts']
+            ),
+            device_tokens: settings.database.entitlement_tokens_for_device(sub['device_id']),
+            claimed: claimed.empty? ? nil : settings.database.find_entitlement_token(claimed),
+            device_id: sub['device_id'],
+            token_sent: !claimed.empty?,
+          )
+        end
+
         def validate_device_type!
           unless DEVICE_TYPES.include?(json_body['device_type'])
             halt 400, {error: 'device_type must be ios, android, macos or windows'}.to_json

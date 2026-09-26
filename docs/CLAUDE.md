@@ -41,6 +41,7 @@ flowchart LR
 | POST | `/register` | X-Relay-Secret | デバイストークン登録（capsicum → リレー） |
 | DELETE | `/register/:id` | X-Relay-Secret | 登録解除 |
 | POST | `/push/:push_token` | なし（トークンの推測困難性で保護） | Web Push 受信（Mastodon / Misskey → リレー） |
+| POST | `/entitlements` | X-Relay-Secret | 有償リレーの利用権の発行（capsicum#597 / [#58](https://github.com/pooza/capsicum-relay/issues/58)） |
 
 ### 通信フロー
 
@@ -130,6 +131,76 @@ erDiagram
 3. どちらも無ければ新規 INSERT
 
 1 と 2 が別の行を指すのは、トークンが一度離れて戻る場合だけで実運用では起きない。起きたときは部分インデックス違反になるため、古い方（2 の行）を畳んで 1 を残す。畳んだ行の `announcement_subscriptions` は FK の CASCADE で消える点に注意。
+
+## 有償リレーの利用権（capsicum#597・フェーズ 1）
+
+⚠⚠ **現状は誰も拒まない。**`/register` も `/push` も従来どおり通る。ゲートは
+[#60](https://github.com/pooza/capsicum-relay/issues/60)（フェーズ 2）、レシート検証は
+[#61](https://github.com/pooza/capsicum-relay/issues/61) / [#62](https://github.com/pooza/capsicum-relay/issues/62)（フェーズ 3）。
+正本は capsicum の [`docs/paid-relay-plan.md`](https://github.com/pooza/capsicum/blob/develop/docs/paid-relay-plan.md)。
+
+```mermaid
+erDiagram
+  entitlements ||--o{ entitlement_tokens : "1 購入 N 端末"
+  entitlements {
+    INTEGER id PK
+    TEXT store "apple / google / microsoft"
+    TEXT purchase_id "ストアの購入識別子"
+    TEXT product_id
+    TEXT status "unverified / active / grace / expired / revoked"
+    TEXT expires_at
+  }
+  entitlement_tokens {
+    INTEGER id PK
+    TEXT token UK "opaque・クライアントが /register に載せる"
+    INTEGER entitlement_id FK
+    TEXT device_id "subscriptions.device_id と同じ値"
+  }
+```
+
+### ⚠⚠ `unverified` を許可側に入れない
+
+`POST /entitlements` の認証は共有シークレット 1 本で、**そのシークレットはバイナリから取り出せる**（[capsicum#1121](https://github.com/pooza/capsicum/issues/1121)）。つまりこのエンドポイントは実質的に開いており、**誰でも好きな `purchase_id` で `unverified` の行を作れる**。フェーズ 3 でレシートを検証して初めて `active` になる。
+
+### ⚠ 判定は `subscriptions.device_id` から引く
+
+```text
+/push/{push_token} → subscriptions（push_token UNIQUE）
+                   → subscriptions.device_id
+                   → entitlement_tokens（device_id）
+                   → entitlements.status
+```
+
+クライアントが `/register` に載せてくる `entitlement_token` は**観測のため**に記録するだけで、判定には使わない。⚠ **`device_id` が NULL の行（旧クライアント）は利用権を引けない。**
+
+### ⚠ `subscriptions` に列を足さない
+
+あのテーブルは CHECK / UNIQUE を変えるたびに `rebuild_subscriptions_table!` が要り、**その組み替えは過去に子テーブルの FK を壊している**（`repair_announcement_subscriptions_fk!` が今も居座っているのがその跡・[capsicum#468](https://github.com/pooza/capsicum/issues/468)）。**課金の都合で push の中核テーブルを組み替えない。**
+
+### ⚠ `status` に CHECK を付けない
+
+[#63](https://github.com/pooza/capsicum-relay/issues/63) で扱う状態（更新・失効・返金・支払い猶予・課金リトライ）は**これから増える**。CHECK にすると状態を 1 つ足すたびにテーブル組み替えになり、`subscriptions` で踏んだ罠を新しいテーブルで再現する。検査は `Relay::Database::ENTITLEMENT_STATUSES` で行う。
+
+### プリセット判定の写し
+
+`lib/relay/preset_servers.rb` は capsicum の `packages/capsicum/lib/src/preset_servers.dart` の**写し**。⚠⚠ **2 箇所に同じ一覧がある。**
+
+- ⚠ **クライアントに判定させられない。**ゲートは「非プリセット かつ 利用権なし」で閉じるので、申告に委ねると書き換えるだけで抜けられる
+- ⚠⚠ **ズレると、載っていないプリセットサーバーの利用者がフェーズ 3 で止まる。**`test/preset_servers_test.rb` が件数を固定しているので、片方だけ増やすとテストが落ちる
+- 設定の `extra_preset_hosts` は**足すことしかできない**（置き換えにすると、設定を書き忘れたデプロイで全登録が非プリセット扱いになる）
+
+### 観測（[#59](https://github.com/pooza/capsicum-relay/issues/59)）
+
+`relay_register_entitlement_total{preset,entitlement,token}` が、フェーズ 3 でゲートを閉じたときに誰が止まるかを先に示す。
+
+```console
+$ curl -s -H "X-Relay-Secret: $SECRET" https://relay.capsicum.shrieker.net/metrics \
+    | grep relay_register_entitlement_total
+```
+
+- `preset="no"` かつ `entitlement="none"` … **止まる候補**
+- `token="mismatch"` … ⚠ **token を送れているのに止まる**いちばん分かりにくい形（別の端末の token を持っている）
+- `token="unknown"` … relay が知らない token（別の relay 向け・手で作った値・DB を戻した後）
 
 ## コーディング規約
 
@@ -330,6 +401,7 @@ APNs / FCM のクレデンシャルは `.gitignore` で除外されている。
 | APNs Team ID | 同上 | settings.yml の `apns.team_id` |
 | Firebase サービスアカウント JSON | Android プッシュ通知送信 | settings.yml の `fcm.service_account_path` |
 | shared_secret | capsicum からの登録認証 | settings.yml の `shared_secret` |
+| extra_preset_hosts | プリセット判定に**足す**ホスト（任意・capsicum#597） | settings.yml の `extra_preset_hosts` |
 
 ## 関連リポジトリ
 

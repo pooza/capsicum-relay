@@ -122,4 +122,123 @@ class RegisterRouteTest < RequestTestCase
 
     assert_equal(404, last_response.status)
   end
+
+  # --- 利用権の観測 (capsicum#597 / #59) ----------------------------------
+  #
+  # ⚠⚠ **この Issue では誰も拒まない。**受け取って記録するだけ。
+
+  # ⚠⚠ **いちばん大事な固定。**token を持たないクライアント（無償のプリセット
+  # ユーザーが大多数）が従来どおり成功する。
+  def test_registers_without_entitlement_token
+    post_json('/register', VALID)
+
+    assert_equal(201, last_response.status)
+    refute_empty(json_response['push_token'].to_s)
+    assert_equal(
+      1,
+      metrics.value('relay_register_entitlement_total',
+        {preset: 'no', entitlement: 'none', token: 'none'}),
+    )
+  end
+
+  # ⚠ 知らない token を送られても拒まない（拒むのはフェーズ 2 以降）。
+  def test_registers_with_unknown_entitlement_token
+    post_json('/register', VALID.merge(device_id: 'd1', entitlement_token: 'bogus'))
+
+    assert_equal(201, last_response.status)
+    assert_equal(
+      1,
+      metrics.value('relay_register_entitlement_total',
+        {preset: 'no', entitlement: 'none', token: 'unknown'}),
+    )
+  end
+
+  def test_records_matching_entitlement_token
+    token = issue_entitlement(device_id: 'd1')
+    post_json('/register', VALID.merge(device_id: 'd1', entitlement_token: token))
+
+    assert_equal(201, last_response.status)
+    assert_equal(
+      1,
+      metrics.value('relay_register_entitlement_total',
+        {preset: 'no', entitlement: 'unverified', token: 'ok'}),
+    )
+  end
+
+  # ⚠⚠ ゲート（#60）は `subscriptions.device_id` から引くので、この端末は
+  # フェーズ 3 で止まる。token を送れているのに止まる形を先に数える。
+  def test_records_token_belonging_to_another_device
+    token = issue_entitlement(device_id: 'other-device')
+    post_json('/register', VALID.merge(device_id: 'd1', entitlement_token: token))
+
+    assert_equal(201, last_response.status)
+    assert_equal(
+      1,
+      metrics.value('relay_register_entitlement_total',
+        {preset: 'no', entitlement: 'none', token: 'mismatch'}),
+    )
+  end
+
+  # ⚠ **利用権は token の申告ではなく device_id から引く。**token を送ってこない
+  # クライアントでも、その端末に利用権があれば観測に出る。
+  def test_finds_entitlement_by_device_id_without_claimed_token
+    issue_entitlement(device_id: 'd1')
+    post_json('/register', VALID.merge(device_id: 'd1'))
+
+    assert_equal(
+      1,
+      metrics.value('relay_register_entitlement_total',
+        {preset: 'no', entitlement: 'unverified', token: 'none'}),
+    )
+  end
+
+  def test_records_preset_host
+    post_json('/register', VALID.merge(
+      account: 'pooza@mstdn.b-shock.org', server: 'mstdn.b-shock.org',
+    ))
+
+    assert_equal(
+      1,
+      metrics.value('relay_register_entitlement_total',
+        {preset: 'yes', entitlement: 'none', token: 'none'}),
+    )
+  end
+
+  # ⚠ 旧クライアント（device_id を送らない）でも落ちない。
+  def test_registers_without_device_id_and_with_token
+    token = issue_entitlement(device_id: 'other-device')
+    post_json('/register', VALID.merge(entitlement_token: token))
+
+    assert_equal(201, last_response.status)
+    assert_equal(
+      1,
+      metrics.value('relay_register_entitlement_total',
+        {preset: 'no', entitlement: 'none', token: 'mismatch'}),
+    )
+  end
+
+  # 空文字は「送っていない」と同じ扱い（他の項目と揃える）。
+  def test_blank_entitlement_token_is_treated_as_absent
+    post_json('/register', VALID.merge(entitlement_token: ''))
+
+    assert_equal(201, last_response.status)
+    assert_equal(
+      1,
+      metrics.value('relay_register_entitlement_total',
+        {preset: 'no', entitlement: 'none', token: 'none'}),
+    )
+  end
+
+  private
+
+  def metrics
+    return Relay::App.settings.metrics
+  end
+
+  def issue_entitlement(device_id:)
+    post_json('/entitlements', {
+      store: 'apple', purchase_id: "purchase-#{device_id}", device_id: device_id
+    })
+    return JSON.parse(last_response.body)['token']
+  end
 end

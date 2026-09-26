@@ -30,3 +30,10 @@ wns:
 # poll_interval を 0 にすると polling worker を無効化 (テスト用)
 announcement:
   poll_interval: 60
+
+# プリセット（capsicum 運営元）サーバーの判定に**足す**ホスト (capsicum#597 / #59)
+# ⚠ 一覧の正本は lib/relay/preset_servers.rb（capsicum の preset_servers.dart の写し）。
+# ⚠⚠ ここは足すことしかできない。置き換えにしていないのは、書き忘れたデプロイで
+#     全登録が非プリセット扱いになるのを防ぐため（フェーズ 3 では全員のゲートが閉じる）。
+# extra_preset_hosts:
+#   - "example.test"

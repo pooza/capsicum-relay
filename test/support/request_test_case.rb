@@ -65,6 +65,10 @@ class RequestTestCase < Minitest::Test
     db = SQLite3::Database.new(safe_db_path)
     TABLES.each {|table| db.execute("DELETE FROM #{table}")}
     db.close
+    # ⚠ **counter はプロセス内で共有**（`Relay::Metrics` は単一 App の設定に
+    # 載っている）。DB だけ空にして counter を残すと、ラベル別の件数を検証する
+    # ケースが**実行順で結果を変える**。
+    Relay::App.settings.metrics.reset!
   end
 
   # 🔴 消してよい DB かを毎回確かめる（Codex P1・PR #40 の多重防御）。

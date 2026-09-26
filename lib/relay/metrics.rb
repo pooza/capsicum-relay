@@ -34,6 +34,11 @@ module Relay
       # （同じ購入へ端末を足すたびに増える）。購入と端末の現在値は gauge の側。
       'relay_entitlement_token_total' =>
         'Entitlement tokens issued, by store (⚠ not verified in phase 1).',
+      # ⚠⚠ **フェーズ 3 でゲートを閉じたときに誰が止まるかを先に測る系列** (#59)。
+      # `preset="no"` かつ `entitlement="none"` が止まる候補。⚠ `token="mismatch"`
+      # は「token を送れているのに止まる」いちばん分かりにくい形。
+      'relay_register_entitlement_total' =>
+        'Registrations by preset host, entitlement status and claimed-token state.',
     }.freeze
 
     def initialize
