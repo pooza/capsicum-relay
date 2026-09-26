@@ -1,5 +1,6 @@
 require_relative 'lib/relay/base_app'
 require_relative 'lib/relay/routes/announcement_subscriptions'
+require_relative 'lib/relay/routes/entitlements'
 require_relative 'lib/relay/routes/health'
 require_relative 'lib/relay/routes/metrics'
 require_relative 'lib/relay/routes/push'
@@ -23,6 +24,7 @@ module Relay
     use Sentry::Rack::CaptureExceptions if Relay::SentrySetup.enabled?
 
     use Routes::AnnouncementSubscriptions
+    use Routes::Entitlements
     use Routes::Health
     use Routes::Metrics
     use Routes::Push

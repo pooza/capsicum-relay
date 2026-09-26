@@ -48,6 +48,7 @@ class AppCompositionTest < RequestTestCase
   def test_route_classes_share_one_database
     [
       Relay::Routes::AnnouncementSubscriptions,
+      Relay::Routes::Entitlements,
       Relay::Routes::Health,
       Relay::Routes::Push,
       Relay::Routes::Register,

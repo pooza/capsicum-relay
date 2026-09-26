@@ -19,6 +19,19 @@ module Relay
       'device_id', 'created_at', 'updated_at'
     ].freeze
 
+    # 利用権を扱えるストア (capsicum#597 / #58)。⚠ **Linux は入れない**
+    # （買える経路が無い・設計書の未決事項 7）。
+    ENTITLEMENT_STORES = ['apple', 'google', 'microsoft'].freeze
+
+    # 検証していない購入 (#58)。⚠⚠ **ゲート (#60) の許可側へ入れてはいけない。**
+    ENTITLEMENT_STATUS_UNVERIFIED = 'unverified'.freeze
+
+    # 購入の状態 (#58)。⚠ **DB の CHECK ではなくここで検査する**（理由は
+    # [create_entitlement_tables!] の doc）。フェーズ 3（#63）で増える。
+    ENTITLEMENT_STATUSES = [
+      ENTITLEMENT_STATUS_UNVERIFIED, 'active', 'grace', 'expired', 'revoked'
+    ].freeze
+
     # device_id を持たない古い行を掃除してよいと判断するまでの猶予 (capsicum#949)。
     # 生きている端末は起動のたびに register して updated_at が進むので、これを
     # 超えるのは実際に使われていない行だけになる。詳細は purge_legacy_rows 参照。
@@ -204,6 +217,78 @@ module Relay
       return @db.get_first_value('SELECT COUNT(*) FROM supporters')
     end
 
+    # 有償リレーの利用権 (capsicum#597 / #58)。**購入**単位。
+    #
+    # ⚠⚠ **フェーズ 1 ではレシートを検証しない**（検証はフェーズ 3 / #61 / #62）。
+    # 新規の status は必ず [ENTITLEMENT_STATUS_UNVERIFIED] で、**「購入した証拠」
+    # ではない**。⚠ ゲート (#60) を実際に閉じるときに `unverified` を許可側へ
+    # 入れてはいけない —— このエンドポイントは共有シークレットしか見ておらず、
+    # **シークレットはバイナリから取り出せる**（capsicum#1121）ので、誰でも
+    # 好きな `purchase_id` で行を作れる。
+    #
+    # [device_id] は `subscriptions.device_id` と同じ、クライアントがインストール
+    # 単位で持つ安定 ID (#15 / capsicum#932)。⚠ **新しい識別子を作らない**（#57）。
+    #
+    # 同じ (store, purchase_id, device_id) で二度呼ばれたら**同じ token を返す**。
+    # ⚠ アプリの起動ごとに token が増えると、端末単位の無効化 (#57) が
+    # 「どれを消せばいいのか分からない」状態になる。
+    def issue_entitlement_token(store:, purchase_id:, device_id:, product_id: nil)
+      entitlement = upsert_entitlement(store, purchase_id, product_id)
+      upsert_entitlement_token(entitlement['id'], device_id)
+      return find_entitlement_token_by_device(entitlement['id'], device_id)
+    end
+
+    # token 1 本を、紐づく購入の状態と一緒に引く (#58)。ゲート (#60) の入口。
+    #
+    # ⚠ **返すのは join 済みの 1 行。**`status` / `expires_at` は購入側の列で、
+    # token 側には無い（端末ごとに状態が分かれることは無い）。
+    def find_entitlement_token(token)
+      return @db.execute(<<~SQL, [token]).first
+        SELECT t.id, t.token, t.entitlement_id, t.device_id,
+               t.created_at, t.updated_at,
+               e.store, e.purchase_id, e.product_id, e.status, e.expires_at
+        FROM entitlement_tokens t
+        JOIN entitlements e ON t.entitlement_id = e.id
+        WHERE t.token = ?
+      SQL
+    end
+
+    # `subscriptions.device_id` から利用権を引く (#57 の 2-4 の経路)。
+    #
+    # ⚠ **1 端末が複数の購入にぶら下がりうる**（買い直し・別ストア）。ゲートは
+    # 「1 つでも有効なものがあるか」で見るので、**全部返す**。
+    def entitlement_tokens_for_device(device_id)
+      return [] if device_id.to_s.empty?
+
+      return @db.execute(<<~SQL, [device_id])
+        SELECT t.token, t.device_id, e.store, e.purchase_id, e.status, e.expires_at
+        FROM entitlement_tokens t
+        JOIN entitlements e ON t.entitlement_id = e.id
+        WHERE t.device_id = ?
+      SQL
+    end
+
+    # 1 購入にぶら下がっている端末 (#58)。
+    #
+    # ⚠ **上限は設けない**（#57）。対象者 0 人から始まるので先回りで制限せず、
+    # **件数だけ記録する**。異常な数が出てから考える。
+    def entitlement_tokens_for_purchase(store, purchase_id)
+      return @db.execute(<<~SQL, [store, purchase_id])
+        SELECT t.token, t.device_id, t.created_at
+        FROM entitlement_tokens t
+        JOIN entitlements e ON t.entitlement_id = e.id
+        WHERE e.store = ? AND e.purchase_id = ?
+      SQL
+    end
+
+    def entitlement_count
+      return @db.get_first_value('SELECT COUNT(*) FROM entitlements')
+    end
+
+    def entitlement_token_count
+      return @db.get_first_value('SELECT COUNT(*) FROM entitlement_tokens')
+    end
+
     def announcement_seen?(server, announcement_id)
       return @db.get_first_value(<<~SQL, [server, announcement_id.to_s]).to_i.positive?
         SELECT COUNT(*) FROM seen_announcements
@@ -340,6 +425,7 @@ module Relay
       create_subscriptions_indexes!
       create_announcement_tables!
       create_supporters_table!
+      create_entitlement_tables!
     end
 
     def create_subscriptions_indexes!
@@ -388,6 +474,102 @@ module Relay
       # register で埋まる。
       return if subscriptions_schema['sql'].include?('device_id')
       @db.execute('ALTER TABLE subscriptions ADD COLUMN device_id TEXT')
+    end
+
+    # 有償リレーの利用権 (capsicum#597 / #58)。テーブルは 2 本（#57 の決着）。
+    #
+    # ⚠⚠ **`subscriptions` に列を足さない。**あのテーブルは CHECK / UNIQUE を
+    # 変えるたびに [rebuild_subscriptions_table!] が要り、**その組み替えは過去に
+    # 子テーブルの FK を壊している**（`repair_announcement_subscriptions_fk!` が
+    # 今も居座っているのがその跡・capsicum#468）。**課金の都合で push の中核
+    # テーブルを組み替えない。**紐づけは `device_id` の join で足りる。
+    #
+    # ⚠⚠ **`status` に CHECK を付けない。**フェーズ 3（#63）で扱う状態は
+    # 更新・失効・返金・支払い猶予・課金リトライと**これから増える**。CHECK を
+    # 付けると状態を 1 つ足すたびにテーブル組み替えになり、`subscriptions` で
+    # 踏んだのと同じ罠を新しいテーブルで再現することになる。値の検査は Ruby 側
+    # （[ENTITLEMENT_STATUSES]）で行う。
+    def create_entitlement_tables!
+      create_entitlements_table!
+      create_entitlement_tokens_table!
+    end
+
+    def create_entitlements_table!
+      @db.execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS entitlements (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          store TEXT NOT NULL,
+          purchase_id TEXT NOT NULL,
+          product_id TEXT,
+          status TEXT NOT NULL,
+          expires_at TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(store, purchase_id)
+        )
+      SQL
+    end
+
+    def create_entitlement_tokens_table!
+      @db.execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS entitlement_tokens (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          token TEXT NOT NULL,
+          entitlement_id INTEGER NOT NULL,
+          device_id TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(token),
+          UNIQUE(entitlement_id, device_id),
+          FOREIGN KEY (entitlement_id) REFERENCES entitlements(id) ON DELETE CASCADE
+        )
+      SQL
+      # `subscriptions.device_id` から引く経路（#57 の 2-4）のための索引。
+      @db.execute(<<~SQL)
+        CREATE INDEX IF NOT EXISTS idx_entitlement_tokens_device
+        ON entitlement_tokens(device_id)
+      SQL
+    end
+
+    # 購入の upsert。⚠ **既存行の `status` / `expires_at` は触らない。**
+    # フェーズ 3 の検証結果を、クライアントからの再発行要求で `unverified` へ
+    # 巻き戻さないため（アプリを再起動しただけで有効な購入が無効に見える）。
+    def upsert_entitlement(store, purchase_id, product_id)
+      @db.execute(<<~SQL, [store, purchase_id, product_id, ENTITLEMENT_STATUS_UNVERIFIED])
+        INSERT INTO entitlements
+          (store, purchase_id, product_id, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))
+        ON CONFLICT(store, purchase_id) DO UPDATE SET
+          product_id = COALESCE(excluded.product_id, product_id),
+          updated_at = datetime('now')
+      SQL
+      return @db.execute(
+        'SELECT * FROM entitlements WHERE store = ? AND purchase_id = ?',
+        [store, purchase_id],
+      ).first
+    end
+
+    # 端末ごとの token の upsert。⚠ **既存行の `token` は差し替えない**
+    # （[issue_entitlement_token] の doc）。
+    def upsert_entitlement_token(entitlement_id, device_id)
+      @db.execute(<<~SQL, [SecureRandom.urlsafe_base64(32), entitlement_id, device_id])
+        INSERT INTO entitlement_tokens
+          (token, entitlement_id, device_id, created_at, updated_at)
+        VALUES (?, ?, ?, datetime('now'), datetime('now'))
+        ON CONFLICT(entitlement_id, device_id) DO UPDATE SET
+          updated_at = datetime('now')
+      SQL
+    end
+
+    def find_entitlement_token_by_device(entitlement_id, device_id)
+      return @db.execute(<<~SQL, [entitlement_id, device_id]).first
+        SELECT t.id, t.token, t.entitlement_id, t.device_id,
+               t.created_at, t.updated_at,
+               e.store, e.purchase_id, e.product_id, e.status, e.expires_at
+        FROM entitlement_tokens t
+        JOIN entitlements e ON t.entitlement_id = e.id
+        WHERE t.entitlement_id = ? AND t.device_id = ?
+      SQL
     end
 
     # サポーター状態 (capsicum#596 / #18)。将来の有償リレー利用権

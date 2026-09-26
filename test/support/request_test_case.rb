@@ -45,7 +45,13 @@ class RequestTestCase < Minitest::Test
 
   SECRET = 'test-secret'.freeze
 
-  TABLES = ['announcement_subscriptions', 'supporters', 'subscriptions'].freeze
+  # ⚠ **子から先に消す。**`entitlement_tokens` は `entitlements` を FK 参照して
+  # いるので、親を先に消すと ON DELETE CASCADE 頼みになる（意図せず
+  # 「消えたこと」を検証してしまう）。
+  TABLES = [
+    'announcement_subscriptions', 'supporters', 'entitlement_tokens',
+    'entitlements', 'subscriptions'
+  ].freeze
 
   def app
     return Relay::App
@@ -57,8 +63,6 @@ class RequestTestCase < Minitest::Test
 
   def setup
     db = SQLite3::Database.new(safe_db_path)
-    # 子から先に消す（subscriptions を先に消すと FK ON DELETE CASCADE 頼みに
-    # なり、意図せず「消えたこと」を検証してしまう）。
     TABLES.each {|table| db.execute("DELETE FROM #{table}")}
     db.close
   end

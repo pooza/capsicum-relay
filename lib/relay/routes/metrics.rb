@@ -22,6 +22,10 @@ module Relay
       helpers do
         # DB から都度読む現在値。counter と違って再起動をまたいで意味を保つ。
         def gauges
+          return push_gauges.merge(entitlement_gauges)
+        end
+
+        def push_gauges
           return {
             'relay_subscriptions' => [
               'Registered device subscriptions.', settings.database.count
@@ -33,6 +37,21 @@ module Relay
             'relay_supporters' => [
               'Supporters who have tipped at least once.',
               settings.database.supporter_count,
+            ],
+          }
+        end
+
+        # 有償リレー (capsicum#597 / #58)。⚠ **`/health` には出さない。**
+        # あちらは無認証で、購入の数は「生きているか」に要らない。
+        def entitlement_gauges
+          return {
+            'relay_entitlements' => [
+              'Purchases with an entitlement (⚠ includes unverified ones in phase 1).',
+              settings.database.entitlement_count,
+            ],
+            'relay_entitlement_tokens' => [
+              'Devices holding an entitlement token.',
+              settings.database.entitlement_token_count,
             ],
           }
         end

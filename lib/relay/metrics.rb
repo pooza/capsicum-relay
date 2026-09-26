@@ -30,6 +30,10 @@ module Relay
       'relay_announcement_subscription_total' =>
         'Announcement subscription changes, by action.',
       'relay_supporter_tip_total' => 'Supporter tips recorded.',
+      # 有償リレー (capsicum#597 / #58)。⚠ **発行の回数**で、購入の数ではない
+      # （同じ購入へ端末を足すたびに増える）。購入と端末の現在値は gauge の側。
+      'relay_entitlement_token_total' =>
+        'Entitlement tokens issued, by store (⚠ not verified in phase 1).',
     }.freeze
 
     def initialize
