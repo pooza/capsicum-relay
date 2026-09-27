@@ -138,6 +138,31 @@ class DatabaseTest < Minitest::Test
     assert_equal(1, count)
   end
 
+  # ⚠ token の発行（行を作る → token を入れる）の間に、検証の付け替えが割り込まない
+  # （Codex P2・PR #75）。割り込むと作ったばかりの行が消され、消えた行を指す token を
+  # 入れようとして外部キー違反で落ちる。1 本目は行を作った直後に待ち、その間に 2 本目が
+  # その行を元の取引 ID の行へ寄せる。
+  def test_token_issuance_is_not_interrupted_by_a_merge
+    db = open_database
+    db.issue_entitlement_token(store: 'apple', purchase_id: 'orig', device_id: 'd1')
+    def db.upsert_entitlement_token(...)
+      sleep(0.2)
+      return super
+    end
+    issued = Thread.new do
+      db.issue_entitlement_token(store: 'apple', purchase_id: 'tx-new', device_id: 'd2')
+    rescue StandardError => e
+      e
+    end
+    sleep(0.05)
+    provisional = db.find_entitlement('apple', 'tx-new')
+    db.apply_entitlement_verification(provisional['id'], verification('orig')) if provisional
+    result = issued.value
+
+    refute_kind_of(StandardError, result, result.inspect)
+    assert_equal(2, db.entitlement_tokens_for_purchase('apple', 'orig').size)
+  end
+
   # --- 修復 -------------------------------------------------------------------
 
   def test_broken_foreign_key_is_rewritten_to_subscriptions

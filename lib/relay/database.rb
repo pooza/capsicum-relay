@@ -267,10 +267,17 @@ module Relay
     # 同じ (store, purchase_id, device_id) で二度呼ばれたら**同じ token を返す**。
     # ⚠ アプリの起動ごとに token が増えると、端末単位の無効化 (#57) が
     # 「どれを消せばいいのか分からない」状態になる。
+    #
+    # ⚠ **行を作ってから token を入れるまでを 1 つのトランザクションにする**（Codex P2・
+    # PR #75）。間に検証の付け替え（[apply_entitlement_verification]）が割り込むと、
+    # 作ったばかりの行が消され、消えた行を指す token を入れようとして外部キー違反で落ちる。
+    # トランザクションの間は [Relay::SerializedConnection] がほかのスレッドを待たせる。
     def issue_entitlement_token(store:, purchase_id:, device_id:, product_id: nil)
-      entitlement = upsert_entitlement(store, purchase_id, product_id)
-      upsert_entitlement_token(entitlement['id'], device_id)
-      return find_entitlement_token_by_device(entitlement['id'], device_id)
+      @db.transaction do
+        entitlement = upsert_entitlement(store, purchase_id, product_id)
+        upsert_entitlement_token(entitlement['id'], device_id)
+        return find_entitlement_token_by_device(entitlement['id'], device_id)
+      end
     end
 
     # token 1 本を、紐づく購入の状態と一緒に引く (#58)。ゲート (#60) の入口。
