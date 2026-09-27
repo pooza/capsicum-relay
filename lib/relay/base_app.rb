@@ -6,6 +6,8 @@ require 'yaml'
 require_relative 'announcement_worker'
 require_relative 'apns_client'
 require_relative 'database'
+require_relative 'entitlement_gate'
+require_relative 'entitlement_helpers'
 require_relative 'fcm_client'
 require_relative 'metrics'
 require_relative 'push_dedup'
@@ -101,6 +103,10 @@ module Relay
     # push 送信・結果ハンドリング系（build_push_payload / dispatch_push /
     # handle_push_* 等）は Relay::PushHelpers へ切り出してある (#27)。
     helpers Relay::PushHelpers
+
+    # 有償リレーの認可 (capsicum#597 / #60)。⚠ **`/register` と `/push` の両方が
+    # ここを通る。**判定の規則は [Relay::EntitlementGate] が正本。
+    helpers Relay::EntitlementHelpers
 
     helpers do
       # 共有シークレットによる認証 (#47)。

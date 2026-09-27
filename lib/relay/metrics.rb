@@ -39,6 +39,11 @@ module Relay
       # は「token を送れているのに止まる」いちばん分かりにくい形。
       'relay_register_entitlement_total' =>
         'Registrations by preset host, entitlement status and claimed-token state.',
+      # ⚠⚠ **`reason="error"` が 0 でないあいだゲートは効いていない** (#60)。
+      # fail-open なので拒まれないぶん、ここを見ないと気付けない。
+      # ⚠ `reason="enforce_off"` が全部を占めているのがフェーズ 2 の正常な状態。
+      'relay_entitlement_gate_total' =>
+        'Entitlement gate decisions, by route, decision and reason.',
     }.freeze
 
     def initialize

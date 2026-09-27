@@ -37,3 +37,8 @@ announcement:
 #     全登録が非プリセット扱いになるのを防ぐため（フェーズ 3 では全員のゲートが閉じる）。
 # extra_preset_hosts:
 #   - "example.test"
+
+# 認可ゲート (capsicum#597 / #60) は **env** で切り替える（設定ファイルではない）。
+# ⚠⚠ 既定は無効（何も閉じない）。本番で立てるのはフェーズ 3 の決定で、
+#     立てる前に relay_register_entitlement_total を読み直すこと。
+#   systemd drop-in 例: Environment=RELAY_ENTITLEMENT_ENFORCE=true

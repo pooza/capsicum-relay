@@ -25,8 +25,15 @@ module Relay
         )
         # 利用権の観測 (capsicum#597 / #59)。⚠⚠ **ここでは何も拒まない。**
         observation = observe_entitlement(sub)
-
         record_registration(sub, observation)
+
+        # 認可 (capsicum#597 / #60)。⚠⚠ **既定では何も閉じない。**
+        #
+        # ⚠ **登録してから判定する。**行を作らずに拒むと、⚠ **フェーズ 3 で
+        # ゲートを閉じた瞬間に「誰が止まったか」が DB から分からなくなる**
+        # （観測 #59 の母数が消える）。行は残し、配送を `/push` で止める。
+        halt_entitlement_required! unless entitlement_allowed?(sub, route: 'register')
+
         status 201
         sub.to_json
       end
@@ -47,6 +54,14 @@ module Relay
       end
 
       helpers do
+        # ⚠ **401 と区別できる形で返す。**クライアントは「シークレットが違う」と
+        # 「利用権が無い」で出す文面が違う（capsicum#1123 の登録ステータス画面）。
+        def halt_entitlement_required!
+          halt 403, {
+            error: 'Entitlement required', reason: 'entitlement_required'
+          }.to_json
+        end
+
         def record_registration(sub, observation)
           metrics.increment('relay_register_total', {action: 'created'})
           metrics.increment('relay_register_entitlement_total', observation)
