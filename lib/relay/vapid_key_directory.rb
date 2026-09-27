@@ -33,6 +33,12 @@ module Relay
     DEFAULT_TTL = 6 * 60 * 60
     # 引けなかったときに次に試すまで。⚠ **落ちているサーバーを叩き続けない。**
     DEFAULT_NEGATIVE_TTL = 10 * 60
+    # [refresh_key_for] を続けて呼ばれたときに、実際に引き直す最短間隔。
+    #
+    # ⚠⚠ **これが無いと DoS の踏み台になる。**引き直しは「鍵が合わない push が
+    # 来た」ときに走るので、**合わない鍵で叩き続けるだけでプリセットサーバーへ
+    # 好きなだけ HTTP を出させられる。**
+    MIN_REFRESH_INTERVAL = 60
     # ⚠ **短くする。**push の受け口の中で引くので、ここで待つとキューに積むのが遅れる。
     OPEN_TIMEOUT = 3
     READ_TIMEOUT = 3
@@ -40,6 +46,8 @@ module Relay
     # [hosts] は引いてよいホスト（プリセット + `extra_preset_hosts`）。
     # [fetch] はテスト用の差し替え口で、`->(uri, payload) { body or nil }`。
     # payload が nil なら GET、文字列なら JSON の POST。
+    # ⚠ [MIN_REFRESH_INTERVAL] は注入できるようにしていない。テストは [clock] を
+    # 進めれば足りるし、**運用で緩める値ではない**（緩めると DoS の踏み台になる）。
     def initialize(hosts:, ttl: DEFAULT_TTL, negative_ttl: DEFAULT_NEGATIVE_TTL,
       fetch: nil, clock: -> {Time.now.to_f})
       @hosts = Array(hosts).map {|host| Relay::PresetServers.normalize(host)}.reject(&:empty?).to_set
@@ -53,16 +61,40 @@ module Relay
 
     # 引けたら base64url（パディング無し）に揃えた公開鍵、引けなければ nil。
     def public_key_for(server)
-      host = Relay::PresetServers.normalize(server)
-      # ⚠ 一覧に無いホストは**取りに行かない**（SSRF を作らないための入口）。
-      return nil unless @hosts.include?(host)
+      host = allowed(server)
+      return nil unless host
 
       cached = read_cache(host)
       return cached.first if cached
 
+      return store(host, discover(host))
+    end
+
+    # ⚠⚠ **鍵が合わなかったときに 1 度だけ引き直す (#69・PR #77 の Codex P1)。**
+    #
+    # **プリセットサーバーが VAPID を作り直すと、TTL のあいだ手元は古い鍵のまま**に
+    # なる。そのあいだ本物の push が全部 `mismatch` になり、⚠⚠ **ゲートを閉じて
+    # いると 410 を返して上流の購読が永久に消える。**取り返しがつかないので、
+    # 詐称と決める前に必ず引き直す。
+    #
+    # 戻り値は **引き直せた鍵**。⚠ **引き直せなかったら nil**（呼び出し側は
+    # fail-open に倒す）—— 古い鍵をそのまま返すと、⚠ **上の事故がそのまま起きる。**
+    #
+    # ⚠ **[MIN_REFRESH_INTERVAL] のあいだは引き直さず、手元の鍵を返す。**
+    # 直前に引いたばかりなら、それが最新。
+    def refresh_key_for(server)
+      host = allowed(server)
+      return nil unless host
+
+      recent = recently_fetched(host)
+      return recent.first if recent
+
       key = discover(host)
-      write_cache(host, key)
-      return key
+      # ⚠ **引けなかったら手元の記録を壊さない。**negative cache で上書きすると、
+      # 一時的な通信障害のあとに「鍵が無い」状態が居座る。
+      return nil if key.nil?
+
+      return store(host, key)
     end
 
     # テストと、設定を読み直したときのための口。
@@ -72,19 +104,39 @@ module Relay
 
     private
 
+    # ⚠ 一覧に無いホストは**取りに行かない**（SSRF を作らないための入口）。
+    def allowed(server)
+      host = Relay::PresetServers.normalize(server)
+      return @hosts.include?(host) ? host : nil
+    end
+
+    # 記録は `[鍵, 期限, 引いた時刻]`。
     def read_cache(host)
       return @mon.synchronize do
         entry = @cache[host]
         next nil if entry.nil?
-        next nil if entry.last < @clock.call
+        next nil if entry[1] < @clock.call
 
         entry
       end
     end
 
-    def write_cache(host, key)
+    # 引き直しの間隔に入っていれば、手元の記録を返す。
+    def recently_fetched(host)
+      return @mon.synchronize do
+        entry = @cache[host]
+        next nil if entry.nil?
+        next nil if (@clock.call - entry[2]) >= MIN_REFRESH_INTERVAL
+
+        entry
+      end
+    end
+
+    def store(host, key)
       ttl = key.nil? ? @negative_ttl : @ttl
-      @mon.synchronize {@cache[host] = [key, @clock.call + ttl]}
+      now = @clock.call
+      @mon.synchronize {@cache[host] = [key, now + ttl, now]}
+      return key
     end
 
     # ⚠ **Mastodon → Misskey の順に試す。**どちらでもなければ nil。

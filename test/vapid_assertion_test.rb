@@ -118,6 +118,63 @@ class VapidAssertionTest < Minitest::Test
     refute_predicate(V.verify(authorization: "vapid t=#{token},k=#{encoded}"), :verified?)
   end
 
+  # --- ⚠⚠ 宛先（aud）の検証（#69・PR #77 の Codex P1） --------------------
+
+  # ⚠⚠ **他所宛ての署名を貼り直す迂回を塞ぐ。**攻撃者がプリセットサーバーで
+  # 購読を作れば、**本物の鍵で署名された `Authorization` を自分宛てに受け取れる。**
+  def test_a_signature_for_another_audience_does_not_verify
+    result = V.verify(
+      authorization: "vapid t=#{token},k=#{@encoded}",
+      audience: 'https://other.example',
+    )
+
+    refute_predicate(result, :verified?)
+    assert_equal(V::OUTCOME_AUDIENCE_MISMATCH, result.outcome)
+  end
+
+  def test_the_expected_audience_verifies
+    result = V.verify(
+      authorization: "vapid t=#{token},k=#{@encoded}",
+      audience: AUDIENCE,
+    )
+
+    assert_predicate(result, :verified?)
+  end
+
+  # ⚠ **末尾の `/` と大小だけの違いで本物を落とさない。**Mastodon と Misskey で
+  # `aud` の作り方が違う（前者は normalized_site、後者は設定の url そのまま）。
+  def test_audience_comparison_ignores_trailing_slash_and_case
+    ["#{AUDIENCE}/", AUDIENCE.upcase, " #{AUDIENCE} "].each do |expected|
+      assert_predicate(
+        V.verify(authorization: "vapid t=#{token},k=#{@encoded}", audience: expected),
+        :verified?,
+        "unexpectedly rejected: #{expected}",
+      )
+    end
+  end
+
+  # ⚠ **署名が偽物なら、aud を見る前に落ちる**（理由を取り違えない）。
+  def test_a_bad_signature_is_not_reported_as_an_audience_mismatch
+    other = OpenSSL::PKey::EC.generate('prime256v1')
+    result = V.verify(
+      authorization: "vapid t=#{token(key: other)},k=#{@encoded}",
+      audience: 'https://other.example',
+    )
+
+    assert_equal(V::OUTCOME_BAD_SIGNATURE, result.outcome)
+  end
+
+  # ⚠ 貼り直しの調査に要るので、宛先違いでも**鍵と aud は返す**。
+  def test_an_audience_mismatch_still_reports_the_key_and_audience
+    result = V.verify(
+      authorization: "vapid t=#{token},k=#{@encoded}",
+      audience: 'https://other.example',
+    )
+
+    assert_equal(@encoded, result.public_key)
+    assert_equal(AUDIENCE, result.audience)
+  end
+
   # --- 比較のための正規化 -------------------------------------------------
 
   # ⚠⚠ **パディングと `+/` の違いだけで「別の鍵」に見えてはいけない。**

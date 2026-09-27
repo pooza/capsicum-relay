@@ -40,6 +40,19 @@ module Relay
     OUTCOME_MALFORMED = 'malformed'.freeze
     # 公開鍵は読めたが、その鍵では署名が合わない / 期限切れ。
     OUTCOME_BAD_SIGNATURE = 'bad_signature'.freeze
+    # ⚠⚠ **署名は本物だが、**この relay 宛てではない** (#69・PR #77 の Codex P1)。
+    #
+    # **VAPID の JWT は宛先ごとに署名される**（`aud` ＝ push を投げる先の origin）。
+    # ⚠ **見ないと、こういう迂回ができる**:
+    #
+    # 1. 攻撃者がプリセットサーバーで Web Push の購読を作り、**宛先を自分の
+    #    サーバーにする**
+    # 2. プリセットサーバーが**本物の鍵で署名した `Authorization` を攻撃者へ渡す**
+    # 3. それを期限内にこの relay へ**そのまま貼り直す**
+    #
+    # → ⚠⚠ **鍵の照合だけでは通ってしまう。**`aud` まで見て初めて「この要求が
+    # この relay 宛てに作られた」と言える。
+    OUTCOME_AUDIENCE_MISMATCH = 'audience_mismatch'.freeze
 
     Result = Struct.new(:outcome, :public_key, :subject, :audience, keyword_init: true) do
       def verified?
@@ -52,7 +65,10 @@ module Relay
     #
     # ⚠ **例外を外へ出さない。**受け口は認証なしで叩けるので、壊れたヘッダで
     # 500 になってはいけない（#61 の Codex P2 と同じ理由）。
-    def self.verify(authorization:, crypto_key: nil)
+    # [audience] はこの relay の origin（`https://relay.example`）。⚠⚠ **渡すこと。**
+    # nil だと `aud` を見ないので、**他所宛ての署名を貼り直す迂回が通る**
+    # （[OUTCOME_AUDIENCE_MISMATCH] の説明）。テストと移行のためだけに nil を許す。
+    def self.verify(authorization:, crypto_key: nil, audience: nil)
       token, encoded_key = extract(authorization, crypto_key)
       return Result.new(outcome: OUTCOME_ABSENT) if token.nil?
       return Result.new(outcome: OUTCOME_MALFORMED) if encoded_key.nil?
@@ -60,7 +76,7 @@ module Relay
       raw = decode_key(encoded_key)
       return Result.new(outcome: OUTCOME_MALFORMED) if raw.nil?
 
-      return decode_token(token, raw, encoded_key)
+      return decode_token(token, raw, encoded_key, audience)
     rescue StandardError
       return Result.new(outcome: OUTCOME_MALFORMED)
     end
@@ -123,16 +139,40 @@ module Relay
 
     # ⚠ **`exp` は JWT 側が見る**（`verify_expiration` の既定が true）。
     # Mastodon は 24 時間、Misskey（`web-push`）は 12 時間で切る。
-    def self.decode_token(token, raw, encoded_key)
+    def self.decode_token(token, raw, encoded_key, audience)
       payload, = JWT.decode(token, public_key_from(raw), true, algorithm: ALGORITHM)
+      claimed = payload['aud']
+      unless audience_ok?(claimed, audience)
+        # ⚠ **署名は本物なので、公開鍵は返す**（ログで「どのサーバー宛ての
+        # 署名を貼り直したか」が読めるように）。判定は呼び出し側。
+        return Result.new(
+          outcome: OUTCOME_AUDIENCE_MISMATCH,
+          public_key: normalize_key(encoded_key),
+          subject: payload['sub'],
+          audience: claimed,
+        )
+      end
       return Result.new(
         outcome: OUTCOME_VERIFIED,
         public_key: normalize_key(encoded_key),
         subject: payload['sub'],
-        audience: payload['aud'],
+        audience: claimed,
       )
     rescue JWT::DecodeError
       return Result.new(outcome: OUTCOME_BAD_SIGNATURE)
+    end
+
+    # ⚠ **末尾の `/` と大小だけの違いで落とさない。**Mastodon は
+    # `Addressable::URI#normalized_site`（`https://host`）、Misskey（`web-push`）は
+    # 設定の `url` をそのまま入れるので、**形が揃っている保証が無い。**
+    def self.audience_ok?(claimed, expected)
+      return true if expected.nil?
+
+      return normalize_audience(claimed) == normalize_audience(expected)
+    end
+
+    def self.normalize_audience(value)
+      return value.to_s.strip.downcase.sub(%r{/+\z}, '')
     end
 
     # 生の非圧縮点から検証用の EC 公開鍵を組む。

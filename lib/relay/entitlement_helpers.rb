@@ -48,6 +48,7 @@ module Relay
       assertion = Relay::VapidAssertion.verify(
         authorization: request.env['HTTP_AUTHORIZATION'],
         crypto_key: request.env['HTTP_CRYPTO_KEY'],
+        audience: relay_audience,
       )
       verification = classify_preset_claim(subscription['server'], assertion)
       record_vapid_verification(subscription, assertion: assertion, verification: verification)
@@ -60,6 +61,22 @@ module Relay
       )
     end
 
+    # この relay の origin。VAPID の `aud` と突き合わせる (#69)。
+    #
+    # ⚠⚠ **`aud` を見ないと、他所宛ての署名を貼り直す迂回が通る**
+    # （[Relay::VapidAssertion::OUTCOME_AUDIENCE_MISMATCH]）。
+    #
+    # ⚠ **nginx の前段を見る。**`X-Forwarded-Proto` が無いと `http` を名乗って
+    # しまい、**本物の push が全部 audience_mismatch になる。**
+    # ⚠ 経路が変則なとき（別名でも受ける等）は設定の `relay_audience` で上書きする。
+    def relay_audience
+      configured = settings.config['relay_audience']
+      return configured unless configured.to_s.strip.empty?
+
+      scheme = request.env['HTTP_X_FORWARDED_PROTO'] || request.scheme
+      return "#{scheme}://#{request.host}"
+    end
+
     # ⚠⚠ **順序が意味を持つ。**鍵が引けないときは、署名の有無に関わらず
     # `unavailable`（＝ fail-open）。**こちらが確かめられなかったことを、相手の
     # 落ち度として数えない。**
@@ -69,17 +86,39 @@ module Relay
       return Relay::EntitlementGate::PRESET_UNSIGNED unless assertion.verified?
       return Relay::EntitlementGate::PRESET_VERIFIED if assertion.public_key == expected
 
+      return rotated_or_mismatch(server, assertion)
+    end
+
+    # ⚠⚠ **詐称と決める前に、鍵の更新を 1 度だけ疑う (#69・PR #77 の Codex P1)。**
+    #
+    # プリセットサーバーが VAPID を作り直すと、TTL のあいだ手元は古い鍵のままに
+    # なる。そのあいだ本物の push が全部 `mismatch` になり、⚠⚠ **ゲートを閉じて
+    # いると 410 を返して上流の購読が永久に消える。**
+    #
+    # ⚠ **引き直せなかったら fail-open**（`unavailable`）。古い鍵のままで詐称と
+    # 決めると、上の事故がそのまま起きる。
+    def rotated_or_mismatch(server, assertion)
+      fresh = settings.vapid_keys&.refresh_key_for(server)
+      return Relay::EntitlementGate::PRESET_UNAVAILABLE if fresh.nil?
+      return Relay::EntitlementGate::PRESET_VERIFIED if assertion.public_key == fresh
+
       return Relay::EntitlementGate::PRESET_MISMATCH
     end
 
     # ⚠ **`verified` も数える。**分母が無いと「1 件も検証できていない」と
-    # 「全部通っている」が区別できない。⚠ `server` はプリセットの一覧に
-    # 限られる（[claims_preset?] を通った後）ので、ラベルの数は増えない。
+    # 「全部通っている」が区別できない。
+    #
+    # ⚠⚠ **ラベルは正規化した host にする (#69・PR #77 の Codex P2)。**
+    # `subscriptions.server` は **`/register` が受け取った生の申告**で、
+    # `MSTDN.B-Shock.org` / `mstdn.b-shock.org.` / 前後の空白がすべて別の値に
+    # なる。[claims_preset?] は正規化して比べるので**どれもここまで来る**が、
+    # 生のまま数えると ⚠ **その変種の数だけ Prometheus の系列が増え、
+    # プロセス内 Hash と `/metrics` の出力が上限なく育つ。**
     def record_vapid_verification(subscription, assertion:, verification:)
       metrics.increment(
         'relay_vapid_verification_total',
         {
-          server: subscription['server'].to_s,
+          server: Relay::PresetServers.normalize(subscription['server']),
           outcome: assertion.outcome,
           verification: verification.to_s,
         },

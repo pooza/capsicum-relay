@@ -65,6 +65,15 @@ announcement:
 # extra_preset_hosts:
 #   - "example.test"
 
+# プリセットの名乗りを裏取りするときに要求する VAPID の `aud` (capsicum#597 / #69)。
+#
+# ⚠ **通常は書かなくてよい。**未設定なら `X-Forwarded-Proto` + `Host` から組む
+#   （nginx の設定が config/nginx.conf.sample どおりならこれで合う）。
+# ⚠⚠ **書くのは経路が変則なとき**（別名でも push を受ける・前段が Proto を
+#     渡さない等）。⚠ **合っていないと本物の push が全部 audience_mismatch に
+#     なる**ので、変えたら `relay_vapid_verification_total` を読むこと。
+# relay_audience: "https://relay.example.net"
+
 # 認可ゲート (capsicum#597 / #60) は **env** で切り替える（設定ファイルではない）。
 # ⚠⚠ 既定は無効（何も閉じない）。本番で立てるのはフェーズ 3 の決定で、
 #     立てる前に relay_register_entitlement_total を読み直すこと。

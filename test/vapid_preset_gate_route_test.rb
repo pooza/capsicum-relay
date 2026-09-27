@@ -22,7 +22,27 @@ class VapidPresetGateRouteTest < RequestTestCase
   # `public_key_for` だけを持つ最小の代役。[keys] は host => 鍵（nil で「引けない」）。
   class FakeDirectory
     def initialize(keys) = @keys = keys
-    def public_key_for(host) = @keys[host.to_s.downcase]
+    def public_key_for(host) = @keys[Relay::PresetServers.normalize(host)]
+    # 引き直しても同じ鍵（更新していない）。
+    def refresh_key_for(host) = public_key_for(host)
+  end
+
+  # 手元は [cached]、引き直すと [fresh] を返す代役（鍵の更新の再現）。
+  # [fresh] が nil なら「引き直せなかった」。
+  class RotatingDirectory
+    def initialize(host, cached, fresh)
+      @host = Relay::PresetServers.normalize(host)
+      @cached = cached
+      @fresh = fresh
+    end
+
+    def public_key_for(host)
+      return Relay::PresetServers.normalize(host) == @host ? @cached : nil
+    end
+
+    def refresh_key_for(host)
+      return Relay::PresetServers.normalize(host) == @host ? @fresh : nil
+    end
   end
 
   # ⚠⚠ **`Relay::BaseApp` に set する。** route は `Relay::Routes::*` という
@@ -50,9 +70,13 @@ class VapidPresetGateRouteTest < RequestTestCase
     return Base64.urlsafe_encode64(key.public_key.to_octet_string(:uncompressed)).delete('=')
   end
 
-  def vapid_header(key)
+  # ⚠ Rack::Test は `example.org` を名乗り、`X-Forwarded-Proto` は無いので
+  # relay が組む audience は `http://example.org` になる（#69・Codex P1）。
+  AUDIENCE = 'http://example.org'.freeze
+
+  def vapid_header(key, audience: AUDIENCE)
     payload = {
-      aud: 'https://relay.capsicum.shrieker.net',
+      aud: audience,
       exp: Time.now.to_i + 3600,
       sub: 'mailto:ops@example.test',
     }
@@ -112,6 +136,48 @@ class VapidPresetGateRouteTest < RequestTestCase
     end
   end
 
+  # ⚠⚠ **他所宛ての署名を貼り直しても通らない（#69・Codex P1）。**
+  #
+  # 攻撃者がプリセットサーバーで購読を作って**自分のサーバー宛て**の本物の
+  # `Authorization` を受け取り、それを期限内にここへ貼り直す経路。鍵の照合
+  # だけでは通ってしまう。
+  def test_a_signature_for_another_audience_is_gone
+    with_enforce do
+      assert_equal(
+        410,
+        push_claiming_preset(
+          authorization: vapid_header(@key, audience: 'https://attacker.example'),
+        ),
+      )
+    end
+  end
+
+  # ⚠⚠ **鍵の更新を詐称と誤らない（#69・Codex P1）。**
+  #
+  # 誤ると 410 を返して**上流の購読が永久に消える**ので、取り返しがつかない。
+  def test_a_rotated_key_is_picked_up_instead_of_being_called_impersonation
+    rotated = OpenSSL::PKey::EC.generate('prime256v1')
+    # 手元は古い鍵のまま。引き直すと新しい鍵が返る。
+    Relay::BaseApp.set(
+      :vapid_keys, RotatingDirectory.new(PRESET, encode(@key), encode(rotated))
+    )
+
+    with_enforce do
+      refute_equal(410, push_claiming_preset(authorization: vapid_header(rotated)))
+    end
+  end
+
+  # ⚠ 引き直せなかったら fail-open（古い鍵のままで詐称と決めない）。
+  def test_fails_open_when_the_refresh_cannot_reach_the_server
+    Relay::BaseApp.set(
+      :vapid_keys, RotatingDirectory.new(PRESET, encode(@key), nil)
+    )
+
+    with_enforce do
+      refute_equal(410, push_claiming_preset(authorization: vapid_header(@other)))
+    end
+  end
+
   # ⚠⚠ **鍵が引けないのは「こちらの障害」。**本物のプリセットを巻き込まない。
   def test_fails_open_when_the_key_cannot_be_fetched
     stub_directory({})
@@ -161,6 +227,22 @@ class VapidPresetGateRouteTest < RequestTestCase
       1,
       metrics.value('relay_vapid_verification_total',
         {server: PRESET, outcome: 'verified', verification: 'verified'}),
+    )
+  end
+
+  # ⚠⚠ **ラベルは正規化した host（#69・Codex P2）。**生の申告のまま数えると、
+  # 大小・末尾のドット・空白の変種の数だけ系列が増えて上限なく育つ。
+  def test_the_metric_label_is_the_normalized_host
+    push_token = register_subscription(
+      token: 'device-token', device_type: 'ios',
+      account: "alice@#{PRESET}", server: "  #{PRESET.upcase}.  "
+    )['push_token']
+    post("/push/#{push_token}", 'body', {'CONTENT_TYPE' => 'application/octet-stream'})
+
+    assert_equal(
+      1,
+      metrics.value('relay_vapid_verification_total',
+        {server: PRESET, outcome: 'absent', verification: 'unsigned'}),
     )
   end
 
