@@ -218,6 +218,27 @@ erDiagram
 
 `POST /entitlements` は共有シークレットしか見ておらず、**そのシークレットはバイナリから取り出せる**（capsicum#1121）。**誰でも `unverified` の行を作れる**ので、入れるとゲートが無意味になる。`test/entitlement_gate_test.rb` が固定している。
 
+#### ⚠⚠ 410 で購読が消えることは実測済み（2026-09-27）
+
+設計書は「410 が正しい」と書いていたが**実測していなかった**。ステージングで踏んで確定させた。
+
+**フォークのソース**（推測で語らないための一次情報）:
+
+| | 購読を消す条件 |
+| --- | --- |
+| **Mastodon** (`Web::PushNotificationWorker#send`) | ⚠ **`408` / `429` 以外の 4xx すべて** |
+| **Misskey** (`PushNotificationService`) | ⚠⚠ **`410` だけ**。403 / 404 では消さず**永久に叩き続ける** |
+
+→ **両方に効くのは 410 だけ**なので、ゲートの拒否は 410 で返す。
+
+**ステージングでの実測**（st2.mstdn.b-shock.org = dev24 → st.relay）:
+
+1. 既存の購読に触らず、**relay が知らない push_token を指す購読を 1 件作った**
+2. `Web::PushNotificationWorker` を同期実行 → nginx のアクセスログに `POST /push/… 410`
+3. **購読が destroy された**（既存 2 件は無傷）
+
+⚠ **st2.misskey.delmulin.com → st.relay の push は直近 7 日で 0 件**（購読行はあるが通知が発生していない）。**Misskey 側のライブ確認は未了**でソース読みのみ。
+
 #### ⚠ `reason="error"` が 0 でないあいだゲートは効いていない
 
 fail-open なので拒まれず、**metrics を見ないと気付けない**。`entitlement.gate` のログは **warn** で出る。

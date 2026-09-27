@@ -1,5 +1,6 @@
 require_relative '../base_app'
 require_relative '../sentry_setup'
+require_relative '../structured_log'
 
 module Relay
   module Routes
@@ -35,11 +36,24 @@ module Relay
         def halt_unknown_push_token!
           # それ自体はエラーではない（stale subscription の自然な掃除）。同一
           # リクエスト内で別の例外が捕捉された際の文脈として breadcrumb を残す
-          # に留める (#10 Phase D)。件数そのものの可視化は metrics (#2) 側で扱う。
+          # に留める (#10 Phase D)。
           Relay::SentrySetup.breadcrumb(
             'Push for unknown token (410)',
             category: 'push',
             data: {push_token: Relay::SentrySetup.mask_token(params[:push_token])},
+          )
+          # ⚠⚠ **記録を残す (#60)。**以前はログも metric も無く、**relay 側から
+          # 「410 を返した」ことが一切見えなかった** —— #60 の検証で
+          # 「fedi サーバー側の購読が消えるか」を確かめたとき、**nginx の
+          # アクセスログを読むしか手が無かった**。410 は上流の購読を消す副作用が
+          # あるので、**返した回数は観測できないといけない。**
+          metrics.increment('relay_push_stale_token_total')
+          log_event(
+            'push.stale_token',
+            msg: 'Push for unknown token (410)',
+            # ⚠ push_token は capability secret。指紋だけ残す。
+            push_token: Relay::StructuredLog.fingerprint(params[:push_token]),
+            latency_ms: latency_ms,
           )
           halt 410, {error: 'Unknown push token'}.to_json
         end

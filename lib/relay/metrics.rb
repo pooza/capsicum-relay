@@ -44,6 +44,11 @@ module Relay
       # ⚠ `reason="enforce_off"` が全部を占めているのがフェーズ 2 の正常な状態。
       'relay_entitlement_gate_total' =>
         'Entitlement gate decisions, by route, decision and reason.',
+      # ⚠ **410 は上流の購読を消す副作用がある**ので、返した回数は観測できないと
+      # いけない (#60)。増え続けているなら、クライアントが再登録していない
+      # （＝通知が届かなくなっている）端末がある。
+      'relay_push_stale_token_total' =>
+        'Pushes for unknown tokens answered with 410 (upstream subscription is cleaned up).',
     }.freeze
 
     def initialize

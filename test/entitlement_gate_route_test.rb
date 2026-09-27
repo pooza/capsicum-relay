@@ -156,6 +156,32 @@ class EntitlementGateRouteTest < RequestTestCase
     assert_equal('Unknown push token', json_response['error'])
   end
 
+  # ⚠⚠ **410 は上流の購読を消す副作用がある**ので、返した回数を観測できないと
+  # いけない。以前はログも metric も無く、#60 の検証で「購読が消えるか」を
+  # 確かめたときに **nginx のアクセスログを読むしか手が無かった**。
+  def test_stale_token_410_is_counted
+    post('/push/nope', 'body', {'CONTENT_TYPE' => 'application/octet-stream'})
+
+    assert_equal(1, metrics.value('relay_push_stale_token_total'))
+  end
+
+  # ⚠ ゲートの 410 は stale の counter を増やさない（別の事象）。
+  def test_gate_410_is_not_counted_as_stale
+    push_token = register_subscription(**VALID.slice(:token, :device_type, :account, :server))['push_token']
+
+    with_enforce do
+      post("/push/#{push_token}", 'body', {'CONTENT_TYPE' => 'application/octet-stream'})
+    end
+
+    assert_equal(410, last_response.status)
+    assert_equal(0, metrics.value('relay_push_stale_token_total'))
+    assert_equal(
+      1,
+      metrics.value('relay_entitlement_gate_total',
+        {route: 'push', decision: 'deny', reason: 'no_entitlement'}),
+    )
+  end
+
   private
 
   def metrics
