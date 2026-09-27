@@ -4,6 +4,7 @@ require 'json'
 require 'net/http'
 require 'time'
 require 'uri'
+require_relative 'entitlement_gate'
 require_relative 'store_errors'
 
 module Relay
@@ -117,10 +118,18 @@ module Relay
     def result_from(json, purchase_token, asked_at)
       line = Array(json['lineItems']).max_by {|item| item['expiryTime'].to_s}
       expiry = parse_time(line&.dig('expiryTime'))
+      status = status_for(json['subscriptionState'], expiry)
+      # ⚠⚠ **許可側の状態なのに期限が読めない応答は使わない**（Codex P2・PR #76）。ゲートは
+      # 状態しか見ないので、期限の無い `active` を保存すると**無期限に通る**。形の崩れた
+      # 応答・API の変更は「確かめられなかった」として、いまの状態を残す。
+      if Relay::EntitlementGate::ENTITLED_STATUSES.include?(status) && expiry.nil?
+        raise Relay::StoreResponseInvalid, "#{status} without a valid expiryTime"
+      end
+
       return Result.new(
         purchase_id: purchase_token,
         product_id: line&.dig('productId'),
-        status: status_for(json['subscriptionState'], expiry),
+        status: status,
         expires_at: expiry&.utc&.strftime('%Y-%m-%d %H:%M:%S'),
         # ⚠ ライセンステスターの購入は `testPurchase` を持つ。Apple の TestFlight と同じく
         # `Sandbox` の印を付ける（本番でも有効に扱う・テスターは身内だけの前提）。

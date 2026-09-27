@@ -91,6 +91,23 @@ class GooglePlayClientTest < Minitest::Test
     assert_equal('2026-10-30 00:00:00', result.expires_at)
   end
 
+  # ⚠⚠ 許可側の状態なのに期限が無い・読めない応答は使わない（Codex P2・PR #76）。
+  # 保存すると期限の無い active になり、ゲートは状態しか見ないので無期限に通る。
+  def test_entitled_state_without_expiry_is_invalid
+    no_items = {'subscriptionState' => 'SUBSCRIPTION_STATE_ACTIVE'}.to_json
+    bad_time = purchase('SUBSCRIPTION_STATE_IN_GRACE_PERIOD', expiry: 'not-a-time')
+
+    assert_raises(Relay::StoreResponseInvalid) {client(200, no_items).purchase_status('t')}
+    assert_raises(Relay::StoreResponseInvalid) {client(200, bad_time).purchase_status('t')}
+  end
+
+  # 拒否側の状態は期限が無くても使う（支払い保留中は期限を持たないことがある）。
+  def test_denied_state_without_expiry_is_used
+    pending = {'subscriptionState' => 'SUBSCRIPTION_STATE_PENDING'}.to_json
+
+    assert_equal('pending', client(200, pending).purchase_status('t').status)
+  end
+
   def test_unknown_token_is_nil
     [400, 404, 410].each do |code|
       assert_nil(client(code, '{}').purchase_status('t'), "HTTP #{code}")
