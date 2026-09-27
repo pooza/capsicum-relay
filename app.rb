@@ -1,6 +1,7 @@
 require_relative 'lib/relay/base_app'
 require_relative 'lib/relay/routes/announcement_subscriptions'
 require_relative 'lib/relay/routes/entitlements'
+require_relative 'lib/relay/routes/google_play_notifications'
 require_relative 'lib/relay/routes/health'
 require_relative 'lib/relay/routes/metrics'
 require_relative 'lib/relay/routes/push'
@@ -26,6 +27,7 @@ module Relay
 
     use Routes::AnnouncementSubscriptions
     use Routes::Entitlements
+    use Routes::GooglePlayNotifications
     use Routes::Health
     use Routes::Metrics
     use Routes::Push

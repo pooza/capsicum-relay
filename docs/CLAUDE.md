@@ -284,6 +284,26 @@ $ curl -s -H "X-Relay-Secret: $SECRET" https://relay.capsicum.shrieker.net/metri
 - ⚠ **`outcome="unavailable"` が続くなら検証が止まっている**（fail-open なので状態は変わらず、metrics を見ないと気付けない）
 - 通知の URL は App Store Connect の「App Store Server Notifications」。⚠ **本番 URL は relay、サンドボックス URL は st.relay**
 
+### Google の購入の検証（[#62](https://github.com/pooza/capsicum-relay/issues/62)・フェーズ 3）
+
+Apple と**同じ判断**（`Relay::StoreVerification`）に乗る。ストアごとの違いはクライアント（`purchase_status`）に閉じる。
+
+| 入口 | 何を引く |
+| --- | --- |
+| `POST /entitlements`（`store: google`） | `purchase_id`（purchaseToken） |
+| `POST /store/google/notifications`（Pub/Sub の push） | 通知の `subscriptionNotification` / `voidedPurchaseNotification` の purchaseToken |
+
+| 決まりごと | 理由 |
+| --- | --- |
+| **purchaseToken がそのまま購入の識別子** | Apple と違い、更新で変わらない。再購入・プラン変更は新しい token（`linkedPurchaseToken`）で、クライアントが送り直す |
+| ⚠⚠ **通知の認証は OIDC** | Pub/Sub は共有シークレットを付けられない。**宛先（`push_audience`）と送り手（`push_service_account`）の両方**を照合する。Google の公開鍵が取れないときは 503（再送させる） |
+| ⚠ **`CANCELED` は期限までは `active`** | 自動更新を止めただけ。`ON_HOLD` は `billing_retry`（拒否）、`IN_GRACE_PERIOD` は `grace`（許可）、`PENDING` は `pending`（拒否・#62 で足した） |
+| **順序（`signed_at`）** | Google の応答は署名時刻を持たないので、**問い合わせを始めた時刻**を使う |
+| **ライセンステスター** | `testPurchase` があれば `environment=Sandbox`。⚠ TestFlight と同じく本番でも有効・**テスターは身内だけ** |
+| 投げ銭（消耗型）の通知 | `oneTimeProductNotification` は利用権と関係ないので 200 で受け流す |
+| ⚠ **Pub/Sub は 1 トピックに購読を複数付けられる** | 本番とステージングの両方へ届けられる（Apple は環境ごとに URL が 1 つ） |
+| ⚠ **Proc を `set` しない** | Sinatra は Proc の設定を読み出しのたびに呼ぶ。OIDC の検証器は `call` を持つモジュール（`GooglePlayClient::OidcVerifier`） |
+
 ### 観測（[#59](https://github.com/pooza/capsicum-relay/issues/59)）
 
 `relay_register_entitlement_total{preset,entitlement,token}` が、フェーズ 3 でゲートを閉じたときに誰が止まるかを先に示す。

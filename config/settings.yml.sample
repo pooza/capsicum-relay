@@ -41,6 +41,18 @@ wns:
 #   environments: ["Production", "Sandbox"]
 #   reverify_interval: 600   # unverified の購入を確かめ直す間隔（秒・0 で止める）
 
+# Google の購入の検証 (#62) — Play Developer API + リアルタイム デベロッパー通知（RTDN）
+# サービスアカウントは **relay 専用**（Firebase 用とは分ける）。Play Console の
+# 「ユーザーと権限」で招待し、アプリの注文とサブスクの権限を付ける。
+# push_audience / push_service_account は Pub/Sub の push の購読に設定した値
+# （OIDC トークンの宛先と送り手を照合する）。
+# 節ごと無ければ検証しない（購入は unverified のまま・通知の受け口は 503）。
+# google_play:
+#   package_name: "net.shrieker.capsicum"
+#   service_account_path: "/path/to/capsicum-relay-play.json"
+#   push_audience: "https://relay.example/store/google/notifications"
+#   push_service_account: "xxx@capsicum-xxxxx.iam.gserviceaccount.com"
+
 # お知らせ通知 push (capsicum-relay#14)
 # poll_interval を 0 にすると polling worker を無効化 (テスト用)
 announcement:

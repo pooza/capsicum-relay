@@ -1,4 +1,6 @@
+require_relative 'app_store_client'
 require_relative 'database'
+require_relative 'google_play_client'
 require_relative 'store_errors'
 
 module Relay
@@ -26,6 +28,28 @@ module Relay
 
     def self.lock_for(entitlement_id)
       return LOCKS_GUARD.synchronize {LOCKS[entitlement_id]}
+    end
+
+    # アプリの設定にストアまわりを組み立てる（[Relay::BaseApp] の `configure` から呼ぶ）。
+    #
+    # - `apple_jws_verifier`: ⚠ **1 つを共有する**（API の応答と通知の両方が同じルート
+    #   証明書で検証される・テストはここを差し替える）
+    # - `app_store` / `google_play`: ⚠ **設定が無ければ nil ＝ 確かめない**（従来どおり
+    #   `unverified` のまま・通知の受け口は 503）
+    # - `entitlement_reverifier`: `unverified` のまま残った購入を確かめ直す（Codex P1・PR #75）
+    def self.configure!(app)
+      settings = app.settings
+      app.set :apple_jws_verifier, Relay::AppleJwsVerifier.new
+      app.set :app_store, Relay::AppStoreClient.from_config(
+        settings.config, logger: settings.logger, verifier: settings.apple_jws_verifier
+      )
+      app.set :google_play,
+        Relay::GooglePlayClient.from_config(settings.config, logger: settings.logger)
+      # Pub/Sub の push に付く OIDC トークンの検証（テストはここを差し替える）。
+      # ⚠ **Proc を `set` しない。**Sinatra は Proc の設定を読み出すたびに呼び出すので、
+      # `call` を持つモジュールで渡す。
+      app.set :google_oidc_verifier, Relay::GooglePlayClient::OidcVerifier
+      app.set :entitlement_reverifier, Relay::EntitlementReverifier.start_from_settings(settings)
     end
 
     # そのストアのクライアント。設定されていなければ nil（確かめない）。
@@ -85,3 +109,5 @@ module Relay
     private_class_method :verify_locked, :verification_of
   end
 end
+
+require_relative 'entitlement_reverifier'

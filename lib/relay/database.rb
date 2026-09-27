@@ -36,9 +36,11 @@ module Relay
     # 購入の状態 (#58)。⚠ **DB の CHECK ではなくここで検査する**（理由は
     # [create_entitlement_tables!] の doc）。フェーズ 3（#63）で増える。
     #
-    # `billing_retry` は #61 で足した（Apple が支払いを再試行している間・拒否側）。
+    # `billing_retry` は #61 で足した（ストアが支払いを再試行している間・拒否側）。
+    # `pending` は #62 で足した（Google で支払いが保留中・まだ払われていない・拒否側）。
     ENTITLEMENT_STATUSES = [
-      ENTITLEMENT_STATUS_UNVERIFIED, 'active', 'grace', 'billing_retry', 'expired', 'revoked'
+      ENTITLEMENT_STATUS_UNVERIFIED, 'active', 'grace', 'billing_retry', 'pending', 'expired',
+      'revoked'
     ].freeze
 
     # device_id を持たない古い行を掃除してよいと判断するまでの猶予 (capsicum#949)。
