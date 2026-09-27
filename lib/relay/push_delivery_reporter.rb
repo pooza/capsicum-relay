@@ -149,10 +149,16 @@ module Relay
 
     # ⚠ **`gone` のときだけ relay 側の行を落とす。**これが次の push の 410 の
     # 引き金になり、上流の購読が掃除される（クラスの doc を参照）。
+    #
+    # ⚠⚠ **積んだ時点のトークンと一致するときだけ消す**（PR #67 の Codex P1）。
+    # `update_registration` は**行 ID を保ったまま `token` を差し替える**ので、
+    # 配送の待ち時間中に `/register` で端末のトークンが更新されていたら、
+    # **いま有効な登録を消してしまう**（理由は
+    # [Relay::Database#unregister_stale] の doc）。
     def unregister_gone(sub)
       return if sub['id'].nil? || @database.nil?
 
-      @database.unregister(sub['id'])
+      @database.unregister_stale(sub['id'], sub['token'])
     end
 
     # ⚠ 判定は [PushOutcome.level] で行う（`LEVELS` を直接引くと、動的に組む

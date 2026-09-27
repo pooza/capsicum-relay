@@ -214,6 +214,14 @@ erDiagram
 
 ⚠ **`/push` が 410 を返しても `subscriptions` の行は消さない。**購入が復活したらクライアントの再登録で同じ行（同じ `push_token`）が使われる。消すと `announcement_subscriptions` も CASCADE で消える。⚠ **復帰には再登録が要る**（capsicum#1123 の導線）。
 
+#### ⚠⚠⚠ #69 が未解決のままゲートを閉じてはいけない
+
+**プリセット判定が `subscription['server']` を見ているが、これは `/register` がクライアントから受け取ってそのまま保存した値で、検証していない。**共有シークレットは authorization boundary にできない（[capsicum#1121](https://github.com/pooza/capsicum/issues/1121)）ので、⚠⚠ **誰でも `server: "mstdn.b-shock.org"` と名乗って `push_token` を得て、それを自分のサーバーの Web Push 宛先に渡せばゲートを迂回できる。**
+
+⚠ 設計書 決定済み事項 3 が受け入れたコストは「プリセットサーバーにアカウントを 1 つ作る」で、⚠⚠ **実際は「サーバー名を打つだけ」**。**受け入れたリスクより広い。**
+
+→ [#69](https://github.com/pooza/capsicum-relay/issues/69) でサーバー側から検証できる assertion（VAPID 公開鍵の pin が有力）を用意してから閉じる。
+
 #### ⚠⚠ `unverified` を許可側に入れない
 
 `POST /entitlements` は共有シークレットしか見ておらず、**そのシークレットはバイナリから取り出せる**（capsicum#1121）。**誰でも `unverified` の行を作れる**ので、入れるとゲートが無意味になる。`test/entitlement_gate_test.rb` が固定している。
@@ -383,6 +391,12 @@ done
 | --- | --- | --- |
 | `PUSH_QUEUE_CAPACITY` | 200 | 積める通数。⚠ **深くしない**（詰まりに気付かない時間と、再起動で失う通数が増える） |
 | `PUSH_QUEUE_WORKERS` | 2 | 配送の並行数。⚠⚠ **`HttpConnectionPool::MAX_IDLE_PER_HOST` と揃える**（超えたぶんは checkin で閉じられ、[#54](https://github.com/pooza/capsicum-relay/issues/54) の接続再利用が効かなくなる） |
+
+#### ⚠⚠ `gone` の削除は行 ID だけで判定しない
+
+[update_registration] は **行 ID を保ったまま `token` を差し替える**（#15 の dedup のため）。配送をキューに積んでから結末が出るまでの間に `/register` で端末のトークンが更新されると、⚠⚠ **いま有効な登録を消してしまう**（`announcement_subscriptions` も CASCADE で落ち、上流は次の push で 410 を受けて購読を掃除する ＝ **利用者は再登録まで通知を失う**）。
+
+→ `Database#unregister_stale(id, token)` で **積んだ時点のトークンと一致するときだけ**消す。⚠ 同期配送のときも同じ race があったが、窓がリクエストの中（〜2 秒）に限られていた。**#55 でキューの待ち時間ぶん窓が広がった**（PR #67 の Codex P1）。
 
 #### ⚠⚠ 上流へ結末を返せなくなった、への答え
 

@@ -85,6 +85,31 @@ module Relay
       return sub
     end
 
+    # 配送が恒久的に失敗した購読を落とす (#55 / PR #67 の Codex P1)。
+    #
+    # ⚠⚠ **行 ID だけで消してはいけない。**[update_registration] は**行 ID を保ったまま
+    # `token` を差し替える**（#15 の dedup のため）。配送をキューに積んでから結末が
+    # 出るまでの間に `/register` で端末のトークンが更新されると、⚠ **いま有効な
+    # 登録を消してしまう** —— `announcement_subscriptions` も FK の CASCADE で消え、
+    # 上流は次の push で 410 を受けて購読を掃除する ＝ **利用者は再登録まで通知を
+    # 失う。**
+    #
+    # ⚠ **同期配送のときも同じ race があった**が、窓がリクエストの中（〜2 秒）に
+    # 限られていた。#55 でキューの待ち時間ぶん窓が広がったので、条件を付ける。
+    #
+    # [token] は**配送を積んだ時点の**端末トークン。消えたら行を返し、
+    # 差し替わっていたら nil を返す（＝消さなかった）。
+    def unregister_stale(id, token)
+      sub = find(id)
+      return nil unless sub
+      return nil unless sub['token'] == token
+
+      @db.execute(
+        'DELETE FROM subscriptions WHERE id = ? AND token = ?', [id, token]
+      )
+      return sub
+    end
+
     def find(id)
       return @db.execute('SELECT * FROM subscriptions WHERE id = ?', [id]).first
     end
