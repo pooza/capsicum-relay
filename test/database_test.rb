@@ -81,6 +81,7 @@ class DatabaseTest < Minitest::Test
     columns = raw {|r| r.execute('PRAGMA table_info(entitlements)')}.map {|c| c['name']}
 
     assert_includes(columns, 'environment')
+    assert_includes(columns, 'signed_at')
     assert(db.find_entitlement('apple', '1000'))
   end
 

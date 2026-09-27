@@ -26,7 +26,7 @@ module Relay
 
     # ストアで確かめた購入の状態 (#61)。[apply_entitlement_verification] に渡す。
     EntitlementVerification = Struct.new(
-      :store, :purchase_id, :product_id, :status, :expires_at, :environment,
+      :store, :purchase_id, :product_id, :status, :expires_at, :environment, :signed_at,
       keyword_init: true
     )
 
@@ -592,23 +592,38 @@ module Relay
       # TestFlight の購入は `Sandbox` になる（テスターを外へ広げるときに拒否側へ
       # 切り替えるための印・capsicum の paid-relay-plan.md 7-2）。nullable な列の
       # 追加だけなので組み替えは要らない。
-      return if table_columns('entitlements').include?('environment')
+      columns = table_columns('entitlements')
+      unless columns.include?('environment')
+        @db.execute('ALTER TABLE entitlements ADD COLUMN environment TEXT')
+      end
+      # 反映した結果にストアが署名した時刻（ミリ秒）(Codex P2・PR #75)。古い結果での
+      # 上書きを拒むための順序。
+      return if columns.include?('signed_at')
 
-      @db.execute('ALTER TABLE entitlements ADD COLUMN environment TEXT')
+      @db.execute('ALTER TABLE entitlements ADD COLUMN signed_at INTEGER')
     end
 
+    # ⚠⚠ **ストアの署名時刻が、いま入っているものより古ければ書かない**（Codex P2・
+    # PR #75）。同じ購入を 2 本同時に確かめると、先に読んだ古い結果（active）が後から
+    # 書かれて、新しい結果（expired）を上書きしうる。鍵では防げない ——
+    # 付け替え前の行は購入ごとに別の行 ID を持つので、同じ購入でも別の鍵になる。
+    # ⚠ 付け替え（`purchase_id`）は署名時刻に関係なく行う（行を正しい購入に寄せるだけで、
+    # 状態は変えない）。
     def update_entitlement_verification!(entitlement_id, verification)
       v = verification
-      values = [v.purchase_id, v.product_id, v.status, v.expires_at, v.environment]
-      @db.execute(<<~SQL, values + [entitlement_id])
+      @db.execute(<<~SQL, [v.purchase_id, entitlement_id])
+        UPDATE entitlements SET purchase_id = ? WHERE id = ?
+      SQL
+      values = [v.product_id, v.status, v.expires_at, v.environment, v.signed_at]
+      @db.execute(<<~SQL, values + [entitlement_id, v.signed_at, v.signed_at])
         UPDATE entitlements SET
-          purchase_id = ?,
           product_id = COALESCE(?, product_id),
           status = ?,
           expires_at = ?,
           environment = ?,
+          signed_at = ?,
           updated_at = datetime('now')
-        WHERE id = ?
+        WHERE id = ? AND (signed_at IS NULL OR ? IS NULL OR signed_at <= ?)
       SQL
     end
 

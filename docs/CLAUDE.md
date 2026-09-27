@@ -276,7 +276,8 @@ $ curl -s -H "X-Relay-Secret: $SECRET" https://relay.capsicum.shrieker.net/metri
 | ⚠ **TestFlight のテスターは身内だけ**（2026-09-27 pooza） | 本番でもサンドボックスの購入を有効に扱うため。外部テスターを開くなら `environment=Sandbox` を拒否側へ |
 | `billing_retry` | Apple が支払いを再試行している間。**拒否側**（ゲートの許可は `active` / `grace` だけ） |
 | ⚠ **確かめ直しのワーカー**（`EntitlementReverifier`） | 登録時に Apple へ届かず transactionId のまま `unverified` で残った購入は、**更新の後の通知ではどちらの ID でも引けない**。10 分おきに確かめ直して元の取引 ID へ付け替える。⚠ `unverified` は誰でも作れるので **1 回 20 件・作られてから 7 日以内**に縛る。`app_store.reverify_interval`（秒・0 で止める） |
-| ⚠ **購入ごとの鍵** | 「Apple から読む → 書く」を同じ購入については 1 本ずつ。割り込まれると古い読み（active）が新しい書き（expired）を上書きする。⚠ **全体で 1 本の鍵にしない**（Apple が遅いと puma の 2 スレッドが両方待たされ、push の受け付けまで止まる） |
+| ⚠⚠ **古い結果で上書きしない**（`entitlements.signed_at`） | Apple が応答に署名した時刻（`signedDate`）を保存し、**それより古い結果では状態を書かない**。同じ購入でも付け替え前の行は別の行 ID を持つので、**鍵だけでは防げない**（別々の端末が別の取引 ID で送ってくる）。行の付け替え自体は時刻に関係なく行う |
+| ⚠ **購入ごとの鍵** | 「Apple から読む → 書く」を同じ行については 1 本ずつ（上の時刻の比較と二重の守り）。⚠ **全体で 1 本の鍵にしない**（Apple が遅いと puma の 2 スレッドが両方待たされ、push の受け付けまで止まる） |
 | ⚠ **接続の直列化**（`SerializedConnection`） | SQLite の接続は puma のスレッド間で共有で、トランザクションは接続単位。**トランザクションの間はほかのスレッドの SQL を待たせる**（混ざると他人の巻き戻しに巻き込まれて消える） |
 
 - 鍵は**アプリ内課金キー**（`app_store.key_path`）。⚠ **期限は無い**。revoke されると 401 → error ログ + `relay_entitlement_verify_total{outcome="unavailable"}`

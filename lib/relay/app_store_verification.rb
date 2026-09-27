@@ -41,17 +41,7 @@ module Relay
       result = settings.app_store.subscription_status(transaction_id)
       return ['not_found', entitlement_id] unless result
 
-      id = settings.database.apply_entitlement_verification(
-        entitlement_id,
-        Relay::Database::EntitlementVerification.new(
-          store: 'apple',
-          purchase_id: result.original_transaction_id,
-          product_id: result.product_id,
-          status: result.status,
-          expires_at: result.expires_at,
-          environment: result.environment,
-        ),
-      )
+      id = settings.database.apply_entitlement_verification(entitlement_id, verification_of(result))
       return [result.status, id]
     rescue AppStoreClient::Unavailable => e
       # ⚠⚠ **有効な購入を「確かめられなかった」だけで失効扱いにしない。**
@@ -61,6 +51,18 @@ module Relay
       settings.logger.warn("App Store response failed verification: #{e.message}")
       return ['invalid', entitlement_id]
     end
-    private_class_method :verify_locked
+
+    def self.verification_of(result)
+      return Relay::Database::EntitlementVerification.new(
+        store: 'apple',
+        purchase_id: result.original_transaction_id,
+        product_id: result.product_id,
+        status: result.status,
+        expires_at: result.expires_at,
+        environment: result.environment,
+        signed_at: result.signed_at,
+      )
+    end
+    private_class_method :verify_locked, :verification_of
   end
 end

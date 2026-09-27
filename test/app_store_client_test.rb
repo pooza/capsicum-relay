@@ -43,7 +43,8 @@ class AppStoreClientTest < Minitest::Test
   def status_body(status:, environment: 'Production', bundle_id: BUNDLE_ID)
     transaction = @pki.sign({
       'bundleId' => bundle_id, 'productId' => 'relay.monthly',
-      'originalTransactionId' => '1000', 'expiresDate' => EXPIRES_MS
+      'originalTransactionId' => '1000', 'expiresDate' => EXPIRES_MS,
+      'signedDate' => 1_790_000_000_123
     })
     return [200, {
       'environment' => environment,
@@ -68,6 +69,7 @@ class AppStoreClientTest < Minitest::Test
     assert_equal('active', result.status)
     assert_equal(Time.at(EXPIRES_MS / 1000).utc.strftime('%Y-%m-%d %H:%M:%S'), result.expires_at)
     assert_equal('Production', result.environment)
+    assert_equal(1_790_000_000_123, result.signed_at)
   end
 
   def test_status_mapping
@@ -161,6 +163,19 @@ class AppStoreClientTest < Minitest::Test
     client({'Production' => not_found, 'Sandbox' => not_found}).subscription_status('../x')
 
     assert_equal('/inApps/v1/subscriptions/..%2Fx', @calls.first[1])
+  end
+
+  # ⚠ 名前解決の失敗（SocketError）も fail-open に倒す（Codex P1・PR #75）。
+  # SystemCallError ではないので、拾い漏れると 500 になる。
+  def test_dns_failure_is_unavailable
+    # `.invalid` は名前解決できないことが予約されている TLD（RFC 2606）。
+    client = Relay::AppStoreClient.new(
+      {'key_id' => 'KEY', 'issuer_id' => 'ISSUER', 'key_path' => @key_path, 'bundle_id' => BUNDLE_ID},
+      logger: Logger.new(@log), verifier: @pki.verifier,
+      hosts: {'Production' => 'app-store.invalid', 'Sandbox' => 'app-store.invalid'}
+    )
+
+    assert_raises(Relay::AppStoreClient::Unavailable) {client.subscription_status('2000')}
   end
 
   def test_from_config_without_section_is_nil

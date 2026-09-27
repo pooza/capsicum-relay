@@ -43,7 +43,7 @@ module Relay
     NOT_FOUND_ERROR_CODES = [4_040_010, 4_000_006].freeze
 
     Result = Struct.new(
-      :original_transaction_id, :product_id, :status, :expires_at, :environment,
+      :original_transaction_id, :product_id, :status, :expires_at, :environment, :signed_at,
       keyword_init: true
     )
 
@@ -53,7 +53,8 @@ module Relay
     # - `environments`: 引く順。本番 relay は `[Production, Sandbox]`、ステージングは
     #   `[Sandbox]`。⚠ 本番でサンドボックスの購入を扱うのは 2026-09-27 の決定
     #   （TestFlight のテスターは身内だけにする前提）
-    def initialize(config, logger:, verifier: AppleJwsVerifier.new, http: nil)
+    # [hosts] はテストで名前解決できないホスト（`.invalid`）へ向けるための口。
+    def initialize(config, logger:, verifier: AppleJwsVerifier.new, http: nil, hosts: HOSTS)
       @key_id = config.fetch('key_id')
       @issuer_id = config.fetch('issuer_id')
       @bundle_id = config.fetch('bundle_id')
@@ -62,6 +63,7 @@ module Relay
       @logger = logger
       @verifier = verifier
       @http = http || method(:request)
+      @hosts = hosts
     end
 
     attr_reader :bundle_id
@@ -128,6 +130,9 @@ module Relay
         status: STATUSES.fetch(last['status'], 'expired'),
         expires_at: iso8601_ms(transaction['expiresDate']),
         environment: body['environment'] || environment,
+        # Apple がこの応答に署名した時刻（ミリ秒）。⚠ **古い結果で新しい結果を上書き
+        # しないための順序**（[Relay::Database#apply_entitlement_verification]）。
+        signed_at: transaction['signedDate'],
       )
     end
 
@@ -148,14 +153,17 @@ module Relay
     end
 
     def request(environment, path, token)
-      uri = URI("https://#{HOSTS.fetch(environment)}#{path}")
+      uri = URI("https://#{@hosts.fetch(environment)}#{path}")
       request = Net::HTTP::Get.new(uri)
       request['Authorization'] = "Bearer #{token}"
       response = Net::HTTP.start(
         uri.host, uri.port, use_ssl: true, open_timeout: 5, read_timeout: 10
       ) {|http| http.request(request)}
       return [response.code.to_i, response.body]
-    rescue SystemCallError, IOError, Timeout::Error, OpenSSL::SSL::SSLError => e
+    # ⚠ **`SocketError`（名前解決の失敗）は `SystemCallError` ではない**ので別に書く
+    # （Codex P1・PR #75）。漏れると fail-open にならず 500 になる。
+    rescue SystemCallError, SocketError, IOError, Timeout::Error, OpenSSL::SSL::SSLError,
+      Net::ProtocolError => e
       raise Unavailable, "#{e.class}: #{e.message}"
     end
   end

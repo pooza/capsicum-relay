@@ -42,10 +42,10 @@ class AppStoreVerificationTest < Minitest::Test
     )
   end
 
-  def result(status, original: '1000')
+  def result(status, original: '1000', signed_at: nil)
     return Relay::AppStoreClient::Result.new(
       original_transaction_id: original, product_id: 'relay.monthly', status: status,
-      expires_at: nil, environment: 'Production'
+      expires_at: nil, environment: 'Production', signed_at: signed_at
     )
   end
 
@@ -71,6 +71,41 @@ class AppStoreVerificationTest < Minitest::Test
     sleep(0.05)
     second = Thread.new {Relay::AppStoreVerification.verify!(settings(fake), entitlement_id: id, transaction_id: '1000')}
     [first, second].each(&:join)
+
+    assert_equal('expired', @db.find_entitlement('apple', '1000')['status'])
+  end
+
+  # ⚠⚠ 同じ購入でも、付け替え前の行は別の行 ID ＝ 別の鍵になる（Codex P2・PR #75）。
+  # 別々の端末が別の取引 ID で送ってきた 2 行で、**後から書かれる古い結果**が新しい
+  # 結果を上書きしないことを、ストアの署名時刻で保証する。
+  def test_older_result_on_an_alias_row_does_not_overwrite_a_newer_one
+    newer = entitlement('tx-b', device_id: 'device-b')
+    older = entitlement('tx-a', device_id: 'device-a')
+    Relay::AppStoreVerification.verify!(
+      settings(FakeAppStore.new {result('expired', signed_at: 2000)}),
+      entitlement_id: newer, transaction_id: 'tx-b',
+    )
+    Relay::AppStoreVerification.verify!(
+      settings(FakeAppStore.new {result('active', signed_at: 1000)}),
+      entitlement_id: older, transaction_id: 'tx-a',
+    )
+
+    row = @db.find_entitlement('apple', '1000')
+
+    assert_equal('expired', row['status'])
+    assert_equal(1, @db.entitlement_count)
+    assert_equal(2, @db.entitlement_tokens_for_purchase('apple', '1000').size)
+  end
+
+  # 新しい結果は、古い結果の上に書ける（順方向は止めない）。
+  def test_newer_result_overwrites_an_older_one
+    id = entitlement('1000')
+    [[1000, 'active'], [2000, 'expired']].each do |signed_at, status|
+      Relay::AppStoreVerification.verify!(
+        settings(FakeAppStore.new {result(status, signed_at: signed_at)}),
+        entitlement_id: id, transaction_id: '1000',
+      )
+    end
 
     assert_equal('expired', @db.find_entitlement('apple', '1000')['status'])
   end
