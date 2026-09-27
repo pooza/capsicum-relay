@@ -11,6 +11,13 @@ module Relay
     # INVALID_ARGUMENT は request 側のバグでも返るため含めない（誤削除回避）。
     PERMANENT_ERROR_CODES = ['UNREGISTERED', 'SENDER_ID_MISMATCH'].freeze
 
+    # ⚠⚠ **文言は FCM 側で変わる。**#9 の時点の "Android message is too big" を
+    # 小文字 1 本で探していたが、2026-09 の本番では
+    # "Message is too large. The maximum is 4K (4096 bytes)." が返っており、
+    # **一度も当たらず `failed` に落ちていた**（#71）。大文字小文字を問わず、
+    # 新旧どちらの言い回しも拾う。
+    OVERSIZED_MESSAGE = /too (?:big|large)/i
+
     def initialize(config)
       @config = config
       @project_id = config['fcm']['project_id']
@@ -18,6 +25,16 @@ module Relay
         json_key_io: File.open(config['fcm']['service_account_path']),
         scope: 'https://www.googleapis.com/auth/firebase.messaging',
       )
+    end
+
+    # 認証情報なしで検査できるよう、応答コードと本文だけで判定する。
+    def self.oversized_response?(code, body)
+      return false unless code.to_s == '400'
+
+      message = JSON.parse(body.to_s).dig('error', 'message').to_s
+      return OVERSIZED_MESSAGE.match?(message)
+    rescue JSON::ParserError
+      return false
     end
 
     def push(device_token:, payload:)
@@ -76,19 +93,12 @@ module Relay
       return false
     end
 
-    # FCM data message は 4KB 制限。超過すると INVALID_ARGUMENT 400 +
-    # "Android message is too big" が返るが、INVALID_ARGUMENT 全体を permanent
-    # にすると request 側のバグまで unregister してしまうため、メッセージ
-    # 文字列で限定マッチして oversized フラグを立てる (#9)。oversized は
-    # subscription を残したまま該当通知だけドロップする app 側ハンドラで処理する。
+    # FCM data message は 4KB 制限。超過すると INVALID_ARGUMENT 400 が返るが、
+    # INVALID_ARGUMENT 全体を permanent にすると request 側のバグまで unregister
+    # してしまうため、メッセージ文字列で限定マッチして oversized フラグを立てる
+    # (#9)。oversized は subscription を残したまま該当通知だけドロップする。
     def oversized_payload?(response)
-      return false unless response.code == '400'
-
-      body = JSON.parse(response.body)
-      message = body.dig('error', 'message').to_s
-      return message.include?('message is too big')
-    rescue JSON::ParserError
-      return false
+      return self.class.oversized_response?(response.code, response.body)
     end
   end
 end
