@@ -5,12 +5,11 @@ require 'sinatra/base'
 require 'yaml'
 require_relative 'announcement_worker'
 require_relative 'apns_client'
-require_relative 'app_store_client'
 require_relative 'database'
 require_relative 'entitlement_gate'
 require_relative 'entitlement_helpers'
-require_relative 'entitlement_reverifier'
 require_relative 'fcm_client'
+require_relative 'store_verification'
 require_relative 'metrics'
 require_relative 'push_dedup'
 require_relative 'push_delivery_reporter'
@@ -90,16 +89,8 @@ module Relay
         set :apns, Relay::ApnsClient.new(settings.config, logger: settings.logger)
       end
       set :fcm, Relay::FcmClient.new(settings.config) if settings.config.dig('fcm', 'project_id')
-      # Apple の購入の検証 (#61)。⚠ **無ければ検証しない**（従来どおり `unverified` の
-      # まま）。通知の受け口も 503 を返す。
-      # ⚠ 検証器は 1 つを共有する（API の応答と通知の両方が同じルート証明書で
-      # 検証される・テストはここを差し替える）。
-      set :apple_jws_verifier, Relay::AppleJwsVerifier.new
-      set :app_store, Relay::AppStoreClient.from_config(
-        settings.config, logger: settings.logger, verifier: settings.apple_jws_verifier
-      )
-      # `unverified` のまま残った購入を確かめ直す（Codex P1・PR #75）。
-      set :entitlement_reverifier, Relay::EntitlementReverifier.start_from_settings(settings)
+      # ストアの購入の検証 (#61 / #62)。組み立ては [Relay::StoreVerification.configure!]。
+      Relay::StoreVerification.configure!(self)
 
       if settings.config.dig('wns', 'package_sid')
         set :wns, Relay::WnsClient.new(settings.config, logger: settings.logger)

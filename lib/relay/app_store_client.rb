@@ -4,6 +4,7 @@ require 'net/http'
 require 'openssl'
 require 'uri'
 require_relative 'apple_jws_verifier'
+require_relative 'store_errors'
 
 module Relay
   # App Store Server API でサブスクの状態を引く (#61)。
@@ -19,7 +20,7 @@ module Relay
     # Apple に届かない・Apple 側の障害・鍵が使えない。⚠ **呼び出し側は状態を
     # 変えずに抜ける（fail-open）。**有効な購入を「確かめられなかった」だけで
     # 失効扱いにしない。
-    class Unavailable < StandardError; end
+    class Unavailable < Relay::StoreUnavailable; end
 
     HOSTS = {
       'Production' => 'api.storekit.itunes.apple.com',
@@ -45,7 +46,12 @@ module Relay
     Result = Struct.new(
       :original_transaction_id, :product_id, :status, :expires_at, :environment, :signed_at,
       keyword_init: true
-    )
+    ) do
+      # 保存する購入の識別子。Apple は元の取引 ID（[Relay::StoreVerification]）。
+      def purchase_id
+        return original_transaction_id
+      end
+    end
 
     # [config] は settings.yml の `app_store` 節。
     #
@@ -79,6 +85,11 @@ module Relay
 
     # [transaction_id] はその購入に属する取引 ID ならどれでもよい（元の取引でも、
     # 更新後の取引でも）。見つからなければ nil。
+    # [Relay::StoreVerification] から呼ばれる入口（ストア共通の名前）。
+    def purchase_status(transaction_id)
+      return subscription_status(transaction_id)
+    end
+
     def subscription_status(transaction_id)
       @environments.each do |environment|
         body = fetch(environment,

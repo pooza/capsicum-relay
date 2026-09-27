@@ -2,14 +2,15 @@ require_relative 'test_helper'
 require 'logger'
 require 'tmpdir'
 require 'lib/relay/app_store_client'
-require 'lib/relay/app_store_verification'
+require 'lib/relay/google_play_client'
+require 'lib/relay/store_verification'
 require 'lib/relay/database'
 require 'lib/relay/entitlement_reverifier'
 require 'lib/relay/metrics'
 
 # #61（Codex P1 / P2・PR #75）: 検証の順序と、確かめ直しのワーカー。
 class AppStoreVerificationTest < Minitest::Test
-  Settings = Struct.new(:app_store, :database, :logger, :metrics, :config, keyword_init: true)
+  Settings = Struct.new(:app_store, :google_play, :database, :logger, :metrics, :config, keyword_init: true)
 
   # 取引 ID ごとに、返す結果（と待ち時間）を決めておく App Store Server API の偽物。
   class FakeAppStore
@@ -20,7 +21,7 @@ class AppStoreVerificationTest < Minitest::Test
       @calls = Queue.new
     end
 
-    def subscription_status(transaction_id)
+    def purchase_status(transaction_id)
       @calls << transaction_id
       return @responder.call(transaction_id, @calls.size)
     end
@@ -35,9 +36,9 @@ class AppStoreVerificationTest < Minitest::Test
     FileUtils.remove_entry(@dir)
   end
 
-  def settings(app_store)
+  def settings(app_store, google_play: nil)
     return Settings.new(
-      app_store: app_store, database: @db, logger: Logger.new(File::NULL),
+      app_store: app_store, google_play: google_play, database: @db, logger: Logger.new(File::NULL),
       metrics: Relay::Metrics.new, config: {}
     )
   end
@@ -67,9 +68,9 @@ class AppStoreVerificationTest < Minitest::Test
       sleep(0.2)
       next result('active')
     end
-    first = Thread.new {Relay::AppStoreVerification.verify!(settings(fake), entitlement_id: id, transaction_id: '1000')}
+    first = Thread.new {Relay::StoreVerification.verify!(settings(fake), store: 'apple', entitlement_id: id, purchase_ref: '1000')}
     sleep(0.05)
-    second = Thread.new {Relay::AppStoreVerification.verify!(settings(fake), entitlement_id: id, transaction_id: '1000')}
+    second = Thread.new {Relay::StoreVerification.verify!(settings(fake), store: 'apple', entitlement_id: id, purchase_ref: '1000')}
     [first, second].each(&:join)
 
     assert_equal('expired', @db.find_entitlement('apple', '1000')['status'])
@@ -81,13 +82,13 @@ class AppStoreVerificationTest < Minitest::Test
   def test_older_result_on_an_alias_row_does_not_overwrite_a_newer_one
     newer = entitlement('tx-b', device_id: 'device-b')
     older = entitlement('tx-a', device_id: 'device-a')
-    Relay::AppStoreVerification.verify!(
+    Relay::StoreVerification.verify!(
       settings(FakeAppStore.new {result('expired', signed_at: 2000)}),
-      entitlement_id: newer, transaction_id: 'tx-b',
+      store: 'apple', entitlement_id: newer, purchase_ref: 'tx-b',
     )
-    Relay::AppStoreVerification.verify!(
+    Relay::StoreVerification.verify!(
       settings(FakeAppStore.new {result('active', signed_at: 1000)}),
-      entitlement_id: older, transaction_id: 'tx-a',
+      store: 'apple', entitlement_id: older, purchase_ref: 'tx-a',
     )
 
     row = @db.find_entitlement('apple', '1000')
@@ -101,9 +102,9 @@ class AppStoreVerificationTest < Minitest::Test
   def test_newer_result_overwrites_an_older_one
     id = entitlement('1000')
     [[1000, 'active'], [2000, 'expired']].each do |signed_at, status|
-      Relay::AppStoreVerification.verify!(
+      Relay::StoreVerification.verify!(
         settings(FakeAppStore.new {result(status, signed_at: signed_at)}),
-        entitlement_id: id, transaction_id: '1000',
+        store: 'apple', entitlement_id: id, purchase_ref: '1000',
       )
     end
 
@@ -156,6 +157,21 @@ class AppStoreVerificationTest < Minitest::Test
     second = Array.new(fake.calls.size) {fake.calls.pop}
 
     assert_equal(ids.size, (seen + second).uniq.size, '2 周目で残りの行に届いていない')
+  end
+
+  # #62: Google の `unverified` も確かめ直す（purchaseToken がそのまま識別子）。
+  def test_reverifier_also_verifies_google_purchases
+    @db.issue_entitlement_token(store: 'google', purchase_id: 'token-1', device_id: 'g')
+    google = FakeAppStore.new do
+      Relay::GooglePlayClient::Result.new(
+        purchase_id: 'token-1', product_id: 'relay.monthly', status: 'active',
+        expires_at: nil, environment: 'Production', signed_at: 1
+      )
+    end
+    count = Relay::EntitlementReverifier.new(settings(nil, google_play: google)).run_once
+
+    assert_equal(1, count)
+    assert_equal('active', @db.find_entitlement('google', 'token-1')['status'])
   end
 
   def test_reverifier_does_not_start_without_app_store

@@ -20,7 +20,7 @@ class AppStoreVerificationRouteTest < RequestTestCase
       @calls = []
     end
 
-    def subscription_status(transaction_id)
+    def purchase_status(transaction_id)
       @calls << transaction_id
       result = @results[transaction_id]
       raise Relay::AppStoreClient::Unavailable, 'down' if result == :unavailable
