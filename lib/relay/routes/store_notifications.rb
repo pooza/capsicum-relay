@@ -1,4 +1,4 @@
-require_relative '../app_store_verification'
+require_relative '../store_verification'
 require_relative '../apple_jws_verifier'
 require_relative '../base_app'
 
@@ -12,7 +12,7 @@ module Relay
     # （[Relay::AppleJwsVerifier]）。**署名が通らないものは 400 で捨てる。**
     #
     # ⚠⚠ **中身の状態は使わない。**通知から取り出すのは「どの購入か」（元の取引 ID）
-    # だけで、状態は App Store Server API で引き直す（[Relay::AppStoreVerification]）。
+    # だけで、状態は App Store Server API で引き直す（[Relay::StoreVerification]）。
     # Apple は通知の順序を保証しないし、同じ通知を再送もする。引き直せば、いつ
     # 処理しても Apple 側の最新の状態になる。
     #
@@ -115,8 +115,8 @@ module Relay
           entitlement = find_apple_entitlement(original_id, transaction['transactionId'].to_s)
           return 'unknown_purchase' unless entitlement
 
-          outcome, = Relay::AppStoreVerification.verify!(
-            settings, entitlement_id: entitlement['id'], transaction_id: original_id
+          outcome, = Relay::StoreVerification.verify!(
+            settings, store: 'apple', entitlement_id: entitlement['id'], purchase_ref: original_id
           )
           metrics.increment('relay_entitlement_verify_total', {store: 'apple', outcome: outcome})
           return outcome

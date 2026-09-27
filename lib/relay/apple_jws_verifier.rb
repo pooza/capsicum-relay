@@ -2,6 +2,7 @@ require 'base64'
 require 'json'
 require 'jwt'
 require 'openssl'
+require_relative 'store_errors'
 
 module Relay
   # Apple が署名した JWS（App Store Server Notifications V2 の `signedPayload`、
@@ -22,7 +23,7 @@ module Relay
   # `63:34:3A:BF:B8:9A:6A:03:EB:B5:7E:9B:3F:5F:A7:BE:7C:4F:5C:75:`
   # `6F:30:17:B3:A8:C4:88:C3:65:3E:91:79`。
   class AppleJwsVerifier
-    class Invalid < StandardError; end
+    class Invalid < Relay::StoreResponseInvalid; end
 
     ROOT_CERT_PATH = File.expand_path('../../config/apple_root_ca_g3.pem', __dir__)
 

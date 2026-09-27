@@ -2,7 +2,7 @@ require_relative 'test_helper'
 require 'logger'
 require 'tmpdir'
 require 'lib/relay/app_store_client'
-require 'lib/relay/app_store_verification'
+require 'lib/relay/store_verification'
 require 'lib/relay/database'
 require 'lib/relay/entitlement_reverifier'
 require 'lib/relay/metrics'
@@ -20,7 +20,7 @@ class AppStoreVerificationTest < Minitest::Test
       @calls = Queue.new
     end
 
-    def subscription_status(transaction_id)
+    def purchase_status(transaction_id)
       @calls << transaction_id
       return @responder.call(transaction_id, @calls.size)
     end
@@ -67,9 +67,9 @@ class AppStoreVerificationTest < Minitest::Test
       sleep(0.2)
       next result('active')
     end
-    first = Thread.new {Relay::AppStoreVerification.verify!(settings(fake), entitlement_id: id, transaction_id: '1000')}
+    first = Thread.new {Relay::StoreVerification.verify!(settings(fake), store: 'apple', entitlement_id: id, purchase_ref: '1000')}
     sleep(0.05)
-    second = Thread.new {Relay::AppStoreVerification.verify!(settings(fake), entitlement_id: id, transaction_id: '1000')}
+    second = Thread.new {Relay::StoreVerification.verify!(settings(fake), store: 'apple', entitlement_id: id, purchase_ref: '1000')}
     [first, second].each(&:join)
 
     assert_equal('expired', @db.find_entitlement('apple', '1000')['status'])
@@ -81,13 +81,13 @@ class AppStoreVerificationTest < Minitest::Test
   def test_older_result_on_an_alias_row_does_not_overwrite_a_newer_one
     newer = entitlement('tx-b', device_id: 'device-b')
     older = entitlement('tx-a', device_id: 'device-a')
-    Relay::AppStoreVerification.verify!(
+    Relay::StoreVerification.verify!(
       settings(FakeAppStore.new {result('expired', signed_at: 2000)}),
-      entitlement_id: newer, transaction_id: 'tx-b',
+      store: 'apple', entitlement_id: newer, purchase_ref: 'tx-b',
     )
-    Relay::AppStoreVerification.verify!(
+    Relay::StoreVerification.verify!(
       settings(FakeAppStore.new {result('active', signed_at: 1000)}),
-      entitlement_id: older, transaction_id: 'tx-a',
+      store: 'apple', entitlement_id: older, purchase_ref: 'tx-a',
     )
 
     row = @db.find_entitlement('apple', '1000')
@@ -101,9 +101,9 @@ class AppStoreVerificationTest < Minitest::Test
   def test_newer_result_overwrites_an_older_one
     id = entitlement('1000')
     [[1000, 'active'], [2000, 'expired']].each do |signed_at, status|
-      Relay::AppStoreVerification.verify!(
+      Relay::StoreVerification.verify!(
         settings(FakeAppStore.new {result(status, signed_at: signed_at)}),
-        entitlement_id: id, transaction_id: '1000',
+        store: 'apple', entitlement_id: id, purchase_ref: '1000',
       )
     end
 

@@ -1,4 +1,4 @@
-require_relative '../app_store_verification'
+require_relative '../store_verification'
 require_relative '../base_app'
 
 module Relay
@@ -16,10 +16,10 @@ module Relay
     # `unverified` の行を作れる**。フェーズ 3 でレシートを検証して初めて
     # `active` になる。
     #
-    # **Apple はその場で確かめる (#61)。**`purchase_id`（StoreKit の transactionId）で
-    # App Store Server API を引き、状態と元の取引 ID を反映してから応答する。
-    # ⚠ Apple に届かないときは `unverified` のまま返す（fail-open・判断は
-    # [Relay::AppStoreVerification]）。Google / Microsoft は #62 以降。
+    # **Apple / Google はその場で確かめる (#61 / #62)。**`purchase_id`（Apple は StoreKit の
+    # transactionId、Google は purchaseToken）でストアの API を引き、状態を反映してから
+    # 応答する。⚠ ストアに届かないときは `unverified` のまま返す（fail-open・判断は
+    # [Relay::StoreVerification]）。Microsoft は後回し。
     class Entitlements < BaseApp
       post '/entitlements' do
         authenticate!
@@ -56,20 +56,22 @@ module Relay
       end
 
       helpers do
-        # Apple の購入ならその場で確かめる。戻り値は `[token, outcome]`（確かめ
-        # なかったときの outcome は nil）。
+        # ストアのクライアントがあればその場で確かめる。戻り値は `[token, outcome]`
+        # （確かめなかったときの outcome は nil）。
         #
         # ⚠ 検証で行が寄った（元の取引 ID の行が既にあった）ときは、**寄せた先の
         # token を返し直す**。クライアントの手元の token はそれで置き換わる。
         def verified(token)
-          return [token, nil] unless token['store'] == 'apple' && settings.app_store
+          store = token['store']
+          return [token, nil] unless Relay::StoreVerification.client_for(settings, store)
 
-          outcome, entitlement_id = Relay::AppStoreVerification.verify!(
+          outcome, entitlement_id = Relay::StoreVerification.verify!(
             settings,
+            store: store,
             entitlement_id: token['entitlement_id'],
-            transaction_id: json_body['purchase_id'],
+            purchase_ref: json_body['purchase_id'],
           )
-          metrics.increment('relay_entitlement_verify_total', {store: 'apple', outcome: outcome})
+          metrics.increment('relay_entitlement_verify_total', {store: store, outcome: outcome})
           return [
             settings.database.entitlement_token_for(entitlement_id, json_body['device_id']),
             outcome,
