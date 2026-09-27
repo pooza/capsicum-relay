@@ -57,6 +57,33 @@ class DatabaseTest < Minitest::Test
     assert_empty(db.find_announcement_subscriptions_by_push_token(sub['push_token']))
   end
 
+  # #61: 既に動いている DB（`environment` 列が無い entitlements）へ列を足す。
+  # ⚠ 行は残る（組み替えではなく ALTER TABLE ADD COLUMN）。
+  def test_environment_column_is_added_to_existing_entitlements
+    open_database
+    raw do |db|
+      db.execute('DROP TABLE entitlement_tokens')
+      db.execute('DROP TABLE entitlements')
+      db.execute(<<~SQL)
+        CREATE TABLE entitlements (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, store TEXT NOT NULL,
+          purchase_id TEXT NOT NULL, product_id TEXT, status TEXT NOT NULL,
+          expires_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          UNIQUE(store, purchase_id)
+        )
+      SQL
+      db.execute(<<~SQL)
+        INSERT INTO entitlements (store, purchase_id, status, created_at, updated_at)
+        VALUES ('apple', '1000', 'unverified', datetime('now'), datetime('now'))
+      SQL
+    end
+    db = open_database
+    columns = raw {|r| r.execute('PRAGMA table_info(entitlements)')}.map {|c| c['name']}
+
+    assert_includes(columns, 'environment')
+    assert(db.find_entitlement('apple', '1000'))
+  end
+
   # --- 修復 -------------------------------------------------------------------
 
   def test_broken_foreign_key_is_rewritten_to_subscriptions

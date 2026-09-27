@@ -5,6 +5,7 @@ require_relative 'lib/relay/routes/health'
 require_relative 'lib/relay/routes/metrics'
 require_relative 'lib/relay/routes/push'
 require_relative 'lib/relay/routes/register'
+require_relative 'lib/relay/routes/store_notifications'
 require_relative 'lib/relay/routes/supporters'
 require_relative 'lib/relay/sentry_setup'
 
@@ -29,6 +30,7 @@ module Relay
     use Routes::Metrics
     use Routes::Push
     use Routes::Register
+    use Routes::StoreNotifications
     use Routes::Supporters
   end
 end
