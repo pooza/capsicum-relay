@@ -53,6 +53,11 @@ module Relay
     def initialize(logger: Logger.new($stdout), path: DB_PATH)
       @logger = logger
       @db = SQLite3::Database.new(path)
+      # ⚠ **接続は puma のスレッド間で共有**（`workers 0` / `threads 2`）。SQLite の
+      # トランザクションは接続単位なので、2 本が同時に `BEGIN` すると入れ子で落ち、
+      # 後始末で先の 1 本まで巻き戻す（Codex P2・PR #75）。トランザクションを張る
+      # 処理はこの鍵の中で行う。
+      @transaction_lock = Mutex.new
       @db.results_as_hash = true
       @db.execute('PRAGMA journal_mode=WAL')
       @db.execute('PRAGMA foreign_keys=ON')
@@ -339,16 +344,9 @@ module Relay
     # 返すので、手元の token が変わっても追いつく。
     # [verification] は [EntitlementVerification]。
     def apply_entitlement_verification(entitlement_id, verification)
-      @db.transaction do
-        target = find_entitlement(verification.store, verification.purchase_id)
-        if target && target['id'] != entitlement_id
-          merge_entitlement_tokens!(entitlement_id, target['id'])
-          @db.execute('DELETE FROM entitlements WHERE id = ?', [entitlement_id])
-          entitlement_id = target['id']
-        end
-        update_entitlement_verification!(entitlement_id, verification)
+      @transaction_lock.synchronize do
+        apply_entitlement_verification_locked(entitlement_id, verification)
       end
-      return entitlement_id
     end
 
     # 端末の token を、購入の行 id と端末 id から引く（検証で行が寄った後に
@@ -376,6 +374,20 @@ module Relay
     end
 
     private
+
+    # [apply_entitlement_verification] の本体。⚠ **鍵の外から呼ばない。**
+    def apply_entitlement_verification_locked(entitlement_id, verification)
+      @db.transaction do
+        target = find_entitlement(verification.store, verification.purchase_id)
+        if target && target['id'] != entitlement_id
+          merge_entitlement_tokens!(entitlement_id, target['id'])
+          @db.execute('DELETE FROM entitlements WHERE id = ?', [entitlement_id])
+          entitlement_id = target['id']
+        end
+        update_entitlement_verification!(entitlement_id, verification)
+      end
+      return entitlement_id
+    end
 
     # device_id を送らない旧クライアント向けの従来経路。(token, account, server)
     # をキーにした upsert で、トークンが変われば別の行になる。

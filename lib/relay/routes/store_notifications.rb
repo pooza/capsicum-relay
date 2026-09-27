@@ -71,10 +71,21 @@ module Relay
 
         # 通知に入っている取引情報も署名を確かめる。⚠ 外側（`signedPayload`）が
         # 通っても、中身だけ差し替えられていないとは言えない。
-        def verified_original_transaction_id(signed_transaction)
-          return apple_verifier.verify(signed_transaction)['originalTransactionId'].to_s
+        def verified_transaction(signed_transaction)
+          return apple_verifier.verify(signed_transaction)
         rescue AppleJwsVerifier::Invalid => e
           reject_invalid!("signedTransactionInfo: #{e.message}")
+        end
+
+        # ⚠ **元の取引 ID だけで引かない**（Codex P1・PR #75）。購入の登録時に Apple へ
+        # 届かなかった（fail-open）行は、クライアントが送った transactionId のまま
+        # `unverified` で残っている。初回購入の通知はその transactionId を持って来るので、
+        # そちらでも引く。見つかれば検証で元の取引 ID へ付け替わる。
+        def find_apple_entitlement(original_id, transaction_id)
+          found = settings.database.find_entitlement('apple', original_id)
+          return found if found || transaction_id.empty?
+
+          return settings.database.find_entitlement('apple', transaction_id)
         end
 
         def reject_invalid!(message)
@@ -99,8 +110,9 @@ module Relay
           signed_transaction = data['signedTransactionInfo']
           return 'no_transaction' unless signed_transaction
 
-          original_id = verified_original_transaction_id(signed_transaction)
-          entitlement = settings.database.find_entitlement('apple', original_id)
+          transaction = verified_transaction(signed_transaction)
+          original_id = transaction['originalTransactionId'].to_s
+          entitlement = find_apple_entitlement(original_id, transaction['transactionId'].to_s)
           return 'unknown_purchase' unless entitlement
 
           outcome, = Relay::AppStoreVerification.verify!(

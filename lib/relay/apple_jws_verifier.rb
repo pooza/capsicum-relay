@@ -54,6 +54,8 @@ module Relay
       raise Invalid, 'not a JWS' if encoded.empty?
 
       header = JSON.parse(Base64.urlsafe_decode64(pad(encoded)))
+      # ⚠ 受け口は認証なしで叩ける。`[]` などを渡されて 500 にならないように（Codex P2・PR #75）。
+      raise Invalid, 'header is not an object' unless header.is_a?(Hash)
       raise Invalid, "unexpected alg: #{header['alg']}" unless header['alg'] == 'ES256'
 
       return header
@@ -69,6 +71,7 @@ module Relay
     def chain_from(header)
       x5c = header['x5c']
       raise Invalid, 'x5c must have 3 certificates' unless x5c.is_a?(Array) && x5c.size == 3
+      raise Invalid, 'x5c must be strings' unless x5c.all?(String)
 
       return x5c.first(2).map {|der| OpenSSL::X509::Certificate.new(Base64.strict_decode64(der))}
     end

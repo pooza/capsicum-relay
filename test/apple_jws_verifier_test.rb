@@ -72,6 +72,19 @@ class AppleJwsVerifierTest < Minitest::Test
     assert_raises(Relay::AppleJwsVerifier::Invalid) {@pki.verifier.verify(jws)}
   end
 
+  # ⚠ 受け口は認証なしで叩ける。ヘッダが配列でも 500 にしない（Codex P2・PR #75）。
+  def test_non_object_header_is_rejected
+    header = Base64.urlsafe_encode64('[]', padding: false)
+
+    assert_raises(Relay::AppleJwsVerifier::Invalid) {@pki.verifier.verify("#{header}.e30.x")}
+  end
+
+  def test_non_string_certificates_are_rejected
+    jws = @pki.sign(PAYLOAD, x5c: [1, 2, 3])
+
+    assert_raises(Relay::AppleJwsVerifier::Invalid) {@pki.verifier.verify(jws)}
+  end
+
   def test_garbage_is_rejected
     assert_raises(Relay::AppleJwsVerifier::Invalid) {@pki.verifier.verify('not-a-jws')}
     assert_raises(Relay::AppleJwsVerifier::Invalid) {@pki.verifier.verify(nil)}

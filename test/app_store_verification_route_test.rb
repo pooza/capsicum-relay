@@ -175,13 +175,15 @@ class AppStoreVerificationRouteTest < RequestTestCase
     )
   end
 
-  def notification(type, original: '1000', bundle_id: BUNDLE_ID, pki: @pki)
+  def notification(type, original: '1000', transaction: '9999', bundle_id: BUNDLE_ID, pki: @pki)
     return {
       'notificationType' => type,
       'data' => {
         'bundleId' => bundle_id,
         'environment' => 'Production',
-        'signedTransactionInfo' => pki.sign({'originalTransactionId' => original}),
+        'signedTransactionInfo' => pki.sign(
+          {'originalTransactionId' => original, 'transactionId' => transaction},
+        ),
       },
     }
   end
@@ -204,6 +206,21 @@ class AppStoreVerificationRouteTest < RequestTestCase
       assert_equal('expired', database.find_entitlement('apple', '1000')['status'])
       assert_equal(['1000'], fake.calls)
       assert_equal(1, notification_count('DID_CHANGE_RENEWAL_STATUS', 'expired'))
+    end
+  end
+
+  # ⚠⚠ 登録時に Apple へ届かず、送られた transactionId のまま `unverified` で残った
+  # 購入。初回購入の通知はその transactionId を持って来るので、そちらでも引いて
+  # 確かめ直す（Codex P1・PR #75）。
+  def test_notification_finds_purchase_left_unverified_by_its_transaction_id
+    with_app_store(FakeAppStore.new({'2000' => :unavailable})) {purchase('2000')}
+    fake = FakeAppStore.new({'1000' => result('active')})
+    with_app_store(fake) do
+      notify(notification('SUBSCRIBED', transaction: '2000'))
+
+      assert_equal(200, last_response.status)
+      assert_equal('active', database.find_entitlement('apple', '1000')['status'])
+      assert_nil(database.find_entitlement('apple', '2000'))
     end
   end
 

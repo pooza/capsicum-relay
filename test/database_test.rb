@@ -84,6 +84,35 @@ class DatabaseTest < Minitest::Test
     assert(db.find_entitlement('apple', '1000'))
   end
 
+  # ⚠ 接続は puma のスレッド間で共有。検証の反映（トランザクション）が同時に走っても
+  # 入れ子で落ちない（Codex P2・PR #75）。
+  #
+  # ⚠ **トランザクションの途中で待たせて、2 本目を確実に割り込ませる。**ただ並べて
+  # 走らせるだけだと GVL のおかげで交互に実行されず、鍵を外しても通ってしまう
+  # （実際に一度そう書いて歯が無かった）。
+  def test_concurrent_verifications_do_not_nest_transactions
+    db = open_database
+    ids = ['a', 'b'].map do |name|
+      db.issue_entitlement_token(store: 'apple', purchase_id: "tx-#{name}", device_id: name)['entitlement_id']
+    end
+    def db.find_entitlement(...)
+      sleep(0.1)
+      return super
+    end
+    errors = Queue.new
+    threads = ids.map do |id|
+      Thread.new do
+        db.apply_entitlement_verification(id, verification("orig-#{id}"))
+      rescue StandardError => e
+        errors << e
+      end
+    end
+    threads.each(&:join)
+
+    assert_empty(Array.new(errors.size) {errors.pop}.map(&:message))
+    assert_equal(2, ids.count {|id| db.find_entitlement('apple', "orig-#{id}")})
+  end
+
   # --- 修復 -------------------------------------------------------------------
 
   def test_broken_foreign_key_is_rewritten_to_subscriptions
@@ -151,6 +180,13 @@ class DatabaseTest < Minitest::Test
   def swap_db_path(path)
     Relay::Database.send(:remove_const, :DB_PATH)
     Relay::Database.const_set(:DB_PATH, path)
+  end
+
+  def verification(purchase_id)
+    return Relay::Database::EntitlementVerification.new(
+      store: 'apple', purchase_id: purchase_id, product_id: 'relay.monthly',
+      status: 'active', expires_at: nil, environment: 'Production'
+    )
   end
 
   def open_database
