@@ -36,6 +36,17 @@ Relay::BaseApp.set(:host_authorization, {permitted_hosts: []})
 # 捨てる（ログの内容そのものを検証するケースは今のところ無い）。
 Relay::BaseApp.set(:logger, Logger.new(File::NULL))
 
+# 🔴 **テストから本物のプリセットサーバーへ HTTP を出さない (#69)。**
+# [Relay::VapidKeyDirectory] は `/push` の中で鍵を引きに行くので、既定のまま
+# だと**プリセットを名乗る購読を作ったテストが実サーバーを叩く**。2026-09-28 に
+# 実際に踏んだ（`mstdn.b-shock.org` の鍵を取りに行き、本物の鍵と突き合わせて
+# いたのでテストが落ちた）。⚠ **空の一覧にすると 1 件も取りに行かない。**
+# 検証そのものを見るケースは `vapid_keys` を自分で差し替える。
+#
+# ⚠⚠ **`Relay::App.set` ではなく `Relay::BaseApp.set`。** route は
+# `Relay::Routes::*` という **App の兄弟**なので、App に set しても見えない。
+Relay::BaseApp.set(:vapid_keys, Relay::VapidKeyDirectory.new(hosts: []))
+
 # route の request テストの土台 (#34)。
 #
 # 単一の App インスタンスと 1 つの一時 DB を全ケースで共有するので、

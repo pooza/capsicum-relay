@@ -1,4 +1,6 @@
 require_relative 'entitlement_gate'
+require_relative 'preset_servers'
+require_relative 'vapid_assertion'
 
 module Relay
   # 認可ゲートを route から呼ぶための helper (capsicum#597 / #60)。
@@ -17,6 +19,7 @@ module Relay
       allowed, reason = Relay::EntitlementGate.decide(
         subscription: subscription,
         database: settings.database,
+        preset_verification: preset_verification_for(subscription, route: route),
         extra_preset_hosts: settings.config['extra_preset_hosts'],
       )
       metrics.increment(
@@ -27,11 +30,87 @@ module Relay
       return allowed
     end
 
+    # プリセットの名乗りの裏を取る (#69)。
+    #
+    # ⚠⚠ **enforce の有無に関わらず走らせる。**ゲートを実際に閉じる前に
+    # 「本物のプリセットの push が全部 `verified` になるか」を測っておく必要が
+    # あり（設計書 2-4「閉じる前に測り直す」）、閉じてから測ると**止めてから
+    # 気付く**ことになる。⚠ [Relay::EntitlementGate.decide] は `enforce_off` で
+    # 即戻るので、ここで作った判定は**そのとき使われないだけ**。
+    #
+    # ⚠ **`/register` では検証しない。**あれを叩くのはクライアント自身で、
+    # fedi サーバーの署名が存在しない（[Relay::EntitlementGate::PRESET_NOT_CHECKED]）。
+    def preset_verification_for(subscription, route:)
+      not_checked = Relay::EntitlementGate::PRESET_NOT_CHECKED
+      return not_checked unless route == 'push'
+      return not_checked unless claims_preset?(subscription)
+
+      assertion = Relay::VapidAssertion.verify(
+        authorization: request.env['HTTP_AUTHORIZATION'],
+        crypto_key: request.env['HTTP_CRYPTO_KEY'],
+      )
+      verification = classify_preset_claim(subscription['server'], assertion)
+      record_vapid_verification(subscription, assertion: assertion, verification: verification)
+      return verification
+    end
+
+    def claims_preset?(subscription)
+      return Relay::PresetServers.preset?(
+        subscription['server'], extra: settings.config['extra_preset_hosts']
+      )
+    end
+
+    # ⚠⚠ **順序が意味を持つ。**鍵が引けないときは、署名の有無に関わらず
+    # `unavailable`（＝ fail-open）。**こちらが確かめられなかったことを、相手の
+    # 落ち度として数えない。**
+    def classify_preset_claim(server, assertion)
+      expected = settings.vapid_keys&.public_key_for(server)
+      return Relay::EntitlementGate::PRESET_UNAVAILABLE if expected.nil?
+      return Relay::EntitlementGate::PRESET_UNSIGNED unless assertion.verified?
+      return Relay::EntitlementGate::PRESET_VERIFIED if assertion.public_key == expected
+
+      return Relay::EntitlementGate::PRESET_MISMATCH
+    end
+
+    # ⚠ **`verified` も数える。**分母が無いと「1 件も検証できていない」と
+    # 「全部通っている」が区別できない。⚠ `server` はプリセットの一覧に
+    # 限られる（[claims_preset?] を通った後）ので、ラベルの数は増えない。
+    def record_vapid_verification(subscription, assertion:, verification:)
+      metrics.increment(
+        'relay_vapid_verification_total',
+        {
+          server: subscription['server'].to_s,
+          outcome: assertion.outcome,
+          verification: verification.to_s,
+        },
+      )
+      return if verification == Relay::EntitlementGate::PRESET_VERIFIED
+
+      log_vapid_verification(subscription, assertion: assertion, verification: verification)
+    end
+
+    # ⚠ **Sentry へは出さない**（`log_event` は journald だけ）。ここは閉じる前の
+    # 観測用で、件数は metrics 側にある。
+    def log_vapid_verification(subscription, assertion:, verification:)
+      log_event(
+        'entitlement.vapid',
+        level: :warn,
+        msg: "Preset claim not verified (#{verification}): #{subscription['server']}",
+        verification: verification.to_s,
+        outcome: assertion.outcome,
+        server: subscription['server'],
+        account: subscription['account'],
+        # ⚠ 公開鍵は秘密ではないが、行が長くなるので頭だけ。詐称の判別には足りる。
+        presented_key: assertion.public_key.to_s[0, 12],
+        subject: assertion.subject,
+      )
+    end
+
     # ⚠ **拒んだときと fail-open のときだけ残す。**通常の許可
     # （`enforce_off` / `preset` / `entitled`）は全リクエストに付くので、
     # ログに出すと journald が埋まる。件数は metrics 側にある。
     def log_gate_decision(subscription, route:, allowed:, reason:)
-      return if allowed && reason != Relay::EntitlementGate::REASON_ERROR
+      return if allowed && !fail_open?(reason)
 
       log_event(
         'entitlement.gate',
@@ -46,6 +125,15 @@ module Relay
         server: subscription['server'],
         has_device_id: !subscription['device_id'].nil?,
       )
+    end
+
+    # 「判定できなかったので通した」形。⚠ **どちらもゲートが効いていない**ので、
+    # 許可でもログに残す。
+    def fail_open?(reason)
+      return [
+        Relay::EntitlementGate::REASON_ERROR,
+        Relay::EntitlementGate::REASON_PRESET_UNVERIFIABLE,
+      ].include?(reason)
     end
   end
 end
