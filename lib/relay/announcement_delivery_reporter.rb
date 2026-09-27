@@ -1,17 +1,17 @@
-require_relative 'announcement_push_outcome'
+require_relative 'push_outcome'
 require_relative 'sentry_setup'
 
 module Relay
   # お知らせ配信 1 通の結末を、構造化ログ 1 行と counter 1 つに落とす (#44)。
   #
-  # 通常の push 経路には [Relay::PushHelpers#handle_push_result] があり、
+  # 通常の push 経路には [Relay::PushDeliveryReporter] があり、
   # success / oversized / permanent / failed を分けて観測している。お知らせ配信
   # ([Relay::AnnouncementWorker#deliver]) にはそれが一切なく、**push クライアント
   # の戻り値を捨てていた**ため、失敗しても journald にも `/metrics` にも Sentry
   # にも何も残らなかった。「お知らせが届かない」という報告が来ても relay 側に
   # 手掛かりが無い、というのが実質いちばん痛い形だった。
   #
-  # 結末の**解釈**は [Relay::AnnouncementPushOutcome]（通常 push 経路と同じ順序・
+  # 結末の**解釈**は [Relay::PushOutcome]（通常 push 経路と同じ順序・
   # 同じ名前）。このクラスは解釈した結果を**どこへ出すか**だけを持つ。
   #
   # ## seen の粒度はこの Issue では触らない（C 案）
@@ -49,11 +49,11 @@ module Relay
 
     # push クライアントの戻り値 1 つを観測に落とす。返り値は outcome 文字列。
     def record(sub:, server:, announcement_id:, result:)
-      outcome = Relay::AnnouncementPushOutcome.classify(result)
+      outcome = Relay::PushOutcome.classify(result)
       about = {server: server, announcement_id: announcement_id}
       unregister_gone(sub) if outcome == 'gone'
       emit(sub: sub, about: about, outcome: outcome,
-        detail: Relay::AnnouncementPushOutcome.detail(result))
+        detail: Relay::PushOutcome.detail(result))
       capture(sub: sub, about: about, outcome: outcome, result: result)
       return outcome
     end
@@ -94,7 +94,7 @@ module Relay
     def emit(sub:, about:, outcome:, detail:, msg: nil)
       @metrics&.increment(COUNTER, {device_type: sub['device_type'], outcome: outcome})
       log(
-        Relay::AnnouncementPushOutcome.level(outcome), EVENT,
+        Relay::PushOutcome.level(outcome), EVENT,
         msg: msg || message(sub, about, outcome),
         outcome: outcome,
         device_type: sub['device_type'],
@@ -119,7 +119,7 @@ module Relay
     # 購読宛には二度と届かないので、お知らせ購読の行を落とす。
     #
     # ⚠ **親 subscription（通常 push 側）はここでは消さない。** 通常 push が同じ
-    # 端末で 404 / 410 を踏めば [Relay::PushHelpers#handle_push_gone] が
+    # 端末で 404 / 410 を踏めば [Relay::PushDeliveryReporter] が
     # `Database#unregister` を呼び、お知らせ購読も FK の CASCADE で一緒に消える。
     # お知らせ配信だけを根拠に親を消すと、**通常 push は生きているのに端末ごと
     # 登録解除する**危険がある（お知らせ payload 固有の失敗を端末の死と取り違える）。
@@ -130,7 +130,7 @@ module Relay
       @database.unregister_announcement_subscription(id)
     end
 
-    # ⚠ **判定は `LEVELS` の引きではなく [AnnouncementPushOutcome.level] で行う**
+    # ⚠ **判定は `LEVELS` の引きではなく [PushOutcome.level] で行う**
     # （Codex P2 / PR #51）。`wns_channelthrottled` のような **動的に組む outcome は
     # `LEVELS` に載っていない**ので、Hash を直接引くと nil になり Sentry へ 1 件も
     # 上がらなかった。通常 push 側 ([Relay::PushHelpers#handle_wns_status]) は
@@ -138,11 +138,11 @@ module Relay
     #
     # 除外は 2 つ:
     # - `:info`（success / gone / `wns_dropped` 等の正常系）。通常 push 側も
-    #   handle_push_gone で Sentry へは上げていない
+    #   `gone` を Sentry へは上げていない
     # - `unconfigured`（設定漏れ・配線漏れ）。直るまで定常的に出続けるので alert に
     #   向かない。journald と counter には残る
     def capture(sub:, about:, outcome:, result:)
-      level = Relay::AnnouncementPushOutcome.level(outcome)
+      level = Relay::PushOutcome.level(outcome)
       return if level == :info || outcome == 'unconfigured'
 
       Relay::SentrySetup.capture_message(
@@ -157,7 +157,7 @@ module Relay
         device_type: sub['device_type'],
         account: sub['account'],
         token: Relay::SentrySetup.mask_token(sub['token']),
-      }.merge(about).merge(Relay::AnnouncementPushOutcome.detail(result)).compact
+      }.merge(about).merge(Relay::PushOutcome.detail(result)).compact
     end
 
     # worker は request scope の外なので request_id は無い。event / msg の形は

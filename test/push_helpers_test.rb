@@ -5,10 +5,13 @@ require 'lib/relay/push_helpers'
 # する。App は config/settings.yml を読む configure ブロックがあり test から
 # require できないため、mixin される側のモジュール契約をここで守る。
 class PushHelpersTest < Minitest::Test
+  # ⚠ **配送の結末を扱う helper は #55 でここから出た。**非同期になり、
+  # `status` / `halt` という request scope の side effect と一体では worker から
+  # 呼べなくなったため、[Relay::PushDeliveryReporter]（出力）と
+  # [Relay::PushOutcome]（解釈）へ移した。ここに残るのは**受信の助け**だけ。
   EXPECTED_METHODS = [
-    :build_push_payload, :dispatch_push, :push_client_for, :log_push_received,
-    :handle_push_result, :push_context, :handle_push_delivered, :handle_wns_status,
-    :handle_push_gone, :handle_push_oversized, :handle_push_degraded, :handle_push_failed
+    :build_push_payload, :push_client_for, :log_push_received,
+    :push_received_fields, :push_received_message
   ].freeze
 
   def test_is_a_module_for_sinatra_helpers_mixin

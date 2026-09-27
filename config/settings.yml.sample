@@ -42,3 +42,9 @@ announcement:
 # ⚠⚠ 既定は無効（何も閉じない）。本番で立てるのはフェーズ 3 の決定で、
 #     立てる前に relay_register_entitlement_total を読み直すこと。
 #   systemd drop-in 例: Environment=RELAY_ENTITLEMENT_ENFORCE=true
+
+# 配送の非同期化 (#55) も **env**。
+#   PUSH_QUEUE_CAPACITY=200  積める通数（⚠ 深くしない）
+#   PUSH_QUEUE_WORKERS=2     配送の並行数
+# ⚠⚠ WORKERS を増やすときは lib/relay/http_connection_pool.rb の
+#     MAX_IDLE_PER_HOST も揃えること（超えたぶんは閉じられ、#54 の再利用が効かない）。

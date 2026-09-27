@@ -11,7 +11,7 @@ module Relay
     # subscription を destroy してもらい、自らの row も削除する。
     PERMANENT_REASONS = ['BadDeviceToken', 'Unregistered', 'DeviceTokenNotForTopic'].freeze
     # degrade しても上限を割れず、送信前に倒したときの合成 reason (#17)。下流
-    # (handle_push_oversized) の扱いを APNs 実応答の 413 と揃えるため、下の
+    # （`PushOutcome` の `oversized`）の扱いを APNs 実応答の 413 と揃えるため、下の
     # OVERSIZED_REASONS に同居させる。
     OVERSIZED_PRECHECK_REASON = 'PayloadTooLarge (pre-check)'.freeze
     # APNs payload 上限 (alert push 4KB) 超過。subscription は健全なので
@@ -67,7 +67,7 @@ module Relay
     end
 
     # degrade して送ったときだけ degraded / original_size を添える。上位
-    # (handle_push_delivered) が「届いたが本文は読めない」を観測するのに使う。
+    # （`PushOutcome` の `degraded`）が「届いたが本文は読めない」を観測するのに使う。
     def delivered(response, degraded_from)
       result = {success: true, id: response.headers['apns-id']}
       return result unless degraded_from
@@ -83,7 +83,7 @@ module Relay
     end
 
     # degrade しても上限を割れない稀なケース（account 名だけで 4KB を超える等）。
-    # 事後の 413 応答と同型 (oversized: true) を返し、handle_push_oversized の
+    # 事後の 413 応答と同型 (oversized: true) を返し、`PushOutcome` の `oversized` の
     # drop + 観測へそのまま倒す。WNS の同名メソッド (#21) と役割を揃えている。
     def oversized_precheck_result(built)
       @logger.warn(
@@ -96,7 +96,8 @@ module Relay
     # ストリーム上限は接続を張り直さないと戻らないので、作り直して 1 回だけ
     # 送り直す。`HTTP2::Connection#new_stream` はバイトを 1 つも送る前に raise
     # するため、この再送で二重配信にはならない。2 回目も上限に当たったら
-    # failure に落として上流の再送に委ねる（handle_push_failed → 502）。
+    # failure に落とす（`PushOutcome` の `failed`）。⚠ #55 で配送が非同期になり、
+    # **上流の再送には委ねられなくなった**（202 を返している）。
     def push_after_reset(stale, error, built)
       @logger.warn(
         'APNs stream limit reached; reconnecting and retrying once:' \

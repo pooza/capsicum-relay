@@ -24,9 +24,11 @@ module Relay
         halt_entitlement_gone! unless entitlement_allowed?(sub, route: 'push')
         return {status: 'deduped'}.to_json if deduped?(sub)
 
-        payload = build_push_payload(sub)
-        result = dispatch_push(sub, payload)
-        handle_push_result(sub, result)
+        # ⚠⚠ **クライアント未設定は同期で 503。**キューに積んでから「未設定でした」と
+        # 分かる形にすると、設定漏れが 202 に隠れて**気付けなくなる**。
+        ensure_push_client!(sub)
+        # ⚠ **payload はここで組む。**`request.body` はリクエストの中でしか読めない。
+        accept_push(sub, build_push_payload(sub))
       end
 
       helpers do
@@ -58,6 +60,39 @@ module Relay
           halt 410, {error: 'Unknown push token'}.to_json
         end
 
+        # 配送はワーカーへ渡し、受信は即返す (#55)。⚠⚠ **遅い 1 通が puma の
+        # スレッドを占有していたのをやめる**のが眼目（Windows は 1 通 2,056ms で、
+        # 2 通並ぶと約 2 秒は他の push を受け付けられなかった）。設計は
+        # [Relay::PushQueue] の doc が正本。
+        #
+        # ⚠ **満杯なら 503。**黙って捨てると失われたことが誰にも分からない。
+        # ⚠ **4xx にしてはいけない**（Mastodon が購読を消す・#66）。
+        def accept_push(sub, payload)
+          queue = settings.push_queue
+          accepted = queue.enqueue(
+            subscription: sub, payload: payload, request_id: request_id,
+          )
+          unless accepted
+            push_reporter.record_rejected(
+              sub: sub, depth: queue.depth, request_id: request_id,
+            )
+            halt 503, {error: 'Push queue full'}.to_json
+          end
+          # ⚠ **202 Accepted。**200 ではない —— 「配送したか」はまだ分からない。
+          status 202
+          return {status: 'accepted', queued: queue.depth}.to_json
+        end
+
+        # ⚠ 観測だけのために reporter を借りる（配送はワーカーが持っている）。
+        def push_reporter
+          return settings.push_queue.reporter
+        end
+
+        def ensure_push_client!(sub)
+          client, name = push_client_for(sub['device_type'])
+          halt 503, {error: "#{name} not configured"}.to_json unless client
+        end
+
         # 利用権が無いので購読ごと掃除させる (capsicum#597 / #60)。
         #
         # ⚠ **`subscriptions` の行は消さない。**購入が復活したときにクライアントが
@@ -81,9 +116,8 @@ module Relay
             length: request.content_length,
           )
 
-          record_push_outcome(
-            sub, 'deduped',
-            msg: "Push deduped (#{sub['device_type']}): #{sub['account']}"
+          push_reporter.record_deduped(
+            sub: sub, request_id: request_id, latency_ms: latency_ms,
           )
           return true
         end

@@ -18,29 +18,6 @@ module Relay
     # （手順は docs/CLAUDE.md「配信不達の切り分け」）。
     WNS_BENIGN_STATUSES = ['dropped'].freeze
 
-    # push 1 通の結末を、構造化ログ 1 行と counter 1 つに落とす (#2)。
-    #
-    # ⚠ **outcome はここを唯一の出口にする。** 従来は結末ごとに logger 呼び出しが
-    # 散っていて、新しい結末を足すたびに計装を書き忘れる形だった（WNS の
-    # `dropped` が長らく件数として見えなかったのがそれ）。
-    #
-    # `msg` は従来と同じ文言。docs/CLAUDE.md「配信不達の切り分け」の grep 手順を
-    # 壊さないため（Relay::StructuredLog 参照）。
-    def record_push_outcome(sub, outcome, msg:, level: :info, **fields)
-      metrics.increment(
-        'relay_push_total', {device_type: sub['device_type'], outcome: outcome}
-      )
-      log_event(
-        'push.result', msg: msg, level: level,
-        outcome: outcome,
-        device_type: sub['device_type'],
-        account: sub['account'],
-        server: sub['server'],
-        latency_ms: latency_ms,
-        **fields
-      )
-    end
-
     def build_push_payload(sub)
       payload = {
         'body' => Base64.strict_encode64(request.body.read),
@@ -58,15 +35,16 @@ module Relay
       return payload
     end
 
-    def dispatch_push(sub, payload)
-      client, name = push_client_for(sub['device_type'])
-      halt 503, {error: "#{name} not configured"}.to_json unless client
-      return client.push(device_token: sub['token'], payload: payload)
-    end
-
     # device_type ごとの送信クライアントと表示名を返す。各クライアントは
     # push(device_token:, payload:) を共通 I/F に持つ。未設定なら client は nil。
     def push_client_for(device_type)
+      return Relay::PushHelpers.client_for(settings, device_type)
+    end
+
+    # ⚠ **module function としても呼べるようにしてある (#55)。**配送ワーカーは
+    # request scope の外にいるので helper mixin として混ざっていない。**選択の
+    # 規則を 2 箇所に持たない**ための入口。
+    def self.client_for(settings, device_type)
       case device_type
       when 'ios', 'macos'
         # macOS は iOS と同一 Bundle ID + 同一 APNs Auth Key で動くため、同じ
@@ -120,149 +98,6 @@ module Relay
       return "Received push: #{sub['account']} (#{sub['device_type']}," \
         " encoding=#{fields[:encoding].inspect}#{flags}" \
         " len=#{fields[:length]}#{topic})"
-    end
-
-    def handle_push_result(sub, result)
-      return handle_push_delivered(sub, result) if result[:success]
-      return handle_push_oversized(sub, result) if result[:oversized]
-      return handle_push_gone(sub, result) if result[:permanent]
-      return handle_push_failed(sub, result)
-    end
-
-    # Sentry に載せる push 失敗コンテキスト。token は部分マスクし、生のレスポンス
-    # body（FCM のエラー JSON 等）は status / reason に絞って送る (#10 Phase B/E)。
-    def push_context(sub, result)
-      {
-        device_type: sub['device_type'],
-        account: sub['account'],
-        server: sub['server'],
-        token: Relay::SentrySetup.mask_token(sub['token']),
-        status: result[:status],
-        reason: result[:reason],
-        # reason を採れない非 JSON 応答のときだけ入る、切り詰めた生 body
-        # (#25)。compact されるので通常の失敗では出ない。
-        body_snippet: result[:body_snippet],
-      }.compact
-    end
-
-    def handle_push_delivered(sub, result = {})
-      wns_status = result[:wns_status]
-      return handle_wns_status(sub, result, wns_status) if wns_status && wns_status != 'received'
-      return handle_push_degraded(sub, result) if result[:degraded]
-
-      # conn は WNS だけが持つ「接続を使い回せたか」(#54)。⚠ **latency_ms と同じ
-      # 行に出すのが眼目** — ヒット率と 690ms の削減を突き合わせるため。
-      record_push_outcome(
-        sub, 'success',
-        msg: "Pushed to #{sub['device_type']}: #{sub['account']}", conn: result[:conn]
-      )
-      return {status: 'delivered'}.to_json
-    end
-
-    # 暗号化 payload が上限を超えたため汎用文面だけ届けた (#17)。以前は 1 通まるごと
-    # drop していた（端末に何も出ない）ので、**ここに来るのは改善後の正常系**。ただし
-    # 「本文の読めない通知」ではあり、送信側の payload 設計が肥大していないかを追う
-    # 材料になるので warning として件数を観測する。drop (Push oversized dropped) とは
-    # 別メッセージにして、本当の不達が 0 になったことを確認できるようにする。件数が
-    # 青天井になるようなら WNS_BENIGN_STATUSES と同じくログのみへ落とす。
-    def handle_push_degraded(sub, result)
-      record_push_outcome(
-        sub, 'degraded', level: :warn,
-        msg: "Push degraded to generic alert: #{sub['account']}" \
-          " (#{sub['device_type']}, #{result[:original_size]}B)",
-        original_size: result[:original_size]
-      )
-      Relay::SentrySetup.capture_message(
-        "Push oversized degraded (#{sub['device_type']})",
-        level: :warning,
-        context: {push: push_context(sub, result).merge(original_size: result[:original_size])},
-      )
-      return {status: 'delivered', degraded: true}.to_json
-    end
-
-    # 配信は受理扱い（success）だが実質的な不達。WNS 固有の静かな失敗モードで、
-    # ここを観測しないと Windows push 不達の切り分けで効かない (#474 レビュー)。
-    # ただし正常系（WNS_BENIGN_STATUSES）は件数が青天井なので Sentry へは上げず、
-    # ログだけに残す。
-    def handle_wns_status(sub, result, wns_status)
-      benign = WNS_BENIGN_STATUSES.include?(wns_status)
-      message = "WNS delivered but #{wns_status}: #{sub['account']}"
-      record_push_outcome(
-        sub, "wns_#{wns_status}", level: benign ? :info : :warn,
-        msg: message, wns_status: wns_status, conn: result[:conn]
-      )
-      unless benign
-        Relay::SentrySetup.capture_message(
-          "WNS notification #{wns_status} (windows)",
-          level: :warning,
-          context: {push: push_context(sub, result).merge(wns_status: wns_status)},
-        )
-      end
-      return {status: 'delivered', wns_status: wns_status}.to_json
-    end
-
-    def handle_push_gone(sub, result)
-      # Device token が無効化された（UNREGISTERED / BadDeviceToken 等）。
-      # Mastodon には 410 を返して subscription を destroy してもらい、
-      # relay 側の行も掃除する。
-      settings.database.unregister(sub['id'])
-      reason = result[:reason] || result[:status]
-      record_push_outcome(
-        sub, 'gone',
-        msg: "Subscription gone: #{sub['account']} (#{reason})", reason: reason,
-        conn: result[:conn]
-      )
-      status 410
-      return {status: 'gone', detail: result}.to_json
-    end
-
-    def handle_push_oversized(sub, result)
-      # FCM (4KB) / APNs (4KB) のペイロード上限を超えた個別メッセージ。
-      # subscription は健全なので unregister せず、この 1 通だけ落とす (#9)。
-      #
-      # ⚠⚠ **4xx を返してはいけない (#66)。**以前は 413 を返して「この 1 通だけ
-      # ドロップさせる」意図だったが、**Mastodon は `408` / `429` 以外の 4xx
-      # すべてで購読を destroy する**（`Web::PushNotificationWorker#send`）。
-      # つまり 413 でも購読が消え、**想定と正反対**になっていた。
-      #
-      # ⚠ **429 でもない。**429 は destroy を免れるが `raise` になって sidekiq が
-      # retry する。**同じ oversized な payload は再送しても必ず失敗する。**
-      #
-      # → **200。**`dropped`（WNS の端末オフライン）と同じ意味づけで、
-      # 「受け取った・retry するな・購読は残せ」。⚠ **件数は `outcome` の
-      # ログ・counter・Sentry で見えたまま**なので、観測は落ちない。
-      record_push_outcome(
-        sub, 'oversized', level: :warn,
-        msg: "Push oversized (subscription kept): #{sub['account']}" \
-          " (#{sub['device_type']}): #{result}",
-        reason: result[:reason] || result[:status]
-      )
-      # 健全な subscription を残したまま 1 通だけドロップする想定挙動だが、
-      # 多発は送信側のペイロード設計問題を示すので warning として件数観測する
-      # (#10 Phase B、#9 の後継観測)。
-      Relay::SentrySetup.capture_message(
-        "Push oversized dropped (#{sub['device_type']})",
-        level: :warning,
-        context: {push: push_context(sub, result)},
-      )
-      return {status: 'oversized', detail: result}.to_json
-    end
-
-    def handle_push_failed(sub, result)
-      record_push_outcome(
-        sub, 'failed', level: :error,
-        msg: "Push failed: #{result}", reason: result[:reason] || result[:status],
-        conn: result[:conn]
-      )
-      # 一過性でない送信失敗（APNs / FCM の 5xx 等）。低頻度・高インパクトなので
-      # journalctl 任せにせず Sentry で alert 駆動にする (#10 Phase B、#8 の後継観測)。
-      Relay::SentrySetup.capture_message(
-        "Push delivery failed (#{sub['device_type']})",
-        level: :error,
-        context: {push: push_context(sub, result)},
-      )
-      status 502
-      return {status: 'failed', detail: result}.to_json
     end
   end
 end

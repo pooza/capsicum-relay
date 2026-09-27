@@ -134,7 +134,7 @@ module Relay
       end
       # degrade しても割れない（暗号化キーを持たない payload 等）ときは、従来どおり
       # POST せず 413 経路に倒す (#21)。事後の 413 と同じ oversized 扱いなので
-      # 上位（handle_push_oversized）の挙動・観測は変わらない。
+      # 上位（`PushOutcome` の `oversized`）の挙動・観測は変わらない。
       return oversized_precheck_result(body.bytesize) if body.bytesize > RAW_PAYLOAD_LIMIT
 
       sent = post_raw(device_token, body)
@@ -163,14 +163,14 @@ module Relay
     end
 
     # degrade して送れたときだけ degraded / original_size を添える。上位の
-    # handle_push_delivered が APNs (#17) と同じ handle_push_degraded へ振り分ける。
+    # `PushOutcome` が APNs (#17) と同じ `degraded` へ振り分ける。
     def mark_degraded(result, degraded_from)
       return result unless degraded_from && result[:success]
 
       return result.merge(degraded: true, original_size: degraded_from)
     end
 
-    # push が返す失敗ハッシュの共通形。handle_push_result が success / oversized /
+    # push が返す失敗ハッシュの共通形。`PushOutcome.classify` が success / oversized /
     # permanent を見て分岐するので、全経路でキーを揃える。
     def failure(status:, reason:, permanent: false, oversized: false, conn: nil)
       return {
@@ -180,7 +180,7 @@ module Relay
     end
 
     # 送信前 5000B 超過。interpret の 413 応答と同型 (oversized: true) を返し、
-    # handle_push_oversized の drop + 観測にそのまま乗せる。
+    # `oversized` の drop + 観測にそのまま乗せる。
     def oversized_precheck_result(size)
       @logger.warn("WNS payload too large (pre-check): #{size} > #{RAW_PAYLOAD_LIMIT}")
       return failure(

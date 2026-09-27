@@ -1,15 +1,19 @@
 require_relative 'push_helpers'
 
 module Relay
-  # push クライアントの戻り値 1 つを outcome 文字列に解釈する (#44)。
+  # push クライアントの戻り値 1 つを outcome 文字列に解釈する (#44 / #55)。
   #
-  # ⚠ **分岐の順序と名前は [Relay::PushHelpers#handle_push_result] と揃える。**
-  # あちらは Sinatra の helper mixin で、`status` / `halt` という request scope の
-  # side effect と一体になっているため worker からは呼べない。**解釈だけをここに
-  # 切り出して、両方から同じ名前が出るようにする** — 揃っていれば
-  # `relay_push_total` と `relay_announcement_push_total` を同じラベルで比較でき、
-  # 「上流からの中継は成功しているのにお知らせ配信だけ落ちている」が数字で見える。
-  module AnnouncementPushOutcome
+  # ⚠ **通常の push 経路とお知らせ配信の両方がここを通る。**#44 の時点では
+  # `AnnouncementPushOutcome` という名前で、通常 push 側
+  # （`PushHelpers` の `handle_push_result`）は**同じ分岐を別に持っていた** —— 順序と
+  # 名前を「コメントで揃える」運用だった。#55 で通常 push の配送を非同期にした
+  # ときに、あちらも request scope の外へ出す必要が生じたので、**分岐を 1 本に
+  # 畳んで名前も実態に合わせた**。
+  #
+  # 揃っていると `relay_push_total` と `relay_announcement_push_total` を同じ
+  # ラベルで比較でき、「上流からの中継は成功しているのにお知らせ配信だけ落ちて
+  # いる」が数字で見える。
+  module PushOutcome
     # outcome ごとのログレベル。ここに無いものは :info。
     LEVELS = {
       'degraded' => :warn,
@@ -58,7 +62,7 @@ module Relay
     end
 
     # 失敗の材料になる項目だけ拾う。生のレスポンス body は載せない（通常 push 側の
-    # [Relay::PushHelpers#push_context] と同じ方針で status / reason に絞る）。
+    # [Relay::PushDeliveryReporter] と同じ方針で status / reason に絞る）。
     def self.detail(result)
       return {} unless result.is_a?(Hash)
 

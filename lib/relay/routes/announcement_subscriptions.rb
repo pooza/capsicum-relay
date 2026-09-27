@@ -21,7 +21,7 @@ module Relay
         )
 
         # account は既に user@host 形式なので server は付けない（@host が二重に
-        # 出るのを避ける）。push 登録ログ (handle_push_*) と表記を揃える。
+        # 出るのを避ける）。push 配送ログ（`push.result`）と表記を揃える。
         metrics.increment('relay_announcement_subscription_total', {action: 'created'})
         log_event(
           'announcement_subscription.created',

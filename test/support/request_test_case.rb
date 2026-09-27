@@ -62,6 +62,11 @@ class RequestTestCase < Minitest::Test
   end
 
   def setup
+    # ⚠⚠ **前のケースの配送を待ってから DB を消す (#55)。**push キューはプロセス
+    # 共有なので、配送が残っていると**次のケースの最中に DB を触る**（`gone` で
+    # `unregister` が走る等）。⚠ 早期に失敗したケースが in-flight を残しうるので、
+    # ここが最後の歯止め。
+    Relay::App.settings.push_queue.idle_after_waiting?(timeout: 5)
     db = SQLite3::Database.new(safe_db_path)
     TABLES.each {|table| db.execute("DELETE FROM #{table}")}
     db.close

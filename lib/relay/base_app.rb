@@ -11,7 +11,9 @@ require_relative 'entitlement_helpers'
 require_relative 'fcm_client'
 require_relative 'metrics'
 require_relative 'push_dedup'
+require_relative 'push_delivery_reporter'
 require_relative 'push_helpers'
+require_relative 'push_queue'
 require_relative 'sentry_setup'
 require_relative 'structured_log'
 require_relative 'wns_client'
@@ -43,6 +45,34 @@ module Relay
       return ENV.fetch('RELAY_DB_PATH', Relay::Database::DB_PATH)
     end
 
+    # push キューを組み立てる (#55)。⚠ **`configure` から切り出してある**のは、
+    # テストが**差し替えた logger で組み直せる**ようにするため。
+    #
+    # ⚠⚠ **構築時の logger を握る。**`Database` や各 push クライアントと同じで、
+    # あとから `set :logger` しても差し替わらない（`configure` のコメント参照）。
+    # テストは null logger を入れてから**ここを呼び直す**。
+    def self.build_push_queue
+      return Relay::PushQueue.new(
+        reporter: Relay::PushDeliveryReporter.new(
+          # ⚠ **Proc で渡す。**構築時に握ると `set :logger` が効かない
+          # （[Relay::PushDeliveryReporter#initialize] の doc）。
+          logger: -> {settings.logger},
+          metrics: settings.metrics,
+          database: settings.database,
+        ),
+        # ⚠ **クライアントの選択は route 側**（`push_client_for` が未設定なら 503 を
+        # 先に返す）。キューに積んでから「未設定でした」と分かる形にしない。
+        deliver: lambda do |sub, payload|
+          client, = Relay::PushHelpers.client_for(settings, sub['device_type'])
+          next {success: false, reason: 'unconfigured'} unless client
+
+          client.push(device_token: sub['token'], payload: payload)
+        end,
+        capacity: Integer(ENV.fetch('PUSH_QUEUE_CAPACITY', Relay::PushQueue::DEFAULT_CAPACITY)),
+        workers: Integer(ENV.fetch('PUSH_QUEUE_WORKERS', Relay::PushQueue::DEFAULT_WORKERS)),
+      )
+    end
+
     configure do
       set :config, YAML.load_file(config_path)
       # ⚠ **logger を先に作る。** Database / 各クライアントは construct 時の
@@ -70,6 +100,13 @@ module Relay
       set :push_dedup,
         (dedup_window.positive? ? Relay::PushDedup.new(window_ms: dedup_window) : nil)
 
+      # 配送の非同期化 (#55)。⚠⚠ **受信して即 202 を返し、送信はワーカーで行う。**
+      # 理由と設計は [Relay::PushQueue] の doc が正本。
+      #
+      # ⚠ **`PUSH_QUEUE_WORKERS` を増やすときは
+      # [Relay::HttpConnectionPool::MAX_IDLE_PER_HOST] も見ること**（超えたぶんは
+      # checkin で閉じられ、#54 の接続再利用が効かなくなる）。
+      set :push_queue, build_push_queue.start!
       # capsicum-relay#14 Phase 2: announcement polling worker。
       # interval が 0 / negative なら無効化 (テスト時等)。
       interval = settings.config.dig('announcement', 'poll_interval')
@@ -88,6 +125,22 @@ module Relay
       end
     end
 
+    # 停止時にキューを吐き切るフックを入れる (#55)。
+    #
+    # ⚠⚠ **`configure` の中で `at_exit` を登録してはいけない。**`minitest/autorun`
+    # が先に `at_exit` を登録しているので、**後から登録したハンドラの方が先に走る**
+    # ＝ **テストが 1 件も動く前にキューが閉じられる**（`ClosedQueueError` で全部
+    # 500 になった）。同じ罠は `test/support/request_test_case.rb` にも書いてある。
+    #
+    # → **プロセスの入口（`config.ru`）から明示的に呼ぶ。**そもそも process 全体の
+    # 後片づけはクラス定義の仕事ではない。
+    #
+    # ⚠ puma は SIGTERM でリクエストを捌き切ってから抜けるので、その後に走る
+    # `at_exit` で足りる。
+    def self.install_shutdown_hook!
+      at_exit {settings.push_queue.stop!}
+    end
+
     before do
       content_type :json
       start_request!
@@ -101,7 +154,8 @@ module Relay
     end
 
     # push 送信・結果ハンドリング系（build_push_payload / dispatch_push /
-    # handle_push_* 等）は Relay::PushHelpers へ切り出してある (#27)。
+    # `log_push_received` 等）は Relay::PushHelpers へ切り出してある (#27)。
+    # ⚠ **配送の結末は [Relay::PushDeliveryReporter]**（#55 で request scope の外へ出た）。
     helpers Relay::PushHelpers
 
     # 有償リレーの認可 (capsicum#597 / #60)。⚠ **`/register` と `/push` の両方が
