@@ -39,6 +39,7 @@ wns:
 #   issuer_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 #   bundle_id: "org.b-shock.capsicum"
 #   environments: ["Production", "Sandbox"]
+#   reverify_interval: 600   # unverified の購入を確かめ直す間隔（秒・0 で止める）
 
 # お知らせ通知 push (capsicum-relay#14)
 # poll_interval を 0 にすると polling worker を無効化 (テスト用)

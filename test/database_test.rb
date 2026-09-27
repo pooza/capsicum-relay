@@ -113,6 +113,30 @@ class DatabaseTest < Minitest::Test
     assert_equal(2, ids.count {|id| db.find_entitlement('apple', "orig-#{id}")})
   end
 
+  # ⚠ トランザクションの途中に、別のスレッドの SQL が混ざらない（Codex P2・PR #75）。
+  # 混ざると、その SQL は**他人のトランザクションの巻き戻しに巻き込まれて消える**。
+  # 1 本目はトランザクションの中で待ってから失敗し、その間に 2 本目が書く。
+  def test_other_threads_do_not_run_inside_a_verification_transaction
+    db = open_database
+    id = db.issue_entitlement_token(store: 'apple', purchase_id: 'tx-a', device_id: 'a')['entitlement_id']
+    def db.find_entitlement(...)
+      sleep(0.2)
+      raise 'boom'
+    end
+    first = Thread.new do
+      db.apply_entitlement_verification(id, verification('orig-a'))
+    rescue StandardError
+      nil
+    end
+    sleep(0.05)
+    db.issue_entitlement_token(store: 'google', purchase_id: 'gpa-b', device_id: 'b')
+    first.join
+
+    count = raw {|r| r.get_first_value("SELECT COUNT(*) FROM entitlements WHERE purchase_id = 'gpa-b'")}
+
+    assert_equal(1, count)
+  end
+
   # --- 修復 -------------------------------------------------------------------
 
   def test_broken_foreign_key_is_rewritten_to_subscriptions

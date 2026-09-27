@@ -9,6 +9,7 @@ require_relative 'app_store_client'
 require_relative 'database'
 require_relative 'entitlement_gate'
 require_relative 'entitlement_helpers'
+require_relative 'entitlement_reverifier'
 require_relative 'fcm_client'
 require_relative 'metrics'
 require_relative 'push_dedup'
@@ -97,6 +98,8 @@ module Relay
       set :app_store, Relay::AppStoreClient.from_config(
         settings.config, logger: settings.logger, verifier: settings.apple_jws_verifier
       )
+      # `unverified` のまま残った購入を確かめ直す（Codex P1・PR #75）。
+      set :entitlement_reverifier, Relay::EntitlementReverifier.start_from_settings(settings)
 
       if settings.config.dig('wns', 'package_sid')
         set :wns, Relay::WnsClient.new(settings.config, logger: settings.logger)

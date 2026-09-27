@@ -1,6 +1,7 @@
 require 'logger'
 require 'securerandom'
 require 'sqlite3'
+require_relative 'serialized_connection'
 
 module Relay
   # スキーマ定義と移行 (device_type の macos #468 / windows #474 追加、FK 修復な
@@ -52,12 +53,8 @@ module Relay
     # 掴む形になりうる。テスト用の差し替えは呼び出し側（App）が明示的に渡す (#34)。
     def initialize(logger: Logger.new($stdout), path: DB_PATH)
       @logger = logger
-      @db = SQLite3::Database.new(path)
-      # ⚠ **接続は puma のスレッド間で共有**（`workers 0` / `threads 2`）。SQLite の
-      # トランザクションは接続単位なので、2 本が同時に `BEGIN` すると入れ子で落ち、
-      # 後始末で先の 1 本まで巻き戻す（Codex P2・PR #75）。トランザクションを張る
-      # 処理はこの鍵の中で行う。
-      @transaction_lock = Mutex.new
+      # ⚠ **スレッド間で直列にした接続**（理由は [Relay::SerializedConnection]）。
+      @db = Relay::SerializedConnection.new(SQLite3::Database.new(path))
       @db.results_as_hash = true
       @db.execute('PRAGMA journal_mode=WAL')
       @db.execute('PRAGMA foreign_keys=ON')
@@ -344,9 +341,38 @@ module Relay
     # 返すので、手元の token が変わっても追いつく。
     # [verification] は [EntitlementVerification]。
     def apply_entitlement_verification(entitlement_id, verification)
-      @transaction_lock.synchronize do
-        apply_entitlement_verification_locked(entitlement_id, verification)
+      @db.transaction do
+        target = find_entitlement(verification.store, verification.purchase_id)
+        if target && target['id'] != entitlement_id
+          merge_entitlement_tokens!(entitlement_id, target['id'])
+          @db.execute('DELETE FROM entitlements WHERE id = ?', [entitlement_id])
+          entitlement_id = target['id']
+        end
+        update_entitlement_verification!(entitlement_id, verification)
       end
+      return entitlement_id
+    end
+
+    # 確かめ直す `unverified` の購入 (Codex P1・PR #75)。**作られてから [days] 日以内**で、
+    # 最後に触ってから時間の経ったものから [limit] 件。
+    #
+    # ⚠ `unverified` の行は誰でも作れる（`POST /entitlements` は共有シークレットだけ）。
+    # **件数と期間で縛る**のは、でたらめな行を大量に作られても Apple API を叩く量が
+    # 増えないようにするため。
+    def unverified_entitlements(store, days:, limit:)
+      window = "-#{Integer(days)} days"
+      return @db.execute(<<~SQL, [store, ENTITLEMENT_STATUS_UNVERIFIED, window, limit])
+        SELECT * FROM entitlements
+        WHERE store = ? AND status = ? AND created_at >= datetime('now', ?)
+        ORDER BY updated_at ASC, id ASC
+        LIMIT ?
+      SQL
+    end
+
+    # 確かめ直した行を順番の後ろへ回す（同じ行ばかり引かないように）。
+    def touch_entitlement(entitlement_id)
+      @db.execute("UPDATE entitlements SET updated_at = datetime('now') WHERE id = ?",
+        [entitlement_id])
     end
 
     # 端末の token を、購入の行 id と端末 id から引く（検証で行が寄った後に
@@ -374,20 +400,6 @@ module Relay
     end
 
     private
-
-    # [apply_entitlement_verification] の本体。⚠ **鍵の外から呼ばない。**
-    def apply_entitlement_verification_locked(entitlement_id, verification)
-      @db.transaction do
-        target = find_entitlement(verification.store, verification.purchase_id)
-        if target && target['id'] != entitlement_id
-          merge_entitlement_tokens!(entitlement_id, target['id'])
-          @db.execute('DELETE FROM entitlements WHERE id = ?', [entitlement_id])
-          entitlement_id = target['id']
-        end
-        update_entitlement_verification!(entitlement_id, verification)
-      end
-      return entitlement_id
-    end
 
     # device_id を送らない旧クライアント向けの従来経路。(token, account, server)
     # をキーにした upsert で、トークンが変われば別の行になる。
