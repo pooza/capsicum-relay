@@ -211,4 +211,52 @@ class PushOutcomeStatusTest < RequestTestCase
 
     assert_equal(3, delivered.size, '積まれていたぶんを捌いてから止まる')
   end
+
+  # ⚠⚠ **配送の待ち時間中にトークンが更新されたら、いま有効な登録を消さない**
+  # （PR #67 の Codex P1）。`update_registration` は**行 ID を保ったまま `token` を
+  # 差し替える**（#15 の dedup のため）ので、行 ID だけで消すと**有効な登録が消え、
+  # `announcement_subscriptions` も CASCADE で落ちる。**
+  #
+  # ⚠ 同期配送のときも同じ race があったが、窓がリクエストの中（〜2 秒）に
+  # 限られていた。#55 でキューの待ち時間ぶん窓が広がった。
+  def test_gone_does_not_delete_a_row_whose_token_was_refreshed
+    # ⚠ **同じ端末（同じ `device_id`）の再登録**でないと `update_registration` を
+    # 通らない（別 device_id は新しい行になる）。
+    queued = database.register(
+      token: 'old-device-token', device_type: 'ios',
+      account: 'race@example.test', server: 'example.test', device_id: 'race-device'
+    )
+    # 配送を積んだ「後」に端末のトークンが更新された状況を作る。
+    refreshed = database.register(
+      token: 'refreshed-device-token', device_type: 'ios',
+      account: 'race@example.test', server: 'example.test', device_id: 'race-device'
+    )
+    # ⚠ 行 ID が同じまま token だけ差し替わっていることが前提（これが崩れたら
+    # この検査は意味を失う）。
+    assert_equal(queued['id'], refreshed['id'], '前提: 行 ID は保たれる')
+    refute_equal(queued['token'], refreshed['token'], '前提: token は差し替わる')
+
+    # 古いトークン宛の配送が恒久的失敗で返ってくる。
+    Relay::App.settings.push_queue.reporter.record(
+      sub: queued, result: {success: false, permanent: true, reason: 'Unregistered'},
+    )
+
+    still = database.find(queued['id'])
+
+    refute_nil(still, 'いま有効な登録を消してはいけない')
+    assert_equal(refreshed['token'], still['token'])
+  end
+
+  # ⚠ トークンが変わっていなければ従来どおり消す（410 の引き金）。
+  def test_gone_deletes_the_row_when_the_token_is_unchanged
+    queued = database.find_by_push_token(@parent['push_token'])
+
+    refute_nil(queued)
+
+    Relay::App.settings.push_queue.reporter.record(
+      sub: queued, result: {success: false, permanent: true, reason: 'Unregistered'},
+    )
+
+    assert_nil(database.find(queued['id']))
+  end
 end

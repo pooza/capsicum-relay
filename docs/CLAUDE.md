@@ -214,6 +214,14 @@ erDiagram
 
 ⚠ **`/push` が 410 を返しても `subscriptions` の行は消さない。**購入が復活したらクライアントの再登録で同じ行（同じ `push_token`）が使われる。消すと `announcement_subscriptions` も CASCADE で消える。⚠ **復帰には再登録が要る**（capsicum#1123 の導線）。
 
+#### ⚠⚠⚠ #69 が未解決のままゲートを閉じてはいけない
+
+**プリセット判定が `subscription['server']` を見ているが、これは `/register` がクライアントから受け取ってそのまま保存した値で、検証していない。**共有シークレットは authorization boundary にできない（[capsicum#1121](https://github.com/pooza/capsicum/issues/1121)）ので、⚠⚠ **誰でも `server: "mstdn.b-shock.org"` と名乗って `push_token` を得て、それを自分のサーバーの Web Push 宛先に渡せばゲートを迂回できる。**
+
+⚠ 設計書 決定済み事項 3 が受け入れたコストは「プリセットサーバーにアカウントを 1 つ作る」で、⚠⚠ **実際は「サーバー名を打つだけ」**。**受け入れたリスクより広い。**
+
+→ [#69](https://github.com/pooza/capsicum-relay/issues/69) でサーバー側から検証できる assertion（VAPID 公開鍵の pin が有力）を用意してから閉じる。
+
 #### ⚠⚠ `unverified` を許可側に入れない
 
 `POST /entitlements` は共有シークレットしか見ておらず、**そのシークレットはバイナリから取り出せる**（capsicum#1121）。**誰でも `unverified` の行を作れる**ので、入れるとゲートが無意味になる。`test/entitlement_gate_test.rb` が固定している。
@@ -307,15 +315,61 @@ Windows 実機（capsicum の Windows 機能検証機）に Ruby を入れて `r
 | リバースプロキシ | nginx（HTTPS 終端、Let's Encrypt 自動更新） |
 | Puma | `127.0.0.1:9292`（nginx 背後） |
 
-### デプロイ手順
+### ⚠⚠ ブランチ運用（2026-09-27 決定・[#68](https://github.com/pooza/capsicum-relay/issues/68)）
+
+**ブランチ 2 本とホスト 2 台を 1 対 1 に対応させる。**
+
+| ブランチ | デプロイ先 | 保護 |
+| --- | --- | --- |
+| `develop` | **triton**（ステージング・`st.relay.capsicum.shrieker.net`） | なし（直 push 可） |
+| `main` | **flauros**（本番・`relay.capsicum.shrieker.net`） | ⚠⚠ **PR 必須 + `enforce_admins: true`** |
+
+```text
+feature（任意）→ develop → triton へデプロイして寝かせる
+                    ↓ PR（⚠ ここで @codex review）
+                  main → flauros へデプロイ
+```
+
+⚠⚠ **`main` へは直 push できない**（2026-09-27 に `enforce_admins: true` にした）。以前は保護が入っていても**管理者は素通りでき**、実際に [#58](https://github.com/pooza/capsicum-relay/issues/58)〜[#55](https://github.com/pooza/capsicum-relay/issues/55) の 5 回とも素通りで main へ入れてしまった。**規約では止まらなかったのでフックにした**（capsicum 側の `.claude/hooks/deny-shell-loops.sh` と同じ考え方）。
+
+⚠ **急いでいても段取りは端折れない**（2026-09-27 pooza）。緊急時に本当に直 push が要るなら **`enforce_admins` を一時的に false にしてから**入れ、**戻す**。
 
 ```bash
-ssh deploy@flauros.b-shock.co.jp
-cd ~/repos/capsicum-relay
-git pull
-bundle install
-sudo systemctl restart capsicum-relay
+gh api -X DELETE repos/pooza/capsicum-relay/branches/main/protection/enforce_admins  # 外す
+gh api -X POST   repos/pooza/capsicum-relay/branches/main/protection/enforce_admins  # 戻す
 ```
+
+⚠ **Codex は `@codex review` を打った時だけ走る。**追加コミットや force-push では発火しない。⚠ 未登録リポジトリや base SHA 取得不能で**空振りする**ことがあるので、空振りなら 5 観点レビュー（capsicum の `/release-review`）に切り替える。
+
+### デプロイ手順
+
+⚠ **ステージング（triton）を先に、本番（flauros）を後に。**ホストごとに**見るブランチが違う**。
+
+⚠⚠ **`ssh` を 2 行並べてから共通のコマンドを書かない**（PR #70 の Codex P2）。最初の `ssh` が triton のシェルを開いてしまい、**残りのコマンドがそちらで動く** ＝ **本番にしか当たらず、ステージングが未デプロイのまま「両方やった」ことになる。**ステージング先という手順そのものが壊れるので、**ホストごとに完結したブロックにする。**
+
+```bash
+# 1. ステージング（triton・develop を追う）
+ssh deploy@triton.b-shock.local '
+  cd ~/repos/capsicum-relay &&
+  git pull &&
+  bundle install &&
+  sudo -n systemctl restart capsicum-relay
+'
+```
+
+```bash
+# 2. 本番（flauros・main を追う）。⚠ develop → main の PR をマージし、1 の疎通確認が通ってから
+ssh deploy@flauros.b-shock.co.jp '
+  cd ~/repos/capsicum-relay &&
+  git pull &&
+  bundle install &&
+  sudo -n systemctl restart capsicum-relay
+'
+```
+
+⚠ **変更系（pull / restart）と確認系（status / log / curl）は同じ ssh セッションに混ぜない**（2026-05-28 に誤って本番を再起動した経緯がある）。
+
+⚠ **restart 直後の `curl` は 502 を返す**（Puma が listen するまで 15〜20 秒）。下の「疎通確認」を参照。
 
 ### 疎通確認
 
@@ -347,6 +401,12 @@ done
 | --- | --- | --- |
 | `PUSH_QUEUE_CAPACITY` | 200 | 積める通数。⚠ **深くしない**（詰まりに気付かない時間と、再起動で失う通数が増える） |
 | `PUSH_QUEUE_WORKERS` | 2 | 配送の並行数。⚠⚠ **`HttpConnectionPool::MAX_IDLE_PER_HOST` と揃える**（超えたぶんは checkin で閉じられ、[#54](https://github.com/pooza/capsicum-relay/issues/54) の接続再利用が効かなくなる） |
+
+#### ⚠⚠ `gone` の削除は行 ID だけで判定しない
+
+[update_registration] は **行 ID を保ったまま `token` を差し替える**（#15 の dedup のため）。配送をキューに積んでから結末が出るまでの間に `/register` で端末のトークンが更新されると、⚠⚠ **いま有効な登録を消してしまう**（`announcement_subscriptions` も CASCADE で落ち、上流は次の push で 410 を受けて購読を掃除する ＝ **利用者は再登録まで通知を失う**）。
+
+→ `Database#unregister_stale(id, token)` で **積んだ時点のトークンと一致するときだけ**消す。⚠ 同期配送のときも同じ race があったが、窓がリクエストの中（〜2 秒）に限られていた。**#55 でキューの待ち時間ぶん窓が広がった**（PR #67 の Codex P1）。
 
 #### ⚠⚠ 上流へ結末を返せなくなった、への答え
 

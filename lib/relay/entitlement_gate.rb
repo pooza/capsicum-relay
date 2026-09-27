@@ -55,6 +55,17 @@ module Relay
       # ⚠ **プリセットは判定に入る前に抜ける**（#60 の「絶対に守る 2 点」の 1）。
       # 「プリセットに 1 アカウント持てば全部無償」の穴は残すと決定済み
       # （2026-09-12・設計書 決定済み事項 3）。
+      #
+      # ⚠⚠⚠ **ここを信じてゲートを閉じてはいけない（#69 が未解決）。**
+      # `subscription['server']` は **`/register` がクライアントから受け取って
+      # そのまま保存した値**で、**検証していない**。共有シークレットは
+      # authorization boundary にできない（capsicum#1121）ので、⚠ **誰でも
+      # `server: "mstdn.b-shock.org"` と名乗って `push_token` を得て、それを
+      # 自分のサーバーの Web Push 宛先に渡せば、ゲートを完全に迂回できる。**
+      #
+      # ⚠ **受け入れたリスクより広い。**決定済み事項 3 が許したのは「プリセット
+      # サーバーにアカウントを 1 つ作る」コストで、実際は「**サーバー名を打つだけ**」。
+      # → **#69 でサーバー側から検証できる assertion を用意してから閉じる。**
       if Relay::PresetServers.preset?(subscription['server'], extra: extra_preset_hosts)
         return [true, REASON_PRESET]
       end
