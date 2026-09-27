@@ -49,6 +49,14 @@ module Relay
       # （＝通知が届かなくなっている）端末がある。
       'relay_push_stale_token_total' =>
         'Pushes for unknown tokens answered with 410 (upstream subscription is cleaned up).',
+      # ストアでの購入の検証 (#61)。⚠⚠ **`outcome="unavailable"` が続くなら検証が
+      # 止まっている**（Apple 側の障害か、鍵が revoke された）。fail-open なので
+      # 状態は変わらず、ここを見ないと気付けない。
+      'relay_entitlement_verify_total' =>
+        'Store verifications of purchases, by store and outcome.',
+      # ストアからの通知 (#61)。`type` は Apple の notificationType。
+      'relay_store_notification_total' =>
+        'Store server notifications received, by store, type and outcome.',
     }.freeze
 
     def initialize

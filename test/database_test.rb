@@ -57,6 +57,112 @@ class DatabaseTest < Minitest::Test
     assert_empty(db.find_announcement_subscriptions_by_push_token(sub['push_token']))
   end
 
+  # #61: 既に動いている DB（`environment` 列が無い entitlements）へ列を足す。
+  # ⚠ 行は残る（組み替えではなく ALTER TABLE ADD COLUMN）。
+  def test_environment_column_is_added_to_existing_entitlements
+    open_database
+    raw do |db|
+      db.execute('DROP TABLE entitlement_tokens')
+      db.execute('DROP TABLE entitlements')
+      db.execute(<<~SQL)
+        CREATE TABLE entitlements (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, store TEXT NOT NULL,
+          purchase_id TEXT NOT NULL, product_id TEXT, status TEXT NOT NULL,
+          expires_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          UNIQUE(store, purchase_id)
+        )
+      SQL
+      db.execute(<<~SQL)
+        INSERT INTO entitlements (store, purchase_id, status, created_at, updated_at)
+        VALUES ('apple', '1000', 'unverified', datetime('now'), datetime('now'))
+      SQL
+    end
+    db = open_database
+    columns = raw {|r| r.execute('PRAGMA table_info(entitlements)')}.map {|c| c['name']}
+
+    assert_includes(columns, 'environment')
+    assert_includes(columns, 'signed_at')
+    assert(db.find_entitlement('apple', '1000'))
+  end
+
+  # ⚠ 接続は puma のスレッド間で共有。検証の反映（トランザクション）が同時に走っても
+  # 入れ子で落ちない（Codex P2・PR #75）。
+  #
+  # ⚠ **トランザクションの途中で待たせて、2 本目を確実に割り込ませる。**ただ並べて
+  # 走らせるだけだと GVL のおかげで交互に実行されず、鍵を外しても通ってしまう
+  # （実際に一度そう書いて歯が無かった）。
+  def test_concurrent_verifications_do_not_nest_transactions
+    db = open_database
+    ids = ['a', 'b'].map do |name|
+      db.issue_entitlement_token(store: 'apple', purchase_id: "tx-#{name}", device_id: name)['entitlement_id']
+    end
+    def db.find_entitlement(...)
+      sleep(0.1)
+      return super
+    end
+    errors = Queue.new
+    threads = ids.map do |id|
+      Thread.new do
+        db.apply_entitlement_verification(id, verification("orig-#{id}"))
+      rescue StandardError => e
+        errors << e
+      end
+    end
+    threads.each(&:join)
+
+    assert_empty(Array.new(errors.size) {errors.pop}.map(&:message))
+    assert_equal(2, ids.count {|id| db.find_entitlement('apple', "orig-#{id}")})
+  end
+
+  # ⚠ トランザクションの途中に、別のスレッドの SQL が混ざらない（Codex P2・PR #75）。
+  # 混ざると、その SQL は**他人のトランザクションの巻き戻しに巻き込まれて消える**。
+  # 1 本目はトランザクションの中で待ってから失敗し、その間に 2 本目が書く。
+  def test_other_threads_do_not_run_inside_a_verification_transaction
+    db = open_database
+    id = db.issue_entitlement_token(store: 'apple', purchase_id: 'tx-a', device_id: 'a')['entitlement_id']
+    def db.find_entitlement(...)
+      sleep(0.2)
+      raise 'boom'
+    end
+    first = Thread.new do
+      db.apply_entitlement_verification(id, verification('orig-a'))
+    rescue StandardError
+      nil
+    end
+    sleep(0.05)
+    db.issue_entitlement_token(store: 'google', purchase_id: 'gpa-b', device_id: 'b')
+    first.join
+
+    count = raw {|r| r.get_first_value("SELECT COUNT(*) FROM entitlements WHERE purchase_id = 'gpa-b'")}
+
+    assert_equal(1, count)
+  end
+
+  # ⚠ token の発行（行を作る → token を入れる）の間に、検証の付け替えが割り込まない
+  # （Codex P2・PR #75）。割り込むと作ったばかりの行が消され、消えた行を指す token を
+  # 入れようとして外部キー違反で落ちる。1 本目は行を作った直後に待ち、その間に 2 本目が
+  # その行を元の取引 ID の行へ寄せる。
+  def test_token_issuance_is_not_interrupted_by_a_merge
+    db = open_database
+    db.issue_entitlement_token(store: 'apple', purchase_id: 'orig', device_id: 'd1')
+    def db.upsert_entitlement_token(...)
+      sleep(0.2)
+      return super
+    end
+    issued = Thread.new do
+      db.issue_entitlement_token(store: 'apple', purchase_id: 'tx-new', device_id: 'd2')
+    rescue StandardError => e
+      e
+    end
+    sleep(0.05)
+    provisional = db.find_entitlement('apple', 'tx-new')
+    db.apply_entitlement_verification(provisional['id'], verification('orig')) if provisional
+    result = issued.value
+
+    refute_kind_of(StandardError, result, result.inspect)
+    assert_equal(2, db.entitlement_tokens_for_purchase('apple', 'orig').size)
+  end
+
   # --- 修復 -------------------------------------------------------------------
 
   def test_broken_foreign_key_is_rewritten_to_subscriptions
@@ -124,6 +230,13 @@ class DatabaseTest < Minitest::Test
   def swap_db_path(path)
     Relay::Database.send(:remove_const, :DB_PATH)
     Relay::Database.const_set(:DB_PATH, path)
+  end
+
+  def verification(purchase_id)
+    return Relay::Database::EntitlementVerification.new(
+      store: 'apple', purchase_id: purchase_id, product_id: 'relay.monthly',
+      status: 'active', expires_at: nil, environment: 'Production'
+    )
   end
 
   def open_database

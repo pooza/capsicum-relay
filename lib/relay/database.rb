@@ -1,6 +1,7 @@
 require 'logger'
 require 'securerandom'
 require 'sqlite3'
+require_relative 'serialized_connection'
 
 module Relay
   # スキーマ定義と移行 (device_type の macos #468 / windows #474 追加、FK 修復な
@@ -23,13 +24,21 @@ module Relay
     # （買える経路が無い・設計書の未決事項 7）。
     ENTITLEMENT_STORES = ['apple', 'google', 'microsoft'].freeze
 
+    # ストアで確かめた購入の状態 (#61)。[apply_entitlement_verification] に渡す。
+    EntitlementVerification = Struct.new(
+      :store, :purchase_id, :product_id, :status, :expires_at, :environment, :signed_at,
+      keyword_init: true
+    )
+
     # 検証していない購入 (#58)。⚠⚠ **ゲート (#60) の許可側へ入れてはいけない。**
     ENTITLEMENT_STATUS_UNVERIFIED = 'unverified'.freeze
 
     # 購入の状態 (#58)。⚠ **DB の CHECK ではなくここで検査する**（理由は
     # [create_entitlement_tables!] の doc）。フェーズ 3（#63）で増える。
+    #
+    # `billing_retry` は #61 で足した（Apple が支払いを再試行している間・拒否側）。
     ENTITLEMENT_STATUSES = [
-      ENTITLEMENT_STATUS_UNVERIFIED, 'active', 'grace', 'expired', 'revoked'
+      ENTITLEMENT_STATUS_UNVERIFIED, 'active', 'grace', 'billing_retry', 'expired', 'revoked'
     ].freeze
 
     # device_id を持たない古い行を掃除してよいと判断するまでの猶予 (capsicum#949)。
@@ -44,7 +53,8 @@ module Relay
     # 掴む形になりうる。テスト用の差し替えは呼び出し側（App）が明示的に渡す (#34)。
     def initialize(logger: Logger.new($stdout), path: DB_PATH)
       @logger = logger
-      @db = SQLite3::Database.new(path)
+      # ⚠ **スレッド間で直列にした接続**（理由は [Relay::SerializedConnection]）。
+      @db = Relay::SerializedConnection.new(SQLite3::Database.new(path))
       @db.results_as_hash = true
       @db.execute('PRAGMA journal_mode=WAL')
       @db.execute('PRAGMA foreign_keys=ON')
@@ -257,10 +267,17 @@ module Relay
     # 同じ (store, purchase_id, device_id) で二度呼ばれたら**同じ token を返す**。
     # ⚠ アプリの起動ごとに token が増えると、端末単位の無効化 (#57) が
     # 「どれを消せばいいのか分からない」状態になる。
+    #
+    # ⚠ **行を作ってから token を入れるまでを 1 つのトランザクションにする**（Codex P2・
+    # PR #75）。間に検証の付け替え（[apply_entitlement_verification]）が割り込むと、
+    # 作ったばかりの行が消され、消えた行を指す token を入れようとして外部キー違反で落ちる。
+    # トランザクションの間は [Relay::SerializedConnection] がほかのスレッドを待たせる。
     def issue_entitlement_token(store:, purchase_id:, device_id:, product_id: nil)
-      entitlement = upsert_entitlement(store, purchase_id, product_id)
-      upsert_entitlement_token(entitlement['id'], device_id)
-      return find_entitlement_token_by_device(entitlement['id'], device_id)
+      @db.transaction do
+        entitlement = upsert_entitlement(store, purchase_id, product_id)
+        upsert_entitlement_token(entitlement['id'], device_id)
+        return find_entitlement_token_by_device(entitlement['id'], device_id)
+      end
     end
 
     # token 1 本を、紐づく購入の状態と一緒に引く (#58)。ゲート (#60) の入口。
@@ -271,7 +288,7 @@ module Relay
       return @db.execute(<<~SQL, [token]).first
         SELECT t.id, t.token, t.entitlement_id, t.device_id,
                t.created_at, t.updated_at,
-               e.store, e.purchase_id, e.product_id, e.status, e.expires_at
+               e.store, e.purchase_id, e.product_id, e.status, e.expires_at, e.environment
         FROM entitlement_tokens t
         JOIN entitlements e ON t.entitlement_id = e.id
         WHERE t.token = ?
@@ -308,6 +325,67 @@ module Relay
 
     def entitlement_count
       return @db.get_first_value('SELECT COUNT(*) FROM entitlements')
+    end
+
+    def find_entitlement(store, purchase_id)
+      return @db.execute(
+        'SELECT * FROM entitlements WHERE store = ? AND purchase_id = ?',
+        [store, purchase_id],
+      ).first
+    end
+
+    # ストアで検証した結果を購入の行へ反映する (#61)。反映先の行 id を返す。
+    #
+    # ⚠⚠ **`purchase_id` を元の取引 ID（originalTransactionId）へ付け替える。**
+    # クライアントが送ってくるのは StoreKit の transactionId で、**更新のたびに
+    # 変わる**。そのまま持つと、同じサブスクが更新ごとに別の行になる（通知は
+    # 元の取引 ID で来るので、どの行を更新すべきかも引けない）。
+    #
+    # 付け替え先の行が既にあるとき（別の端末が先に検証した・更新後の取引 ID で
+    # 送り直した）は、**端末の token をそちらへ寄せてから元の行を消す**。
+    # ⚠ 寄せる先に同じ端末の token が既にあれば、そちらを残す
+    # （`UNIQUE(entitlement_id, device_id)`）。クライアントには応答で新しい token を
+    # 返すので、手元の token が変わっても追いつく。
+    # [verification] は [EntitlementVerification]。
+    def apply_entitlement_verification(entitlement_id, verification)
+      @db.transaction do
+        target = find_entitlement(verification.store, verification.purchase_id)
+        if target && target['id'] != entitlement_id
+          merge_entitlement_tokens!(entitlement_id, target['id'])
+          @db.execute('DELETE FROM entitlements WHERE id = ?', [entitlement_id])
+          entitlement_id = target['id']
+        end
+        update_entitlement_verification!(entitlement_id, verification)
+      end
+      return entitlement_id
+    end
+
+    # 確かめ直す `unverified` の購入 (Codex P1・PR #75)。**作られてから [days] 日以内**で、
+    # 最後に触ってから時間の経ったものから [limit] 件。
+    #
+    # ⚠ `unverified` の行は誰でも作れる（`POST /entitlements` は共有シークレットだけ）。
+    # **件数と期間で縛る**のは、でたらめな行を大量に作られても Apple API を叩く量が
+    # 増えないようにするため。
+    def unverified_entitlements(store, days:, limit:)
+      window = "-#{Integer(days)} days"
+      return @db.execute(<<~SQL, [store, ENTITLEMENT_STATUS_UNVERIFIED, window, limit])
+        SELECT * FROM entitlements
+        WHERE store = ? AND status = ? AND created_at >= datetime('now', ?)
+        ORDER BY updated_at ASC, id ASC
+        LIMIT ?
+      SQL
+    end
+
+    # 確かめ直した行を順番の後ろへ回す（同じ行ばかり引かないように）。
+    def touch_entitlement(entitlement_id)
+      @db.execute("UPDATE entitlements SET updated_at = datetime('now') WHERE id = ?",
+        [entitlement_id])
+    end
+
+    # 端末の token を、購入の行 id と端末 id から引く（検証で行が寄った後に
+    # クライアントへ返し直すため）。
+    def entitlement_token_for(entitlement_id, device_id)
+      return find_entitlement_token_by_device(entitlement_id, device_id)
     end
 
     def entitlement_token_count
@@ -517,6 +595,51 @@ module Relay
     def create_entitlement_tables!
       create_entitlements_table!
       create_entitlement_tokens_table!
+      # どの環境の API で確かめたか (#61)。`Production` / `Sandbox`。⚠ 本番 relay でも
+      # TestFlight の購入は `Sandbox` になる（テスターを外へ広げるときに拒否側へ
+      # 切り替えるための印・capsicum の paid-relay-plan.md 7-2）。nullable な列の
+      # 追加だけなので組み替えは要らない。
+      columns = table_columns('entitlements')
+      unless columns.include?('environment')
+        @db.execute('ALTER TABLE entitlements ADD COLUMN environment TEXT')
+      end
+      # 反映した結果にストアが署名した時刻（ミリ秒）(Codex P2・PR #75)。古い結果での
+      # 上書きを拒むための順序。
+      return if columns.include?('signed_at')
+
+      @db.execute('ALTER TABLE entitlements ADD COLUMN signed_at INTEGER')
+    end
+
+    # ⚠⚠ **ストアの署名時刻が、いま入っているものより古ければ書かない**（Codex P2・
+    # PR #75）。同じ購入を 2 本同時に確かめると、先に読んだ古い結果（active）が後から
+    # 書かれて、新しい結果（expired）を上書きしうる。鍵では防げない ——
+    # 付け替え前の行は購入ごとに別の行 ID を持つので、同じ購入でも別の鍵になる。
+    # ⚠ 付け替え（`purchase_id`）は署名時刻に関係なく行う（行を正しい購入に寄せるだけで、
+    # 状態は変えない）。
+    def update_entitlement_verification!(entitlement_id, verification)
+      v = verification
+      @db.execute(<<~SQL, [v.purchase_id, entitlement_id])
+        UPDATE entitlements SET purchase_id = ? WHERE id = ?
+      SQL
+      values = [v.product_id, v.status, v.expires_at, v.environment, v.signed_at]
+      @db.execute(<<~SQL, values + [entitlement_id, v.signed_at, v.signed_at])
+        UPDATE entitlements SET
+          product_id = COALESCE(?, product_id),
+          status = ?,
+          expires_at = ?,
+          environment = ?,
+          signed_at = ?,
+          updated_at = datetime('now')
+        WHERE id = ? AND (signed_at IS NULL OR ? IS NULL OR signed_at <= ?)
+      SQL
+    end
+
+    def merge_entitlement_tokens!(from_id, to_id)
+      @db.execute(<<~SQL, [to_id, from_id])
+        UPDATE OR IGNORE entitlement_tokens SET entitlement_id = ?, updated_at = datetime('now')
+        WHERE entitlement_id = ?
+      SQL
+      @db.execute('DELETE FROM entitlement_tokens WHERE entitlement_id = ?', [from_id])
     end
 
     def create_entitlements_table!
@@ -590,7 +713,7 @@ module Relay
       return @db.execute(<<~SQL, [entitlement_id, device_id]).first
         SELECT t.id, t.token, t.entitlement_id, t.device_id,
                t.created_at, t.updated_at,
-               e.store, e.purchase_id, e.product_id, e.status, e.expires_at
+               e.store, e.purchase_id, e.product_id, e.status, e.expires_at, e.environment
         FROM entitlement_tokens t
         JOIN entitlements e ON t.entitlement_id = e.id
         WHERE t.entitlement_id = ? AND t.device_id = ?

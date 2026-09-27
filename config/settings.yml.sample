@@ -26,6 +26,21 @@ wns:
   package_sid: "ms-app://S-1-15-2-..."
   client_secret: "CHANGE_ME"
 
+# Apple の購入の検証 (#61) — App Store Server API
+# 鍵は **アプリ内課金キー**（App Store Connect → ユーザとアクセス → 統合 → アプリ内課金）。
+# ⚠ 期限は無い（失効は手動の revoke だけ・revoke されると 401 で error ログ）。
+# issuer_id は App Store Connect API キーと同じ（チーム共通）。
+# environments は引く順。⚠ 本番は Production → Sandbox（TestFlight の購入を扱う・
+#   テスターは身内だけの前提）、ステージングは Sandbox だけ。
+# 節ごと無ければ検証しない（購入は unverified のまま・通知の受け口は 503）。
+# app_store:
+#   key_path: "/path/to/SubscriptionKey_XXXXXXXXXX.p8"
+#   key_id: "XXXXXXXXXX"
+#   issuer_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+#   bundle_id: "org.b-shock.capsicum"
+#   environments: ["Production", "Sandbox"]
+#   reverify_interval: 600   # unverified の購入を確かめ直す間隔（秒・0 で止める）
+
 # お知らせ通知 push (capsicum-relay#14)
 # poll_interval を 0 にすると polling worker を無効化 (テスト用)
 announcement:

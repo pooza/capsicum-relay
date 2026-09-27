@@ -256,6 +256,34 @@ $ curl -s -H "X-Relay-Secret: $SECRET" https://relay.capsicum.shrieker.net/metri
     | grep relay_entitlement_gate_total
 ```
 
+### Apple の購入の検証（[#61](https://github.com/pooza/capsicum-relay/issues/61)・フェーズ 3）
+
+**入口は 2 つ**で、判断は `Relay::AppStoreVerification.verify!` の 1 か所にある。
+
+| 入口 | いつ | 何を引く |
+| --- | --- | --- |
+| `POST /entitlements`（`store: apple`） | クライアントが購入を送ってきた | `purchase_id`（StoreKit の transactionId） |
+| `POST /store/apple/notifications` | Apple の Server Notifications V2 | 通知の `signedTransactionInfo` の元の取引 ID |
+
+⚠⚠ **状態は常に App Store Server API（`GET /inApps/v1/subscriptions/{id}`）から引き直す。**クライアントの申告も通知の中身も「どの購入か」を知るためにだけ使う（Apple は通知の順序を保証せず、再送もする）。
+
+| 決まりごと | 理由 |
+| --- | --- |
+| ⚠⚠ **`purchase_id` を元の取引 ID へ付け替える** | transactionId は更新のたびに変わる。付け替え先が既にあれば端末の token を寄せて元の行を消す（同じ端末なら元の token を返す） |
+| ⚠⚠ **fail-open** | Apple に届かない・5xx・401 のときは**状態を変えない**。新規は `unverified` のまま。通知は **503 を返して Apple に再送させる** |
+| **通知の署名** | `x5c` の葉 → 中間 → **同梱の Apple Root CA - G3**（`config/apple_root_ca_g3.pem`・指紋はテストで固定）。⚠ `x5c` に入っているルートは使わない。通知の受け口は**共有シークレットを見ない**ので、ここが唯一の関門 |
+| **環境** | 本番は Production → Sandbox の順に引く（**TestFlight の購入は Sandbox**）。ステージングは Sandbox だけ。`entitlements.environment` に印を付ける |
+| ⚠ **TestFlight のテスターは身内だけ**（2026-09-27 pooza） | 本番でもサンドボックスの購入を有効に扱うため。外部テスターを開くなら `environment=Sandbox` を拒否側へ |
+| `billing_retry` | Apple が支払いを再試行している間。**拒否側**（ゲートの許可は `active` / `grace` だけ） |
+| ⚠ **確かめ直しのワーカー**（`EntitlementReverifier`） | 登録時に Apple へ届かず transactionId のまま `unverified` で残った購入は、**更新の後の通知ではどちらの ID でも引けない**。10 分おきに確かめ直して元の取引 ID へ付け替える。⚠ `unverified` は誰でも作れるので **1 回 20 件・作られてから 7 日以内**に縛る。`app_store.reverify_interval`（秒・0 で止める） |
+| ⚠⚠ **古い結果で上書きしない**（`entitlements.signed_at`） | Apple が応答に署名した時刻（`signedDate`）を保存し、**それより古い結果では状態を書かない**。同じ購入でも付け替え前の行は別の行 ID を持つので、**鍵だけでは防げない**（別々の端末が別の取引 ID で送ってくる）。行の付け替え自体は時刻に関係なく行う |
+| ⚠ **購入ごとの鍵** | 「Apple から読む → 書く」を同じ行については 1 本ずつ（上の時刻の比較と二重の守り）。⚠ **全体で 1 本の鍵にしない**（Apple が遅いと puma の 2 スレッドが両方待たされ、push の受け付けまで止まる） |
+| ⚠ **接続の直列化**（`SerializedConnection`） | SQLite の接続は puma のスレッド間で共有で、トランザクションは接続単位。**トランザクションの間はほかのスレッドの SQL を待たせる**（混ざると他人の巻き戻しに巻き込まれて消える） |
+
+- 鍵は**アプリ内課金キー**（`app_store.key_path`）。⚠ **期限は無い**。revoke されると 401 → error ログ + `relay_entitlement_verify_total{outcome="unavailable"}`
+- ⚠ **`outcome="unavailable"` が続くなら検証が止まっている**（fail-open なので状態は変わらず、metrics を見ないと気付けない）
+- 通知の URL は App Store Connect の「App Store Server Notifications」。⚠ **本番 URL は relay、サンドボックス URL は st.relay**
+
 ### 観測（[#59](https://github.com/pooza/capsicum-relay/issues/59)）
 
 `relay_register_entitlement_total{preset,entitlement,token}` が、フェーズ 3 でゲートを閉じたときに誰が止まるかを先に示す。
