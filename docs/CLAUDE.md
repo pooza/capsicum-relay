@@ -345,19 +345,29 @@ gh api -X POST   repos/pooza/capsicum-relay/branches/main/protection/enforce_adm
 
 ⚠ **ステージング（triton）を先に、本番（flauros）を後に。**ホストごとに**見るブランチが違う**。
 
-```bash
-# ステージング
-ssh deploy@triton.b-shock.local
-cd ~/repos/capsicum-relay && git pull   # develop
-bundle install
-sudo systemctl restart capsicum-relay
+⚠⚠ **`ssh` を 2 行並べてから共通のコマンドを書かない**（PR #70 の Codex P2）。最初の `ssh` が triton のシェルを開いてしまい、**残りのコマンドがそちらで動く** ＝ **本番にしか当たらず、ステージングが未デプロイのまま「両方やった」ことになる。**ステージング先という手順そのものが壊れるので、**ホストごとに完結したブロックにする。**
 
-# 本番（develop → main の PR をマージした後）
-ssh deploy@flauros.b-shock.co.jp
-cd ~/repos/capsicum-relay && git pull   # main
-bundle install
-sudo systemctl restart capsicum-relay
+```bash
+# 1. ステージング（triton・develop を追う）
+ssh deploy@triton.b-shock.local '
+  cd ~/repos/capsicum-relay &&
+  git pull &&
+  bundle install &&
+  sudo -n systemctl restart capsicum-relay
+'
 ```
+
+```bash
+# 2. 本番（flauros・main を追う）。⚠ develop → main の PR をマージし、1 の疎通確認が通ってから
+ssh deploy@flauros.b-shock.co.jp '
+  cd ~/repos/capsicum-relay &&
+  git pull &&
+  bundle install &&
+  sudo -n systemctl restart capsicum-relay
+'
+```
+
+⚠ **変更系（pull / restart）と確認系（status / log / curl）は同じ ssh セッションに混ぜない**（2026-05-28 に誤って本番を再起動した経緯がある）。
 
 ⚠ **restart 直後の `curl` は 502 を返す**（Puma が listen するまで 15〜20 秒）。下の「疎通確認」を参照。
 

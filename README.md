@@ -32,16 +32,29 @@ bundle exec rubocop
 
 ## デプロイ
 
-⚠ **ステージングを先に、本番を後に。**ホストごとに見るブランチが違う。
+⚠ **ステージングを先に、本番を後に。**ホストごとに見るブランチが違うので、**ホストごとに丸ごと 1 ブロック**で回す。
 
 ```bash
-ssh deploy@triton.b-shock.local      # develop
-ssh deploy@flauros.b-shock.co.jp     # main
-cd ~/repos/capsicum-relay
-git pull
-bundle install
-sudo systemctl restart capsicum-relay
+# 1. ステージング（triton・develop を追う）
+ssh deploy@triton.b-shock.local '
+  cd ~/repos/capsicum-relay &&
+  git pull &&
+  bundle install &&
+  sudo -n systemctl restart capsicum-relay
+'
 ```
+
+```bash
+# 2. 本番（flauros・main を追う）。⚠ 1 の疎通確認が通ってから
+ssh deploy@flauros.b-shock.co.jp '
+  cd ~/repos/capsicum-relay &&
+  git pull &&
+  bundle install &&
+  sudo -n systemctl restart capsicum-relay
+'
+```
+
+⚠⚠ **`ssh` を 2 行並べてから共通のコマンドを書かない。**最初の `ssh` が triton のシェルを開いてしまい、**残りのコマンドがそちらで動く**（＝本番にしか当たらず、ステージングが未デプロイのまま「両方やった」ことになる）。ステージング先の手順そのものが壊れる形なので、**ホストごとに完結させる。**
 
 疎通確認：
 
