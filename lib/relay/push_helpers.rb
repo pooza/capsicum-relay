@@ -218,9 +218,19 @@ module Relay
 
     def handle_push_oversized(sub, result)
       # FCM (4KB) / APNs (4KB) のペイロード上限を超えた個別メッセージ。
-      # subscription は健全なので unregister せず、Mastodon にも 413 を
-      # 返してこの 1 通だけドロップさせる。permanent: false のままだと
-      # Mastodon が retry を続けてログを汚すため、ここで明示的に止める (#9)。
+      # subscription は健全なので unregister せず、この 1 通だけ落とす (#9)。
+      #
+      # ⚠⚠ **4xx を返してはいけない (#66)。**以前は 413 を返して「この 1 通だけ
+      # ドロップさせる」意図だったが、**Mastodon は `408` / `429` 以外の 4xx
+      # すべてで購読を destroy する**（`Web::PushNotificationWorker#send`）。
+      # つまり 413 でも購読が消え、**想定と正反対**になっていた。
+      #
+      # ⚠ **429 でもない。**429 は destroy を免れるが `raise` になって sidekiq が
+      # retry する。**同じ oversized な payload は再送しても必ず失敗する。**
+      #
+      # → **200。**`dropped`（WNS の端末オフライン）と同じ意味づけで、
+      # 「受け取った・retry するな・購読は残せ」。⚠ **件数は `outcome` の
+      # ログ・counter・Sentry で見えたまま**なので、観測は落ちない。
       record_push_outcome(
         sub, 'oversized', level: :warn,
         msg: "Push oversized (subscription kept): #{sub['account']}" \
@@ -235,7 +245,6 @@ module Relay
         level: :warning,
         context: {push: push_context(sub, result)},
       )
-      status 413
       return {status: 'oversized', detail: result}.to_json
     end
 

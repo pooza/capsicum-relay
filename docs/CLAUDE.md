@@ -337,6 +337,25 @@ done
 
 ⚠ **ステージングと本番の `revision` を並べて見ると、デプロイの逆転が検出できる**（2026-09-13 に実際に検出した）。⚠ ステージングは購読が小さく `supporters` は 0 なので、数値が違っても異常ではない。
 
+### ⚠⚠ `/push` が返すステータスの選び方（[#66](https://github.com/pooza/capsicum-relay/issues/66)）
+
+**ステータスは「上流が購読を消すか」で決まる。**配信結果を素直に写してはいけない。
+
+| | 購読を消す条件 |
+| --- | --- |
+| **Mastodon** `Web::PushNotificationWorker#send` | ⚠ **`408` / `429` 以外の 4xx すべて** |
+| **Misskey** `PushNotificationService` | ⚠⚠ **`410` だけ** |
+
+| 結末 | 返す | なぜ |
+| --- | --- | --- |
+| delivered / degraded / dropped / **oversized** | **200** | 購読は健全。⚠ retry させたくないので 5xx にもしない |
+| **gone**（device token 無効） | **410** | ⚠ **意図して消す**。relay 側の行も `unregister` する |
+| failed（一過性） | **502** | 上流に retry させる。⚠ 4xx にすると retry されずに購読が消える |
+
+⚠ **意図して消したいときだけ 4xx（410）を返す。**#66 は `oversized` で 413 を返しており、「購読は健全なので残す」という**想定と正反対**に動いていた（Mastodon が destroy する）。⚠ **429 も選べない** —— destroy は免れるが `raise` になって sidekiq が retry し、**同じ oversized な payload は再送しても必ず失敗する**。
+
+`test/push_outcome_status_test.rb` が結末とステータスの対応を固定している。
+
 ### 配信不達の切り分け（journald を読む）
 
 「プッシュが届かない」を疑ったとき、**Sentry のイベント数だけで判定してはいけない**。flauros の journald には成功も失敗も残っているので、必ず突き合わせる。
