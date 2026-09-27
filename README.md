@@ -21,10 +21,22 @@ bundle exec rubocop
 テスト用の gem は `development` グループにあり、flauros は `BUNDLE_WITHOUT=development`
 なので本番には入らない。
 
+## ブランチ
+
+| ブランチ | デプロイ先 |
+| --- | --- |
+| `develop` | triton（ステージング） |
+| `main` | flauros（本番）。⚠ **PR 必須・直 push 不可** |
+
+詳細は[開発ガイドの「ブランチ運用」](docs/CLAUDE.md)。
+
 ## デプロイ
 
+⚠ **ステージングを先に、本番を後に。**ホストごとに見るブランチが違う。
+
 ```bash
-ssh deploy@flauros.b-shock.co.jp
+ssh deploy@triton.b-shock.local      # develop
+ssh deploy@flauros.b-shock.co.jp     # main
 cd ~/repos/capsicum-relay
 git pull
 bundle install

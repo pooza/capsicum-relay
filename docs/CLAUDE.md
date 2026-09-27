@@ -307,15 +307,51 @@ Windows 実機（capsicum の Windows 機能検証機）に Ruby を入れて `r
 | リバースプロキシ | nginx（HTTPS 終端、Let's Encrypt 自動更新） |
 | Puma | `127.0.0.1:9292`（nginx 背後） |
 
-### デプロイ手順
+### ⚠⚠ ブランチ運用（2026-09-27 決定・[#68](https://github.com/pooza/capsicum-relay/issues/68)）
+
+**ブランチ 2 本とホスト 2 台を 1 対 1 に対応させる。**
+
+| ブランチ | デプロイ先 | 保護 |
+| --- | --- | --- |
+| `develop` | **triton**（ステージング・`st.relay.capsicum.shrieker.net`） | なし（直 push 可） |
+| `main` | **flauros**（本番・`relay.capsicum.shrieker.net`） | ⚠⚠ **PR 必須 + `enforce_admins: true`** |
+
+```text
+feature（任意）→ develop → triton へデプロイして寝かせる
+                    ↓ PR（⚠ ここで @codex review）
+                  main → flauros へデプロイ
+```
+
+⚠⚠ **`main` へは直 push できない**（2026-09-27 に `enforce_admins: true` にした）。以前は保護が入っていても**管理者は素通りでき**、実際に [#58](https://github.com/pooza/capsicum-relay/issues/58)〜[#55](https://github.com/pooza/capsicum-relay/issues/55) の 5 回とも素通りで main へ入れてしまった。**規約では止まらなかったのでフックにした**（capsicum 側の `.claude/hooks/deny-shell-loops.sh` と同じ考え方）。
+
+⚠ **急いでいても段取りは端折れない**（2026-09-27 pooza）。緊急時に本当に直 push が要るなら **`enforce_admins` を一時的に false にしてから**入れ、**戻す**。
 
 ```bash
+gh api -X DELETE repos/pooza/capsicum-relay/branches/main/protection/enforce_admins  # 外す
+gh api -X POST   repos/pooza/capsicum-relay/branches/main/protection/enforce_admins  # 戻す
+```
+
+⚠ **Codex は `@codex review` を打った時だけ走る。**追加コミットや force-push では発火しない。⚠ 未登録リポジトリや base SHA 取得不能で**空振りする**ことがあるので、空振りなら 5 観点レビュー（capsicum の `/release-review`）に切り替える。
+
+### デプロイ手順
+
+⚠ **ステージング（triton）を先に、本番（flauros）を後に。**ホストごとに**見るブランチが違う**。
+
+```bash
+# ステージング
+ssh deploy@triton.b-shock.local
+cd ~/repos/capsicum-relay && git pull   # develop
+bundle install
+sudo systemctl restart capsicum-relay
+
+# 本番（develop → main の PR をマージした後）
 ssh deploy@flauros.b-shock.co.jp
-cd ~/repos/capsicum-relay
-git pull
+cd ~/repos/capsicum-relay && git pull   # main
 bundle install
 sudo systemctl restart capsicum-relay
 ```
+
+⚠ **restart 直後の `curl` は 502 を返す**（Puma が listen するまで 15〜20 秒）。下の「疎通確認」を参照。
 
 ### 疎通確認
 
