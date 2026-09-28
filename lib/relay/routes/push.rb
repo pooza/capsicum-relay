@@ -114,9 +114,13 @@ module Relay
         # ⚠⚠ **4xx にしてはいけない**（Mastodon が購読を destroy する・#66）。
         # ⚠ **fail-open でも 410 でもない**——「いま判定できないので、もう一度
         # 送ってくれ」。上流は 5xx を再送するので、**通知は失われない。**
+        #
+        # ⚠ **ここで metrics を足さない (#69・Codex P2 7 巡目)。**
+        # `relay_entitlement_gate_total` は [entitlement_decision] が
+        # `reason="preset_busy"` で既に 1 回数えている。ここで足すと**同じ要求を
+        # 2 回数える**ので、あの counter の合計が「判定の回数」でなくなり、
+        # ⚠ **ゲートを閉じてよいかを測る材料が濁る。**
         def halt_entitlement_busy!
-          metrics.increment('relay_entitlement_gate_total',
-            {route: 'push', decision: 'busy', reason: Relay::EntitlementGate::REASON_PRESET_BUSY})
           headers['Retry-After'] = '1'
           halt 503, {error: 'Entitlement check busy', reason: 'busy'}.to_json
         end

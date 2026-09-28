@@ -71,7 +71,7 @@ module Relay
 
       begin
         # ⚠ 枠は取れたのに予約が取れない ＝ 誰かが引いている最中 / 直前に試した。
-        return @ledger.throttled_result(host) unless @ledger.reserve(host)
+        return @ledger.throttled_outcome(host) unless @ledger.reserve(host)
 
         key = discover(host)
         # ⚠ 引けなければ negative cache（従来どおり）。手元の鍵は既に期限切れ。
@@ -94,11 +94,11 @@ module Relay
       host = allowed(server)
       return nil unless host
       # ⚠ **間隔の判定は枠の前。**I/O をしないので、枠を待たせる必要が無い。
-      return @ledger.throttled_result(host) if @ledger.throttled?(host)
+      return @ledger.throttled_outcome(host) if @ledger.throttled?(host)
       return Relay::VapidKeyLedger::BUSY unless @ledger.acquire_slot
 
       begin
-        return @ledger.throttled_result(host) unless @ledger.reserve(host)
+        return @ledger.throttled_outcome(host) unless @ledger.reserve(host)
 
         key = discover(host)
         # ⚠ **引けなかったら手元の記録を壊さない。**`failed` を立てるだけ。

@@ -196,8 +196,14 @@ class VapidKeyRefreshTest < Minitest::Test
     assert_equal('BOldKey', dir.public_key_for(HOST))
   end
 
-  # ⚠ 成功した引き直しは、間隔の中でもその鍵を返す（こちらは「最新」なので正しい）。
-  def test_a_throttled_success_returns_the_fresh_key
+  # ⚠⚠ **成功した直後でも、間隔の中では BUSY（#69・Codex P1 7 巡目）。**
+  #
+  # 🔴 **ここは 3 巡目に「最新を返す」と書いてしまい、不具合を正しい挙動として
+  # 固定していた。**「引けた鍵」と「**いま引き直した**鍵」は違う ——
+  # **引いた 60 秒の間にサーバーが VAPID を作り直すと、手元の鍵は既に古い。**
+  # それを「引き直した結果」として返すと、呼び出し側が**本物の新しい鍵を詐称と
+  # 判定し、410 で上流の購読を永久に消す。**
+  def test_a_throttled_success_is_busy_not_a_confirmation
     now = 1000.0
     body = mastodon_body('BOldKey')
     dir, = directory({MASTODON_URL => -> {body}}, clock: -> {now})
@@ -206,8 +212,9 @@ class VapidKeyRefreshTest < Minitest::Test
     body = mastodon_body('BNewKey')
     now += 61
 
-    assert_equal('BNewKey', dir.refresh_key_for(HOST))
-    assert_equal('BNewKey', dir.refresh_key_for(HOST), '間隔の中でも最新を返す')
+    assert_equal('BNewKey', dir.refresh_key_for(HOST), '間隔が明けたので引き直せる')
+    # ⚠ ここで「BNewKey」を返すと、**その 60 秒の間に更新された鍵を詐称と判定する。**
+    assert_equal(BUSY, dir.refresh_key_for(HOST), '間隔の中は確認したことにしない')
   end
 
   # ⚠⚠ **同時要求でも 1 本しか出さない。**枠を I/O の前に押さえていないと、

@@ -94,19 +94,27 @@ module Relay
       end
     end
 
-    # 間隔のあいだに来た要求への答え。
+    # 間隔のあいだに来た要求への答え。⚠ **手元の鍵は絶対に返さない。**
     #
-    # ⚠⚠ **直前の試みが失敗なら nil、引いている最中なら [BUSY]。**手元の古い鍵を
-    # 返すと、呼び出し側が**引き直した結果**と読んで詐称判定に倒し、410 で購読が
-    # 消える。⚠ **2 つを畳むと、競合が外部障害として fail-open される。**
-    def throttled_result(host)
+    # | 直前の試み | 戻り値 | 呼び出し側 |
+    # | --- | --- | --- |
+    # | **失敗した** | `nil` | ⚠ 外部の障害 → fail-open |
+    # | それ以外（引いている最中 / 成功した） | [BUSY] | ⚠⚠ 競合 → 再試行させる |
+    #
+    # ⚠⚠ **成功した直後でも [BUSY] を返す (#69・Codex P1 7 巡目)。**
+    # 「引けた鍵」と「**いま引き直した**鍵」は違う —— **引いた 60 秒の間に
+    # サーバーが VAPID を作り直すと、手元の鍵は既に古い。**それを「引き直した
+    # 結果」として返すと、呼び出し側が**本物の新しい鍵を詐称と判定し、410 で
+    # 上流の購読を永久に消す。**
+    #
+    # ⚠ **3 巡目で `failed` について直したのと同じ穴が、`ok` に残っていた。**
+    def throttled_outcome(host)
       return @mon.synchronize do
         entry = @entries[host]
         next nil if entry.nil?
-        next BUSY if entry[STATE] == IN_FLIGHT
         next nil if entry[STATE] == FAILED
 
-        entry[KEY]
+        BUSY
       end
     end
 

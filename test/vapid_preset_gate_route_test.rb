@@ -400,4 +400,40 @@ class VapidPresetGateRouteTest < RequestTestCase
 
     refute_equal('busy', json_response['reason'])
   end
+
+  # --- ⚠⚠ 7 巡目の Codex（間隔の中の不一致を 410 にしていた） -------------
+
+  # ⚠⚠ **引いた 60 秒の間に鍵が更新されると、本物が詐称扱いになっていた。**
+  #
+  # 手元は古い鍵、引き直しは間隔の中なので走らない —— そこで「引き直した結果と
+  # 一致しない」と読んで **410 で購読を永久に消していた。**⚠ 正解は **503**
+  # （いま確認できないので、もう一度送ってくれ）。
+  def test_a_mismatch_inside_the_throttle_window_is_retryable
+    Relay::BaseApp.set(:vapid_keys, BusyDirectory.new(PRESET, encode(@key)))
+
+    with_enforce do
+      refute_equal(410, push_claiming_preset(authorization: vapid_header(@other)))
+    end
+
+    assert_equal('busy', json_response['reason'])
+  end
+
+  # ⚠ 二重計上しない（#69・Codex P2 7 巡目）。⚠⚠ **濁ると「ゲートを閉じてよいか」
+  # を測る材料にならない。**
+  def test_a_busy_request_is_counted_once
+    Relay::BaseApp.set(:vapid_keys, BusyDirectory.new(PRESET, encode(@key)))
+    with_enforce {push_claiming_preset(authorization: vapid_header(@other))}
+
+    assert_equal(
+      1,
+      metrics.value('relay_entitlement_gate_total',
+        {route: 'push', decision: 'deny', reason: 'preset_busy'}),
+    )
+    assert_equal(
+      0,
+      metrics.value('relay_entitlement_gate_total',
+        {route: 'push', decision: 'busy', reason: 'preset_busy'}),
+      '同じ要求を 2 回数えない',
+    )
+  end
 end
