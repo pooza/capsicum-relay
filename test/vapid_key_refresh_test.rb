@@ -14,6 +14,8 @@ require 'relay/vapid_key_directory'
 class VapidKeyRefreshTest < Minitest::Test
   HOSTS = ['mstdn.b-shock.org'].freeze
   MASTODON_URL = 'https://mstdn.b-shock.org/api/v2/instance'.freeze
+  OTHER_HOST = 'precure.ml'.freeze
+  OTHER_MASTODON_URL = 'https://precure.ml/api/v2/instance'.freeze
   HOST = 'mstdn.b-shock.org'.freeze
 
   # 呼ばれた URL を覚える偽の HTTP。[responses] は URL => body（Proc も可）。
@@ -271,5 +273,64 @@ class VapidKeyRefreshTest < Minitest::Test
     assert_equal('BColdKey', dir.public_key_for(HOST))
     assert_equal('BColdKey', dir.public_key_for(HOST))
     assert_equal(1, fetch.calls.size)
+  end
+
+  # --- ⚠⚠ 5 巡目の Codex P1（枠がホストごとだけだった） ------------------
+
+  # ⚠⚠ **別のホストを名乗る 2 件で受け口が埋まっていた。**
+  #
+  # ホストごとの予約は**同じホスト**しか直列化しない。⚠ **puma は 2 スレッド**
+  # なのに一覧には **9 ホスト**あるので、2 件同時で relay が push を 1 通も
+  # 受け付けられなくなる。⚠ **クライアントは好きなホストを名乗れる**ので、
+  # 攻撃者がこれを起こせる。
+  def test_discovery_is_capped_across_different_hosts
+    entered = Queue.new
+    release = Queue.new
+    slow = lambda do
+      entered << true
+      release.pop
+      mastodon_body('BKey')
+    end
+    counter = FakeFetch.new({MASTODON_URL => slow, OTHER_MASTODON_URL => slow})
+    dir = Relay::VapidKeyDirectory.new(
+      hosts: [HOST, OTHER_HOST], fetch: counter.to_proc,
+    )
+    fetch = counter
+
+    first = Thread.new {dir.public_key_for(HOST)}
+    entered.pop # 1 本目が I/O に入るまで待つ
+
+    # ⚠⚠ **別ホストでも I/O に入ってはいけない。**
+    assert_nil(dir.public_key_for(OTHER_HOST), '別ホストでも全体の枠で止まる')
+    assert_equal(1, fetch.calls.size, '外向き HTTP は 1 本だけ')
+
+    release << true
+
+    assert_equal('BKey', first.value)
+  end
+
+  # ⚠ 全体の枠が取れなかっただけで、そのホストの枠を焼かない。
+  # 焼くと、引いてもいないのに 60 秒引き直せなくなる。
+  def test_a_lost_global_slot_does_not_burn_the_host_slot
+    entered = Queue.new
+    release = Queue.new
+    slow = lambda do
+      entered << true
+      release.pop
+      mastodon_body('BKey')
+    end
+    counter = FakeFetch.new({MASTODON_URL => slow, OTHER_MASTODON_URL => mastodon_body('BOther')})
+    dir = Relay::VapidKeyDirectory.new(hosts: [HOST, OTHER_HOST], fetch: counter.to_proc)
+
+    first = Thread.new {dir.public_key_for(HOST)}
+    entered.pop
+
+    assert_nil(dir.public_key_for(OTHER_HOST), '全体の枠が無いので今は引けない')
+
+    release << true
+    first.value
+
+    # ⚠ 枠が空いたら、間隔を待たずに引ける。
+    assert_equal('BOther', dir.public_key_for(OTHER_HOST))
   end
 end

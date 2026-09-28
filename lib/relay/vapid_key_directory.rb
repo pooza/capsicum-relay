@@ -1,9 +1,9 @@
 require 'json'
-require 'monitor'
 require 'net/http'
 require 'uri'
 require_relative 'preset_servers'
 require_relative 'vapid_assertion'
+require_relative 'vapid_key_ledger'
 
 module Relay
   # プリセットサーバーの VAPID 公開鍵を引いて覚えておく (#69)。
@@ -15,7 +15,9 @@ module Relay
   #
   # ⚠ **鍵は自動で追随させる。**9 ホストぶんを設定ファイルへ手で貼ると、
   # [Relay::PresetServers] の一覧と同じ「2 か所に同じものがある」形が増える。
-  # 鍵はサーバーの公開 API から取れる（2026-09-28 に 4 サーバーで実測）:
+  # 鍵はサーバーの公開 API から取れる（2026-09-28 に 9 ホストで実測。8 つで
+  # 引けた —— `st2.misskey.delmulin.com` だけ `swPublickey` が null で、
+  # **ステージングの Misskey は VAPID 未設定＝そもそも push を送れない**）:
   #
   # | | エンドポイント | 場所 |
   # | --- | --- | --- |
@@ -27,28 +29,9 @@ module Relay
   # ⚠⚠ **引けなかったことと「鍵が違う」ことを混ぜない。**引けないのは**こちらの
   # 障害**で、そのときゲートは fail-open で通す（[Relay::EntitlementGate]）。
   # ここは **nil を返すだけ**で、倒し方は呼び出し側が決める。
+  #
+  # ⚠ **記録と枠は [Relay::VapidKeyLedger] が持つ。**ここは「どう引くか」だけ。
   class VapidKeyDirectory
-    # 引き直す間隔。⚠ **鍵の更新は滅多に起きない**（サーバーの VAPID を作り直した
-    # ときだけ）ので長くてよい。⚠ **短くすると push 1 通ごとの外向き HTTP が増える。**
-    DEFAULT_TTL = 6 * 60 * 60
-    # 引けなかったときに次に試すまで。⚠ **落ちているサーバーを叩き続けない。**
-    DEFAULT_NEGATIVE_TTL = 10 * 60
-    # [refresh_key_for] を続けて呼ばれたときに、実際に引き直す最短間隔。
-    #
-    # ⚠⚠ **これが無いと DoS の踏み台になる。**引き直しは「鍵が合わない push が
-    # 来た」ときに走るので、**合わない鍵で叩き続けるだけでプリセットサーバーへ
-    # 好きなだけ HTTP を出させられる。**
-    MIN_REFRESH_INTERVAL = 60
-    # 記録は `[鍵, 期限, 引き直しを試みた時刻, その試みが失敗したか]`。
-    #
-    # ⚠ **4 つ目は「引き直し」だけのための印。**[public_key_for] の経路は見ない
-    # （手元の鍵は期限まで有効で、引き直しの成否とは別の話）。
-    KEY = 0
-    EXPIRES_AT = 1
-    ATTEMPTED_AT = 2
-    FAILED = 3
-    private_constant :KEY, :EXPIRES_AT, :ATTEMPTED_AT, :FAILED
-
     # ⚠ **短くする。**push の受け口の中で引くので、ここで待つとキューに積むのが遅れる。
     OPEN_TIMEOUT = 3
     READ_TIMEOUT = 3
@@ -56,38 +39,36 @@ module Relay
     # [hosts] は引いてよいホスト（プリセット + `extra_preset_hosts`）。
     # [fetch] はテスト用の差し替え口で、`->(uri, payload) { body or nil }`。
     # payload が nil なら GET、文字列なら JSON の POST。
-    # ⚠ [MIN_REFRESH_INTERVAL] は注入できるようにしていない。テストは [clock] を
-    # 進めれば足りるし、**運用で緩める値ではない**（緩めると DoS の踏み台になる）。
-    def initialize(hosts:, ttl: DEFAULT_TTL, negative_ttl: DEFAULT_NEGATIVE_TTL,
+    def initialize(hosts:, ttl: Relay::VapidKeyLedger::DEFAULT_TTL,
+      negative_ttl: Relay::VapidKeyLedger::DEFAULT_NEGATIVE_TTL,
       fetch: nil, clock: -> {Time.now.to_f})
       @hosts = Array(hosts).map {|host| Relay::PresetServers.normalize(host)}.reject(&:empty?).to_set
-      @ttl = ttl
-      @negative_ttl = negative_ttl
       @fetch = fetch || method(:http_fetch)
-      @clock = clock
-      @cache = {}
-      @mon = Monitor.new
+      @ledger = Relay::VapidKeyLedger.new(ttl: ttl, negative_ttl: negative_ttl, clock: clock)
     end
 
     # 引けたら base64url（パディング無し）に揃えた公開鍵、引けなければ nil。
     #
-    # ⚠⚠ **ここも I/O の前に枠を押さえる (#69・PR #77 の Codex P1 4 巡目)。**
-    # 単発化を [refresh_key_for] にしか入れていなかったので、**起動直後や
-    # 期限切れの瞬間に来た同時要求が全部 `discover` に入れた** —— 相手が落ちて
-    # いると、**puma のスレッドが揃って timeout を待つ**形が残っていた。
+    # ⚠⚠ **枠は 2 段階。プロセス全体 → ホストごと、の順に押さえる (#69・Codex P1)。**
+    # 順を逆にすると、**全体の枠が取れなかったときにホストの枠だけ焼く**ので、
+    # 引いてもいないのに 60 秒間そのホストが引き直せなくなる。
     #
     # ⚠ **枠が取れなければ nil**（誰かが引いている最中 / 直前に試して失敗した）。
     # 呼び出し側は fail-open に倒す。
     def public_key_for(server)
       host = allowed(server)
       return nil unless host
+      return @ledger.read(host) if @ledger.fresh?(host)
+      return nil unless @ledger.acquire_slot
 
-      cached = read_cache(host)
-      return cached[KEY] if cached
-      return nil unless reserve_fetch(host)
+      begin
+        return nil unless @ledger.reserve(host)
 
-      # ⚠ 引けなければ negative cache（従来どおり）。手元の鍵は既に期限切れ。
-      return store(host, discover(host))
+        # ⚠ 引けなければ negative cache（従来どおり）。手元の鍵は既に期限切れ。
+        return @ledger.store(host, discover(host))
+      ensure
+        @ledger.release_slot
+      end
     end
 
     # ⚠⚠ **鍵が合わなかったときに 1 度だけ引き直す (#69・PR #77 の Codex P1)。**
@@ -100,34 +81,32 @@ module Relay
     # 戻り値は **引き直せた鍵**。⚠ **引き直せなかったら nil**（呼び出し側は
     # fail-open に倒す）—— 古い鍵をそのまま返すと、⚠ **上の事故がそのまま起きる。**
     #
-    # ⚠ **[MIN_REFRESH_INTERVAL] のあいだは引き直さず、直前の結果を返す。**
-    #
-    # ⚠⚠ **直前が失敗なら、間隔のあいだは nil を返し続ける (#69・Codex P1 3 巡目)。**
-    # 手元の古い鍵を返すと、呼び出し側がそれを**引き直した結果**と読んで
-    # `mismatch` に倒し、**410 で購読が消える** —— 障害中に fail-open になるのは
-    # 最初の 1 通だけ、という形になっていた。
-    #
-    # ⚠⚠ **枠は I/O の前に押さえる (#69・Codex P1 3 巡目)。**押さえる前に
-    # `discover` を走らせていたので、**間隔が明けた直後に来た同時要求が全部
-    # 素通りして、puma のスレッドぶん一斉に外向き HTTP を出していた。**
-    # 1 ホストあたり 60 秒に 1 本、を**並行でも**守る。
+    # ⚠⚠ **直前が失敗なら、間隔のあいだは nil を返し続ける** —— 手元の古い鍵を
+    # 返すと、呼び出し側がそれを**引き直した結果**と読んで詐称判定に倒す。
     def refresh_key_for(server)
       host = allowed(server)
       return nil unless host
-      return throttled_result(host) unless reserve_fetch(host)
+      # ⚠ **間隔の判定は枠の前。**I/O をしないので、枠を待たせる必要が無い。
+      return @ledger.throttled_result(host) if @ledger.throttled?(host)
+      return nil unless @ledger.acquire_slot
 
-      key = discover(host)
-      # ⚠ **引けなかったら手元の記録を壊さない。**negative cache で上書きすると、
-      # 一時的な通信障害のあとに「鍵が無い」状態が居座る。⚠ 予約の時点で
-      # 「失敗」を立ててあるので、間隔が明けるまでは nil が返る。
-      return nil if key.nil?
+      begin
+        return @ledger.throttled_result(host) unless @ledger.reserve(host)
 
-      return store(host, key)
+        key = discover(host)
+        # ⚠ **引けなかったら手元の記録を壊さない。**予約の時点で「失敗」を
+        # 立ててあるので、間隔が明けるまでは nil が返る。
+        return nil if key.nil?
+
+        return @ledger.store(host, key)
+      ensure
+        @ledger.release_slot
+      end
     end
 
     # テストと、設定を読み直したときのための口。
     def reset!
-      @mon.synchronize {@cache.clear}
+      @ledger.clear
     end
 
     private
@@ -136,57 +115,6 @@ module Relay
     def allowed(server)
       host = Relay::PresetServers.normalize(server)
       return @hosts.include?(host) ? host : nil
-    end
-
-    def read_cache(host)
-      return @mon.synchronize do
-        entry = @cache[host]
-        next nil if entry.nil?
-        next nil if entry[EXPIRES_AT] < @clock.call
-
-        entry
-      end
-    end
-
-    # ⚠⚠ **I/O の前に枠を押さえる。**チェックと更新を 1 つの critical section に
-    # 入れないと、**間隔が明けた直後の同時要求が全部素通りする**（Codex P1 3 巡目）。
-    #
-    # ⚠ **悲観的に「失敗」を立ててから出ていく。**引いている最中に来た要求には
-    # nil を返したい（＝ fail-open）ので、成功したときに [store] が倒す。
-    def reserve_fetch(host)
-      now = @clock.call
-      return @mon.synchronize do
-        entry = @cache[host]
-        next false if entry && (now - entry[ATTEMPTED_AT]) < MIN_REFRESH_INTERVAL
-
-        @cache[host] = if entry.nil?
-          [nil, now + @negative_ttl, now, true]
-        else
-          [entry[KEY], entry[EXPIRES_AT], now, true]
-        end
-        true
-      end
-    end
-
-    # 間隔のあいだに来た要求への答え。
-    #
-    # ⚠⚠ **直前の試みが失敗（または進行中）なら nil。**手元の古い鍵を返すと、
-    # 呼び出し側が**引き直した結果**と読んで詐称判定に倒し、410 で購読が消える。
-    def throttled_result(host)
-      return @mon.synchronize do
-        entry = @cache[host]
-        next nil if entry.nil?
-        next nil if entry[FAILED]
-
-        entry[KEY]
-      end
-    end
-
-    def store(host, key)
-      ttl = key.nil? ? @negative_ttl : @ttl
-      now = @clock.call
-      @mon.synchronize {@cache[host] = [key, now + ttl, now, false]}
-      return key
     end
 
     # ⚠ **Mastodon → Misskey の順に試す。**どちらでもなければ nil。
