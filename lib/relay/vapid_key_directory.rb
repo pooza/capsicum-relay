@@ -76,11 +76,11 @@ module Relay
       host = allowed(server)
       return nil unless host
       return @ledger.read(host) if @ledger.fresh?(host)
-      return stale_or(host, Relay::VapidKeyLedger::BUSY) unless @ledger.acquire_slot
+      return Relay::VapidKeyLedger::BUSY unless @ledger.acquire_slot
 
       begin
         # ⚠ 枠は取れたのに予約が取れない ＝ 誰かが引いている最中 / 直前に試した。
-        return stale_or(host, @ledger.throttled_outcome(host)) unless @ledger.reserve(host)
+        return @ledger.throttled_outcome(host) unless @ledger.reserve(host)
 
         key = discover(host)
         # ⚠ 引けなければ negative cache（従来どおり）。手元の鍵は既に期限切れ。
@@ -130,28 +130,19 @@ module Relay
       return @ledger.retry_after(host)
     end
 
-    # 鍵の温まり具合（#78）。`{fresh:, held:, total:}`。
+    # 鍵の温まり具合（#78）。`{fresh:, total:}`。
     #
     # ⚠⚠ **先読みが効いたかを外から見るための口。**これが無いと、
     # **`warm!` が空振りしていても気付けない**（[warm!] は無言で、
     # `relay_vapid_verification_total` は push が来るまで 1 件も出ない）。
     #
-    # ⚠⚠ **`fresh` と `held` を分ける（PR #79 の Codex P2）。**畳むと
+    # ⚠ **数えるのは期限内の鍵だけ**（PR #79 の Codex P2）。期限切れを混ぜると
     # **TTL が切れても数字が動かず、「冷えている」が読めない。**
     #
-    # | | 数えるもの | 答える問い |
-    # | --- | --- | --- |
-    # | `fresh` | **期限内**の鍵 | ⚠ 次の照合で**引き直しが要るか**（TTL 切れの検出） |
-    # | `held` | 期限を問わず**手元にある**鍵 | ⚠⚠ **`busy` になり得るか**（[stale_or] が使うのと同じ基準） |
-    #
-    # ⚠ **2 つはずれる。**期限が切れても手元の鍵は残るので `held` は減らない ——
-    # **そのぶん `busy` にはならないが、引き直しは走る。**
+    # ⚠⚠ **`fresh` が `total` を下回っている ＝ そのホスト宛の push は `busy`
+    # （503）になり得る。**🔴 Misskey は 5xx を再送しないので通知が消える。
     def cached_counts
-      return {
-        fresh: @hosts.count {|host| !@ledger.read(host).nil?},
-        held: @hosts.count {|host| !@ledger.stale_key(host).nil?},
-        total: @hosts.size,
-      }
+      return {fresh: @hosts.count {|host| !@ledger.read(host).nil?}, total: @hosts.size}
     end
 
     # ⚠⚠ **起動時にプリセットの鍵を引いておく (#78)。**
@@ -231,22 +222,6 @@ module Relay
       return json.is_a?(Hash) ? json : nil
     rescue JSON::ParserError
       return nil
-    end
-
-    # 枠が取れなかったときの答え。⚠⚠ **手元に鍵があるなら、期限が切れていても
-    # それを返して `busy` を出さない (#78)。**
-    #
-    # 🔴 **`busy`（503）は Misskey 宛だと通知が消える** —— `.catch` が 410 しか
-    # 見ていない（2026-09-28 に 2026.9.1 のソースで確認）。Mastodon は `retry: 5`
-    # で再送するので遅れるだけ。**弱いほうに合わせる。**
-    #
-    # ⚠ **穴にはならない。**返した鍵が合わなければ呼び出し側が
-    # [refresh_key_for] へ進むので、鍵の更新はそちらで拾う。
-    # ⚠ [fallback] は経路ごとに違う（枠なし ＝ `BUSY` / 予約なし ＝ 直前の結末）。
-    # **畳まないこと** —— 畳むと「外部障害」と「競合」が混ざる。
-    def stale_or(host, fallback)
-      stale = @ledger.stale_key(host)
-      return stale.nil? ? fallback : stale
     end
 
     # ⚠ ヘッダ側と同じ形へ揃えてから覚える（[Relay::VapidAssertion.normalize_key]）。

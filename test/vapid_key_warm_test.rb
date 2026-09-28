@@ -20,7 +20,9 @@ require 'relay/vapid_key_ledger'
 # ⚠ **この検査の期待値が逆だったら:** `busy` が出っぱなしになり、enforce 下で
 # **Misskey 宛の通知が再起動のたびに落ちる。**
 class VapidKeyWarmTest < Minitest::Test
-  HOSTS = ['mstdn.b-shock.org', 'misskey.delmulin.com'].freeze
+  HOST_A = 'mstdn.b-shock.org'.freeze
+  HOST_B = 'misskey.delmulin.com'.freeze
+  HOSTS = [HOST_A, HOST_B].freeze
   KEY_A, KEY_B = VapidTestKeys.generate(2)
   MASTODON_URL = 'https://mstdn.b-shock.org/api/v2/instance'.freeze
   MISSKEY_URL = 'https://misskey.delmulin.com/api/meta'.freeze
@@ -103,7 +105,7 @@ class VapidKeyWarmTest < Minitest::Test
     dir, = directory(bodies)
     dir.warm!
 
-    assert_equal({fresh: 2, held: 2, total: 2}, dir.cached_counts, '返った時点で温まっている')
+    assert_equal({fresh: 2, total: 2}, dir.cached_counts, '返った時点で温まっている')
   end
 
   # ⚠⚠ **ただし無制限には待たない。**ホストが落ちていると 1 台で最大 12 秒かかり、
@@ -116,11 +118,11 @@ class VapidKeyWarmTest < Minitest::Test
     waited = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
 
     assert_operator(waited, :<, 0.2, '上限で待つのをやめる')
-    refute_equal({fresh: 2, held: 2, total: 2}, dir.cached_counts, 'まだ温め終えていない')
+    refute_equal({fresh: 2, total: 2}, dir.cached_counts, 'まだ温め終えていない')
 
     thread.join
 
-    assert_equal({fresh: 2, held: 2, total: 2}, dir.cached_counts, '背景で続きが進む')
+    assert_equal({fresh: 2, total: 2}, dir.cached_counts, '背景で続きが進む')
   end
 
   # ⚠⚠ **直列に引く。**並列にすると push の受け口と枠を奪い合う。
@@ -140,13 +142,19 @@ class VapidKeyWarmTest < Minitest::Test
     assert_nil(dir.public_key_for('mstdn.b-shock.org'))
   end
 
-  # --- ⚠⚠ 枠が取れないときに手元の鍵を使う -------------------------------
+  # --- 🔴 期限切れの鍵で認証させない（PR #79 の締めの Codex P1） -----------
 
-  # ⚠⚠ **期限が切れていても、手元に鍵があれば `busy` にしない。**
+  # 🔴 **鍵が漏れてローテーションされた場合を考える。**期限切れの鍵を「枠が
+  # 取れなかったから」という理由で照合に使うと、⚠⚠ **攻撃者は別のホストで枠を
+  # 占有し続けるだけで、捨てたはずの鍵を無期限に通せる。**
   #
-  # 手順: A を引く → 期限切れにする → **別スレッドが B を引いて枠を占有** →
-  # そのあいだに A を訊く。従来はここが `busy` だった。
-  def test_an_expired_key_is_served_instead_of_busy_when_the_slot_is_taken
+  # ⚠ `classify_preset_claim` は**一致した時点で `verified`** にして
+  # `refresh_key_for` を呼ばないので、「合わなければ引き直す」では守れない。
+  #
+  # ⚠ **`busy`（503）を返すほうを選ぶ。**🔴 Misskey は 5xx を再送しないので
+  # 通知は落ちるが、**失効した資格情報が通り続けるほうが重い。**冷えた窓は
+  # [warm!] で消してある。
+  def test_an_expired_key_is_not_used_for_matching_under_contention
     now = 1000.0
     entered = Queue.new
     release = Queue.new
@@ -161,19 +169,19 @@ class VapidKeyWarmTest < Minitest::Test
       hosts: HOSTS, fetch: fetch, ttl: 60, clock: -> {now},
     )
 
-    assert_equal(KEY_A, dir.public_key_for('mstdn.b-shock.org'))
+    assert_equal(KEY_A, dir.public_key_for(HOST_A))
 
     now += 61 # ⚠ 期限切れ。引き直しの間隔（60 秒）も明けている
-    held = Thread.new {dir.public_key_for('misskey.delmulin.com')}
+    other = Thread.new {dir.public_key_for(HOST_B)}
     entered.pop # B を引いている最中＝枠は埋まっている
 
     assert_equal(
-      KEY_A, dir.public_key_for('mstdn.b-shock.org'),
-      '期限切れでも手元の鍵を返す（busy にしない）'
+      BUSY, dir.public_key_for(HOST_A),
+      '期限切れの鍵は照合に使わない（失効した鍵が通り続けるのを防ぐ）'
     )
 
     release << true
-    held.join
+    other.join
   end
 
   # ⚠⚠ **一度も引けていないホストは `busy` のまま。**手元に鍵が無いのに通すと
@@ -207,14 +215,14 @@ class VapidKeyWarmTest < Minitest::Test
   def test_cached_counts_starts_empty
     dir, = directory(bodies)
 
-    assert_equal({fresh: 0, held: 0, total: 2}, dir.cached_counts)
+    assert_equal({fresh: 0, total: 2}, dir.cached_counts)
   end
 
   def test_cached_counts_rises_after_warm
     dir, = directory(bodies)
     dir.warm!.join
 
-    assert_equal({fresh: 2, held: 2, total: 2}, dir.cached_counts)
+    assert_equal({fresh: 2, total: 2}, dir.cached_counts)
   end
 
   # ⚠ 引けなかったホストは数に入らない（negative cache を「持っている」にしない）。
@@ -222,18 +230,17 @@ class VapidKeyWarmTest < Minitest::Test
     dir, = directory({MASTODON_URL => bodies[MASTODON_URL]})
     dir.warm!.join
 
-    assert_equal({fresh: 1, held: 1, total: 2}, dir.cached_counts)
+    assert_equal({fresh: 1, total: 2}, dir.cached_counts)
   end
 
-  # ⚠⚠ **TTL が切れたら `fresh` は減り、`held` は残る（PR #79 の Codex P2）。**
+  # ⚠⚠ **TTL が切れたら `fresh` が減る（PR #79 の Codex P2）。**
   #
-  # ⚠ **この 2 つを畳むと、「冷えている」が監視から読めなくなる** —— 期限切れでも
-  # 手元の鍵は残るので、畳んだ数字は**永久に満室のまま**になる。
+  # ⚠ 期限切れを混ぜて数えると、**手元の鍵は残るので数字が永久に満室のまま**に
+  # なり、「冷えている」が監視から読めない。
   #
-  # ⚠ 2 つはそれぞれ別の問いに答える:
-  #   `fresh` が減った ＝ 次の照合で引き直しが走る
-  #   `held` が減った ＝ ⚠⚠ **`busy`（503）になり得る**
-  def test_an_expired_key_lowers_fresh_but_not_held
+  # ⚠ `fresh` が `total` を下回った ＝ ⚠⚠ **そのホスト宛の push は `busy` に
+  # なり得る**（期限切れの鍵は照合に使わないため）。
+  def test_an_expired_key_lowers_fresh
     now = 1000.0
     fetch = FakeFetch.new(bodies)
     dir = Relay::VapidKeyDirectory.new(
@@ -241,13 +248,10 @@ class VapidKeyWarmTest < Minitest::Test
     )
     dir.warm!
 
-    assert_equal({fresh: 2, held: 2, total: 2}, dir.cached_counts)
+    assert_equal({fresh: 2, total: 2}, dir.cached_counts)
 
     now += 61
 
-    assert_equal(
-      {fresh: 0, held: 2, total: 2}, dir.cached_counts,
-      '期限切れでも手元には残る（busy にはならないが引き直しは走る）'
-    )
+    assert_equal({fresh: 0, total: 2}, dir.cached_counts, '期限が切れたら数字が動く')
   end
 end

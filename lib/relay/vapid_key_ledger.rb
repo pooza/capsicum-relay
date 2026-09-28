@@ -89,22 +89,6 @@ module Relay
       end
     end
 
-    # 期限が切れていても**手元にある鍵**。無ければ nil（#78）。
-    #
-    # ⚠⚠ **[BUSY] を返す代わりに使う。**枠を取れなかっただけで `busy`（503）を
-    # 返すと、🔴 **Misskey は 5xx を再送しないので通知が黙って消える**
-    # （`PushNotificationService.ts` の `.catch` は 410 しか見ていない。
-    # 2026-09-28 に 2026.9.1 のソースで確認）。Mastodon は `retry: 5` で再送する。
-    #
-    # ⚠ **穴にはならない。**返した鍵が合わなければ呼び出し側は
-    # [Relay::VapidKeyDirectory#refresh_key_for] へ進むので、**鍵の更新は拾える。**
-    # ⚠⚠ **引き直しの経路（[throttled_outcome]）では絶対にこれを使わないこと** ——
-    # あちらで手元の鍵を「引き直した結果」として返すと、本物の新しい鍵を詐称と
-    # 判定して 410 を返す（Codex P1 7 巡目で塞いだ穴）。
-    def stale_key(host)
-      return @mon.synchronize {@entries[host]&.[](KEY)}
-    end
-
     # 間隔の中か（[MIN_REFRESH_INTERVAL]）。⚠ I/O をしないので枠の前に見てよい。
     def throttled?(host)
       now = @clock.call
