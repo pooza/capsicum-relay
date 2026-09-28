@@ -8,3 +8,6 @@ shared_secret: "test-secret"
 # 0 で polling worker を無効化する。テストプロセスに常駐スレッドを残さない。
 announcement:
   poll_interval: 0
+
+# VAPID の aud (#69)。⚠ Rack::Test は example.org を名乗る。
+relay_audience: "http://example.org"

@@ -45,14 +45,31 @@ module Relay
       return not_checked unless route == 'push'
       return not_checked unless claims_preset?(subscription)
 
+      audience = relay_audience
+      # ⚠⚠ **宛先を決められないなら、裏取りができたことにしない (#69・Codex P1 2 巡目)。**
+      # 詳細は [relay_audience] の doc。
+      return unverifiable_without_audience(subscription) if audience.empty?
+
       assertion = Relay::VapidAssertion.verify(
         authorization: request.env['HTTP_AUTHORIZATION'],
         crypto_key: request.env['HTTP_CRYPTO_KEY'],
-        audience: relay_audience,
+        audience: audience,
       )
       verification = classify_preset_claim(subscription['server'], assertion)
       record_vapid_verification(subscription, assertion: assertion, verification: verification)
       return verification
+    end
+
+    # `relay_audience` が無いので判定できない。⚠ **fail-open**（本物を止めない）
+    # だが、**`outcome` を分けて記録する** —— 「鍵が引けない」と混ぜると、
+    # ⚠⚠ **設定漏れでゲートが効いていないことに気付けなくなる。**
+    def unverifiable_without_audience(subscription)
+      unavailable = Relay::EntitlementGate::PRESET_UNAVAILABLE
+      assertion = Relay::VapidAssertion::Result.new(outcome: 'audience_unconfigured')
+      record_vapid_verification(
+        subscription, assertion: assertion, verification: unavailable
+      )
+      return unavailable
     end
 
     def claims_preset?(subscription)
@@ -63,18 +80,28 @@ module Relay
 
     # この relay の origin。VAPID の `aud` と突き合わせる (#69)。
     #
-    # ⚠⚠ **`aud` を見ないと、他所宛ての署名を貼り直す迂回が通る**
-    # （[Relay::VapidAssertion::OUTCOME_AUDIENCE_MISMATCH]）。
+    # ⚠⚠ **設定からしか取らない。リクエストのヘッダから組んではいけない。**
     #
-    # ⚠ **nginx の前段を見る。**`X-Forwarded-Proto` が無いと `http` を名乗って
-    # しまい、**本物の push が全部 audience_mismatch になる。**
-    # ⚠ 経路が変則なとき（別名でも受ける等）は設定の `relay_audience` で上書きする。
+    # 2026-09-28 に一度 `X-Forwarded-Proto` + `Host` から組んで**迂回を作った**
+    # （PR #77 の Codex P1・2 巡目）。Rack の `request.host` は
+    # **`X-Forwarded-Host` を見る**うえ、`config/nginx.conf.sample` は
+    # そのヘッダを**消していない**。つまり:
+    #
+    # 1. 攻撃者がプリセットサーバーで `https://attacker.example` 宛ての購読を作り、
+    #    **本物の鍵で署名された `Authorization` を受け取る**
+    # 2. それを `X-Forwarded-Host: attacker.example` を添えてこの relay へ送る
+    # 3. ⚠⚠ **こちらが組む期待値まで攻撃者の値になるので、照合が素通りする**
+    #
+    # → **`aud` の検査は、期待値が要求と独立でなければ意味が無い。**
+    #
+    # ⚠ **未設定なら「判定できない」に倒す**（[unverifiable_without_audience]）。
+    # 勝手に組んで「検査したつもり」になるほうが危ない。
+    #
+    # 戻り値は正規化前の配列（1 台で複数の名前を受けることがある）。
     def relay_audience
-      configured = settings.config['relay_audience']
-      return configured unless configured.to_s.strip.empty?
-
-      scheme = request.env['HTTP_X_FORWARDED_PROTO'] || request.scheme
-      return "#{scheme}://#{request.host}"
+      return Array(settings.config['relay_audience'])
+          .map {|value| value.to_s.strip}
+          .reject(&:empty?)
     end
 
     # ⚠⚠ **順序が意味を持つ。**鍵が引けないときは、署名の有無に関わらず

@@ -92,7 +92,12 @@ module Relay
       key = discover(host)
       # ⚠ **引けなかったら手元の記録を壊さない。**negative cache で上書きすると、
       # 一時的な通信障害のあとに「鍵が無い」状態が居座る。
-      return nil if key.nil?
+      #
+      # ⚠⚠ **ただし「試した時刻」は必ず進める (#69・Codex P1 2 巡目)。**
+      # 進めないと、相手が落ちているあいだ **push 1 通ごとに 2 本の外向き HTTP を
+      # やり直す** —— timeout のぶん puma のスレッドを占有し、**障害中の
+      # プリセットサーバーを叩き続ける。**スロットルが効かない形になっていた。
+      return touch_attempt(host) if key.nil?
 
       return store(host, key)
     end
@@ -137,6 +142,18 @@ module Relay
       now = @clock.call
       @mon.synchronize {@cache[host] = [key, now + ttl, now]}
       return key
+    end
+
+    # 引き直しに失敗した。⚠ **鍵と期限は残したまま、試した時刻だけ進める。**
+    # 戻り値は常に nil（呼び出し側は fail-open に倒す）。
+    def touch_attempt(host)
+      now = @clock.call
+      @mon.synchronize do
+        entry = @cache[host]
+        # 記録が無いなら negative cache として置く（従来どおり）。
+        @cache[host] = entry.nil? ? [nil, now + @negative_ttl, now] : [entry[0], entry[1], now]
+      end
+      return nil
     end
 
     # ⚠ **Mastodon → Misskey の順に試す。**どちらでもなければ nil。

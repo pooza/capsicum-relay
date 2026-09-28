@@ -67,12 +67,22 @@ announcement:
 
 # プリセットの名乗りを裏取りするときに要求する VAPID の `aud` (capsicum#597 / #69)。
 #
-# ⚠ **通常は書かなくてよい。**未設定なら `X-Forwarded-Proto` + `Host` から組む
-#   （nginx の設定が config/nginx.conf.sample どおりならこれで合う）。
-# ⚠⚠ **書くのは経路が変則なとき**（別名でも push を受ける・前段が Proto を
-#     渡さない等）。⚠ **合っていないと本物の push が全部 audience_mismatch に
-#     なる**ので、変えたら `relay_vapid_verification_total` を読むこと。
-# relay_audience: "https://relay.example.net"
+# ⚠⚠ **必ず書くこと。**未設定だと裏取りができず、プリセットを名乗る push は
+#     すべて fail-open で通る（`relay_vapid_verification_total` の
+#     `outcome="audience_unconfigured"` が立つ）。
+#
+# ⚠⚠ **リクエストのヘッダから組んではいけない**ので設定で持つ。Rack の
+#     `request.host` は `X-Forwarded-Host` を見るうえ、nginx.conf.sample は
+#     そのヘッダを消していない。組んでいた版では、攻撃者が
+#     `X-Forwarded-Host: attacker.example` を添えるだけで**期待値ごと攻撃者の
+#     値になり、照合が素通りした**（#69・PR #77 の Codex 2 巡目）。
+#
+# ⚠ **fedi サーバーが push を投げる先の origin をそのまま書く。**
+#     本番 = https://relay.capsicum.shrieker.net / ステージング = https://st.relay...
+# ⚠ 1 台で複数の名前を受けるなら配列で並べてよい。
+# ⚠ 合っていないと本物の push が全部 `audience_mismatch` になるので、変えたら
+#     `relay_vapid_verification_total` を読むこと。
+relay_audience: "https://relay.example.net"
 
 # 認可ゲート (capsicum#597 / #60) は **env** で切り替える（設定ファイルではない）。
 # ⚠⚠ 既定は無効（何も閉じない）。本番で立てるのはフェーズ 3 の決定で、

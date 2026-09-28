@@ -165,10 +165,13 @@ module Relay
     # ⚠ **末尾の `/` と大小だけの違いで落とさない。**Mastodon は
     # `Addressable::URI#normalized_site`（`https://host`）、Misskey（`web-push`）は
     # 設定の `url` をそのまま入れるので、**形が揃っている保証が無い。**
+    #
+    # [expected] は文字列でも配列でもよい（1 台で複数の名前を受けるとき）。
     def self.audience_ok?(claimed, expected)
-      return true if expected.nil?
+      allowed = Array(expected).map {|value| normalize_audience(value)}.reject(&:empty?)
+      return true if allowed.empty?
 
-      return normalize_audience(claimed) == normalize_audience(expected)
+      return allowed.include?(normalize_audience(claimed))
     end
 
     def self.normalize_audience(value)

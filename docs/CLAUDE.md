@@ -220,7 +220,8 @@ Authorization: WebPush <JWT>  +  Crypto-Key: …;p256ecdsa=<公開鍵>   ← ⚠
 
 - **鍵の取得元**（2026-09-28 に 9 ホストで実測）: Mastodon は `GET /api/v2/instance` の `configuration.vapid.public_key`、Misskey は `POST /api/meta` の `swPublickey`
 - ⚠⚠ **引くのは一覧のホストだけ。**申告をそのまま取りに行くと **relay が SSRF の道具になる**
-- ⚠⚠ **`aud`（宛先）まで見る。**鍵の照合だけでは足りない —— 攻撃者が**プリセットサーバーで自分のサーバー宛ての購読を作れば、本物の鍵で署名された `Authorization` を受け取れる**ので、それを期限内に貼り直せば通ってしまう。既定は `X-Forwarded-Proto` + `Host` から組み、変則な経路だけ設定の `relay_audience` で上書きする
+- ⚠⚠ **`aud`（宛先）まで見る。**鍵の照合だけでは足りない —— 攻撃者が**プリセットサーバーで自分のサーバー宛ての購読を作れば、本物の鍵で署名された `Authorization` を受け取れる**ので、それを期限内に貼り直せば通ってしまう
+- 🔴 **期待値は設定（`relay_audience`）からしか取らない。リクエストのヘッダから組まない。**Rack の `request.host` は **`X-Forwarded-Host` を見る**うえ、`config/nginx.conf.sample` はそのヘッダを**消していない**。組んでいた版では、攻撃者が自分宛ての本物の署名に `X-Forwarded-Host` を添えるだけで**期待値ごと攻撃者の値になり、照合が素通りした**。⚠ **未設定なら「判定できない」に倒す**（`outcome="audience_unconfigured"` で fail-open）—— 勝手に組んで「検査したつもり」になるほうが危ない。⚠⚠ **デプロイ時に settings.yml へ書くこと**
 - ⚠⚠ **鍵が合わなかったら、詐称と決める前に 1 度だけ引き直す。**プリセットサーバーが VAPID を作り直すと TTL のあいだ手元は古い鍵のままで、**本物の push が全部 mismatch になり、閉じていれば 410 で上流の購読が永久に消える**。⚠ 引き直しは **60 秒に 1 回まで**（合わない鍵で叩き続けるだけで DoS の踏み台になる）。⚠ **引き直せなかったら fail-open**
 - ⚠ **metrics のラベルは正規化した host。**`subscriptions.server` は生の申告なので、大小・末尾のドット・空白の変種の数だけ系列が増える
 - ⚠⚠ **旧形式（`WebPush` + `Crypto-Key`）を落とさない。**Mastodon は `standard` が false の購読へ旧形式で送るので、落とすと**本物のプリセットが詐称扱いになる**

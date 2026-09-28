@@ -66,6 +66,15 @@ class VapidPresetGateRouteTest < RequestTestCase
     Relay::BaseApp.set(:vapid_keys, FakeDirectory.new(keys))
   end
 
+  # ⚠ 設定を一時的に外す（設定漏れの挙動を見るため）。⚠ **必ず戻す。**
+  def without_relay_audience
+    config = Relay::BaseApp.settings.config
+    previous = config.delete('relay_audience')
+    yield
+  ensure
+    config['relay_audience'] = previous unless previous.nil?
+  end
+
   def encode(key)
     return Base64.urlsafe_encode64(key.public_key.to_octet_string(:uncompressed)).delete('=')
   end
@@ -101,11 +110,11 @@ class VapidPresetGateRouteTest < RequestTestCase
   end
 
   # プリセットを名乗る購読を 1 件作り、そこへ push する。
-  def push_claiming_preset(authorization: nil)
+  def push_claiming_preset(authorization: nil, extra_headers: {})
     push_token = register_subscription(
       token: 'device-token', device_type: 'ios', account: "alice@#{PRESET}", server: PRESET,
     )['push_token']
-    headers = {'CONTENT_TYPE' => 'application/octet-stream'}
+    headers = {'CONTENT_TYPE' => 'application/octet-stream'}.merge(extra_headers)
     headers['HTTP_AUTHORIZATION'] = authorization if authorization
     post("/push/#{push_token}", 'body', headers)
     return last_response.status
@@ -149,6 +158,56 @@ class VapidPresetGateRouteTest < RequestTestCase
           authorization: vapid_header(@key, audience: 'https://attacker.example'),
         ),
       )
+    end
+  end
+
+  # ⚠⚠ **期待値をリクエストから作らない（#69・Codex P1 2 巡目）。**
+  #
+  # Rack の `request.host` は **`X-Forwarded-Host` を見る**うえ、
+  # nginx.conf.sample はそのヘッダを消していない。期待値を組んでいた版では、
+  # **攻撃者が自分宛ての本物の署名に `X-Forwarded-Host` を添えるだけで、
+  # 期待値ごと攻撃者の値になって素通りした。**
+  # ⚠⚠ **歯の確認: `relay_audience` を外して、旧実装が通していた形をそのまま送る。**
+  # 設定が在るケースは [test_a_signature_for_another_audience_is_gone] が見ている
+  # ので、ここで突くのは**設定が無いときにヘッダから組んでいた**ところ。
+  def test_a_forwarded_host_cannot_move_the_expected_audience
+    without_relay_audience do
+      push_claiming_preset(
+        authorization: vapid_header(@key, audience: 'https://attacker.example'),
+        extra_headers: {
+          'HTTP_X_FORWARDED_HOST' => 'attacker.example',
+          'HTTP_X_FORWARDED_PROTO' => 'https',
+          'HTTP_HOST' => 'attacker.example',
+        },
+      )
+    end
+
+    # ⚠⚠ **旧実装ではここが `verified` だった**（期待値ごと攻撃者の値になった）。
+    assert_equal(
+      0,
+      metrics.value('relay_vapid_verification_total',
+        {server: PRESET, outcome: 'verified', verification: 'verified'}),
+    )
+  end
+
+  # ⚠⚠ **設定漏れを「鍵が引けない」と混ぜない。**混ぜると、ゲートが効いて
+  # いないことに気付けなくなる。
+  def test_a_missing_audience_is_recorded_with_its_own_outcome
+    without_relay_audience {push_claiming_preset(authorization: vapid_header(@key))}
+
+    assert_equal(
+      1,
+      metrics.value('relay_vapid_verification_total',
+        {server: PRESET, outcome: 'audience_unconfigured', verification: 'unavailable'}),
+    )
+  end
+
+  # ⚠ 設定漏れでも本物を止めない（fail-open）。
+  def test_a_missing_audience_fails_open
+    without_relay_audience do
+      with_enforce do
+        refute_equal(410, push_claiming_preset(authorization: vapid_header(@key)))
+      end
     end
   end
 
