@@ -154,4 +154,83 @@ class VapidKeyRefreshTest < Minitest::Test
     assert_nil(dir.refresh_key_for('evil.example.test'))
     assert_empty(fetch.calls)
   end
+
+  # --- ⚠⚠ 3 巡目の Codex P1（2 巡目の修正が作った穴） --------------------
+
+  # ⚠⚠ **間隔のあいだは、失敗を失敗のまま返し続ける。**
+  #
+  # 手元の古い鍵を返すと、呼び出し側がそれを**引き直した結果**と読んで
+  # `mismatch` に倒し、**410 で購読が永久に消える。**2 巡目の修正では
+  # **障害中に fail-open になるのは最初の 1 通だけ**で、2 通目以降は
+  # 古い鍵を「最新」として返していた。
+  def test_a_throttled_failure_keeps_returning_nil
+    now = 1000.0
+    responses = {MASTODON_URL => mastodon_body('BOldKey')}
+    dir, = directory(responses, clock: -> {now})
+    dir.public_key_for(HOST)
+
+    responses.clear
+    now += 61
+
+    assert_nil(dir.refresh_key_for(HOST), '1 通目')
+    # ⚠ ここが古い鍵を返していた。
+    assert_nil(dir.refresh_key_for(HOST), '2 通目（間隔の中）')
+    assert_nil(dir.refresh_key_for(HOST), '3 通目（間隔の中）')
+  end
+
+  # ⚠ ただし手元の鍵は生きている（期限まで有効）。引き直しの成否とは別の話。
+  def test_a_throttled_failure_does_not_invalidate_the_cached_key
+    now = 1000.0
+    responses = {MASTODON_URL => mastodon_body('BOldKey')}
+    dir, = directory(responses, clock: -> {now})
+    dir.public_key_for(HOST)
+
+    responses.clear
+    now += 61
+    dir.refresh_key_for(HOST)
+
+    assert_equal('BOldKey', dir.public_key_for(HOST))
+  end
+
+  # ⚠ 成功した引き直しは、間隔の中でもその鍵を返す（こちらは「最新」なので正しい）。
+  def test_a_throttled_success_returns_the_fresh_key
+    now = 1000.0
+    body = mastodon_body('BOldKey')
+    dir, = directory({MASTODON_URL => -> {body}}, clock: -> {now})
+    dir.public_key_for(HOST)
+
+    body = mastodon_body('BNewKey')
+    now += 61
+
+    assert_equal('BNewKey', dir.refresh_key_for(HOST))
+    assert_equal('BNewKey', dir.refresh_key_for(HOST), '間隔の中でも最新を返す')
+  end
+
+  # ⚠⚠ **同時要求でも 1 本しか出さない。**枠を I/O の前に押さえていないと、
+  # **間隔が明けた直後に来た要求が全部素通りして、puma のスレッドぶん一斉に
+  # 外向き HTTP を出す**（＝ 攻撃者が全スレッドを占有できる）。
+  def test_a_concurrent_burst_only_triggers_one_discovery
+    entered = Queue.new
+    release = Queue.new
+    responses = {
+      MASTODON_URL => lambda do
+        entered << true
+        release.pop
+        mastodon_body('BNewKey')
+      end,
+    }
+    dir, fetch = directory(responses)
+
+    first = Thread.new {dir.refresh_key_for(HOST)}
+    entered.pop # 1 本目が I/O に入るまで待つ
+
+    # ⚠ **この 4 本は I/O に入ってはいけない**（枠が押さえられているので即 nil）。
+    4.times {assert_nil(dir.refresh_key_for(HOST), '引いている最中は nil')}
+
+    assert_equal(1, fetch.calls.size, '外向き HTTP は 1 本だけ')
+
+    release << true
+
+    assert_equal('BNewKey', first.value)
+  end
 end

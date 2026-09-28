@@ -39,6 +39,16 @@ module Relay
     # 来た」ときに走るので、**合わない鍵で叩き続けるだけでプリセットサーバーへ
     # 好きなだけ HTTP を出させられる。**
     MIN_REFRESH_INTERVAL = 60
+    # 記録は `[鍵, 期限, 引き直しを試みた時刻, その試みが失敗したか]`。
+    #
+    # ⚠ **4 つ目は「引き直し」だけのための印。**[public_key_for] の経路は見ない
+    # （手元の鍵は期限まで有効で、引き直しの成否とは別の話）。
+    KEY = 0
+    EXPIRES_AT = 1
+    ATTEMPTED_AT = 2
+    FAILED = 3
+    private_constant :KEY, :EXPIRES_AT, :ATTEMPTED_AT, :FAILED
+
     # ⚠ **短くする。**push の受け口の中で引くので、ここで待つとキューに積むのが遅れる。
     OPEN_TIMEOUT = 3
     READ_TIMEOUT = 3
@@ -80,24 +90,27 @@ module Relay
     # 戻り値は **引き直せた鍵**。⚠ **引き直せなかったら nil**（呼び出し側は
     # fail-open に倒す）—— 古い鍵をそのまま返すと、⚠ **上の事故がそのまま起きる。**
     #
-    # ⚠ **[MIN_REFRESH_INTERVAL] のあいだは引き直さず、手元の鍵を返す。**
-    # 直前に引いたばかりなら、それが最新。
+    # ⚠ **[MIN_REFRESH_INTERVAL] のあいだは引き直さず、直前の結果を返す。**
+    #
+    # ⚠⚠ **直前が失敗なら、間隔のあいだは nil を返し続ける (#69・Codex P1 3 巡目)。**
+    # 手元の古い鍵を返すと、呼び出し側がそれを**引き直した結果**と読んで
+    # `mismatch` に倒し、**410 で購読が消える** —— 障害中に fail-open になるのは
+    # 最初の 1 通だけ、という形になっていた。
+    #
+    # ⚠⚠ **枠は I/O の前に押さえる (#69・Codex P1 3 巡目)。**押さえる前に
+    # `discover` を走らせていたので、**間隔が明けた直後に来た同時要求が全部
+    # 素通りして、puma のスレッドぶん一斉に外向き HTTP を出していた。**
+    # 1 ホストあたり 60 秒に 1 本、を**並行でも**守る。
     def refresh_key_for(server)
       host = allowed(server)
       return nil unless host
-
-      recent = recently_fetched(host)
-      return recent.first if recent
+      return throttled_result(host) unless reserve_refresh(host)
 
       key = discover(host)
       # ⚠ **引けなかったら手元の記録を壊さない。**negative cache で上書きすると、
-      # 一時的な通信障害のあとに「鍵が無い」状態が居座る。
-      #
-      # ⚠⚠ **ただし「試した時刻」は必ず進める (#69・Codex P1 2 巡目)。**
-      # 進めないと、相手が落ちているあいだ **push 1 通ごとに 2 本の外向き HTTP を
-      # やり直す** —— timeout のぶん puma のスレッドを占有し、**障害中の
-      # プリセットサーバーを叩き続ける。**スロットルが効かない形になっていた。
-      return touch_attempt(host) if key.nil?
+      # 一時的な通信障害のあとに「鍵が無い」状態が居座る。⚠ 予約の時点で
+      # 「失敗」を立ててあるので、間隔が明けるまでは nil が返る。
+      return nil if key.nil?
 
       return store(host, key)
     end
@@ -115,45 +128,55 @@ module Relay
       return @hosts.include?(host) ? host : nil
     end
 
-    # 記録は `[鍵, 期限, 引いた時刻]`。
     def read_cache(host)
       return @mon.synchronize do
         entry = @cache[host]
         next nil if entry.nil?
-        next nil if entry[1] < @clock.call
+        next nil if entry[EXPIRES_AT] < @clock.call
 
         entry
       end
     end
 
-    # 引き直しの間隔に入っていれば、手元の記録を返す。
-    def recently_fetched(host)
+    # ⚠⚠ **I/O の前に枠を押さえる。**チェックと更新を 1 つの critical section に
+    # 入れないと、**間隔が明けた直後の同時要求が全部素通りする**（Codex P1 3 巡目）。
+    #
+    # ⚠ **悲観的に「失敗」を立ててから出ていく。**引いている最中に来た要求には
+    # nil を返したい（＝ fail-open）ので、成功したときに [store] が倒す。
+    def reserve_refresh(host)
+      now = @clock.call
+      return @mon.synchronize do
+        entry = @cache[host]
+        next false if entry && (now - entry[ATTEMPTED_AT]) < MIN_REFRESH_INTERVAL
+
+        @cache[host] = if entry.nil?
+          [nil, now + @negative_ttl, now, true]
+        else
+          [entry[KEY], entry[EXPIRES_AT], now, true]
+        end
+        true
+      end
+    end
+
+    # 間隔のあいだに来た要求への答え。
+    #
+    # ⚠⚠ **直前の試みが失敗（または進行中）なら nil。**手元の古い鍵を返すと、
+    # 呼び出し側が**引き直した結果**と読んで詐称判定に倒し、410 で購読が消える。
+    def throttled_result(host)
       return @mon.synchronize do
         entry = @cache[host]
         next nil if entry.nil?
-        next nil if (@clock.call - entry[2]) >= MIN_REFRESH_INTERVAL
+        next nil if entry[FAILED]
 
-        entry
+        entry[KEY]
       end
     end
 
     def store(host, key)
       ttl = key.nil? ? @negative_ttl : @ttl
       now = @clock.call
-      @mon.synchronize {@cache[host] = [key, now + ttl, now]}
+      @mon.synchronize {@cache[host] = [key, now + ttl, now, false]}
       return key
-    end
-
-    # 引き直しに失敗した。⚠ **鍵と期限は残したまま、試した時刻だけ進める。**
-    # 戻り値は常に nil（呼び出し側は fail-open に倒す）。
-    def touch_attempt(host)
-      now = @clock.call
-      @mon.synchronize do
-        entry = @cache[host]
-        # 記録が無いなら negative cache として置く（従来どおり）。
-        @cache[host] = entry.nil? ? [nil, now + @negative_ttl, now] : [entry[0], entry[1], now]
-      end
-      return nil
     end
 
     # ⚠ **Mastodon → Misskey の順に試す。**どちらでもなければ nil。
