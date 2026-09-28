@@ -55,6 +55,28 @@ module Relay
         entitlement_response(token).to_json
       end
 
+      # 手元の token の**いまの状態**を読む (#80)。
+      #
+      # ⚠⚠ **`POST` を状態確認に使い回さないための口。**あちらは upsert なので
+      # 冪等ではあるが、呼ぶたびに `relay_entitlement_token_total` が増え
+      # `entitlement.issued` が出る —— **「発行の回数」を数えている counter が
+      # 「画面を開いた回数」に汚染され、ゲートを閉じてよいかの判断材料が濁る。**
+      #
+      # ⚠ **副作用を持たない。**metrics もログも増やさず、⚠ **ストアへも
+      # 問い合わせ直さない**（状態を書くのは通知と再確認の仕事・#61 / #62 / #63）。
+      #
+      # ⚠⚠ **404 と「失効」を混ぜない。**クライアントから見て「知らない token」
+      # （端末の保存が壊れた / 消された）と「失効した token」（解約・支払い失敗）は
+      # **別の状況**で、案内が違う。
+      get '/entitlements/:token' do
+        authenticate!
+
+        token = settings.database.find_entitlement_token(params[:token])
+        halt 404, {error: 'Unknown entitlement token'}.to_json unless token
+
+        entitlement_response(token).to_json
+      end
+
       helpers do
         # ストアのクライアントがあればその場で確かめる。戻り値は `[token, outcome]`
         # （確かめなかったときの outcome は nil）。

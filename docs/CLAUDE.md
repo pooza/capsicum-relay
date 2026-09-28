@@ -42,6 +42,7 @@ flowchart LR
 | DELETE | `/register/:id` | X-Relay-Secret | 登録解除 |
 | POST | `/push/:push_token` | なし（トークンの推測困難性で保護） | Web Push 受信（Mastodon / Misskey → リレー） |
 | POST | `/entitlements` | X-Relay-Secret | 有償リレーの利用権の発行（capsicum#597 / [#58](https://github.com/pooza/capsicum-relay/issues/58)） |
+| GET | `/entitlements/:token` | X-Relay-Secret | 利用権の**現在の状態**を読む（⚠ 副作用なし・[#80](https://github.com/pooza/capsicum-relay/issues/80)） |
 
 ### 通信フロー
 
@@ -161,6 +162,16 @@ erDiagram
 ### ⚠⚠ `unverified` を許可側に入れない
 
 `POST /entitlements` の認証は共有シークレット 1 本で、**そのシークレットはバイナリから取り出せる**（[capsicum#1121](https://github.com/pooza/capsicum/issues/1121)）。つまりこのエンドポイントは実質的に開いており、**誰でも好きな `purchase_id` で `unverified` の行を作れる**。フェーズ 3 でレシートを検証して初めて `active` になる。
+
+#### ⚠ 状態を読む口は `POST` と分ける（[#80](https://github.com/pooza/capsicum-relay/issues/80)）
+
+`GET /entitlements/:token` は**手元の token のいまの状態**を返す。
+
+⚠⚠ **`POST /entitlements` を状態確認に使い回さない。**あちらは upsert なので冪等ではあるが、呼ぶたびに `relay_entitlement_token_total` が増え `entitlement.issued` が出る —— **「発行の回数」を数えている counter が「画面を開いた回数」に汚染され、ゲートを閉じてよいかの判断材料が濁る。**
+
+- ⚠ **副作用を持たない。**metrics もログも増やさない（テストで固定してある）
+- ⚠ **ストアへ問い合わせ直さない。**状態を書くのは通知（Apple V2 / Play RTDN）と再確認の仕事で、ここは DB を読むだけ
+- ⚠⚠ **404 と「失効」を混ぜない。**クライアントから見て「知らない token」（端末の保存が壊れた / 消された）と「失効した token」（解約・支払い失敗）は**別の状況**で、案内が違う
 
 ### ⚠ 判定は `subscriptions.device_id` から引く
 
