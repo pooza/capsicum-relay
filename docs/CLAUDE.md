@@ -198,10 +198,43 @@ erDiagram
 | 順 | 条件 | 結果 |
 | --- | --- | --- |
 | 1 | `RELAY_ENTITLEMENT_ENFORCE` が `true` でない | allow（`enforce_off`） |
-| 2 | プリセットホスト | allow（`preset`）⚠ **判定に入る前に抜ける** |
+| 2 | プリセットホストで、**名乗りの裏が取れた** | allow（`preset`） |
+| 2' | プリセットホストだが**鍵が引けなかった** | ⚠⚠ allow（`preset_unverifiable`）＝ fail-open |
+| 2'' | プリセットホストだが**署名が無い / 鍵が違う** | ⚠ **プリセット扱いをやめて 3 へ** |
 | 3 | その端末に `active` / `grace` の利用権がある | allow（`entitled`） |
-| 4 | それ以外 | **deny**（`no_entitlement`） |
+| 4 | それ以外 | **deny**（`no_entitlement` / `preset_unsigned` / `preset_mismatch`） |
 | — | 判定中に例外 | ⚠⚠ **allow**（`error`）＝ fail-open |
+
+### プリセットの名乗りの裏取り（[#69](https://github.com/pooza/capsicum-relay/issues/69)）
+
+⚠⚠ **`subscriptions.server` はクライアントの申告で、それ自体は証拠にならない。**共有シークレットは authorization boundary にできない（[capsicum#1121](https://github.com/pooza/capsicum/issues/1121)）ので、**誰でも `server: "mstdn.b-shock.org"` と名乗れる。**
+
+→ **`/push` を叩くのは fedi サーバー自身**なので、**VAPID の署名だけは本物かどうかを確かめられる**。
+
+```text
+Authorization: vapid t=<JWT(ES256)>,k=<公開鍵>      ← 標準（RFC 8292）
+Authorization: WebPush <JWT>  +  Crypto-Key: …;p256ecdsa=<公開鍵>   ← ⚠ 旧形式
+                 ↓ 署名を検証（Relay::VapidAssertion）
+                 ↓ そのホストの鍵と突き合わせる（Relay::VapidKeyDirectory）
+```
+
+- **鍵の取得元**（2026-09-28 に 9 ホストで実測）: Mastodon は `GET /api/v2/instance` の `configuration.vapid.public_key`、Misskey は `POST /api/meta` の `swPublickey`
+- ⚠⚠ **引くのは一覧のホストだけ。**申告をそのまま取りに行くと **relay が SSRF の道具になる**
+- ⚠⚠ **`aud`（宛先）まで見る。**鍵の照合だけでは足りない —— 攻撃者が**プリセットサーバーで自分のサーバー宛ての購読を作れば、本物の鍵で署名された `Authorization` を受け取れる**ので、それを期限内に貼り直せば通ってしまう
+- 🔴 **期待値は設定（`relay_audience`）からしか取らない。リクエストのヘッダから組まない。**Rack の `request.host` は **`X-Forwarded-Host` を見る**うえ、`config/nginx.conf.sample` はそのヘッダを**消していない**。組んでいた版では、攻撃者が自分宛ての本物の署名に `X-Forwarded-Host` を添えるだけで**期待値ごと攻撃者の値になり、照合が素通りした**。⚠ **未設定なら「判定できない」に倒す**（`outcome="audience_unconfigured"` で fail-open）—— 勝手に組んで「検査したつもり」になるほうが危ない。⚠⚠ **デプロイ時に settings.yml へ書くこと**
+- ⚠⚠ **鍵が合わなかったら、詐称と決める前に 1 度だけ引き直す。**プリセットサーバーが VAPID を作り直すと TTL のあいだ手元は古い鍵のままで、**本物の push が全部 mismatch になり、閉じていれば 410 で上流の購読が永久に消える**。⚠ 引き直しは **60 秒に 1 回まで**（合わない鍵で叩き続けるだけで DoS の踏み台になる）。⚠ **引き直せなかったら fail-open**
+- ⚠⚠ **`exp` を「在ること」から要求する。**`JWT.decode` の期限検査は **claim が在るときだけ効く**ので、`exp` の無い assertion は**永久に貼り直せる**（`required_claims: ['exp']`）。⚠ **数値であることまで見る** —— 2026-09-28 に jwt 3.2.0 で実測したところ、**文字列の `exp`（`"9999999999"`）はそのまま素通りした。**上限は 24 時間（RFC 8292 §2）。⚠⚠ **ただし上限を素で当てない** —— **Mastodon は `exp` をちょうど 24 時間後に置く**（`PAYLOAD_EXPIRATION = 24.hours`）ので常に上限ぴったりで、**相手の時計がこちらより進んでいるだけで本物が全部落ちて 410 になる。**5 分の余裕を持たせる（`EXPIRY_SKEW`）
+- ⚠⚠ **引いてきた値は、P-256 の公開鍵として読めるまで覚えない。**空でない壊れた値（サーバーの設定ミス・直列化の事故）をそのまま覚えると、**本物の署名がその値と永久に一致しない** —— 引き直しの間隔が明けるたびに同じ壊れた値が返るので mismatch が繰り返され、**閉じていれば 410 で購読が消える。**⚠ **長さと先頭バイト（65 バイト・`0x04`）だけでは足りない**（曲線上に無い点が通る）ので `OpenSSL` に読ませて判定する（`Relay::VapidAssertion.public_key?`）。読めなければ **nil ＝「引けなかった」**へ倒す
+- ⚠ **503 の `Retry-After` を固定値にしない。**`busy` には由来が 2 つあり、**明けるまでの長さが 1 桁違う** —— 枠の取り合いは引き終わるまで（5 秒）、引き直しの間隔（`MIN_REFRESH_INTERVAL`）は ⚠ **最大 60 秒**。後者に「1 秒後に」と答えると、**上流は明けるまで 503 を受け続けて再試行の枠を使い切る**（通知が遅れる / 落ちる）。残りを `Relay::VapidKeyLedger#retry_after` に訊く
+- ⚠ **metrics のラベルは正規化した host。**`subscriptions.server` は生の申告なので、大小・末尾のドット・空白の変種の数だけ系列が増える
+- ⚠⚠ **旧形式（`WebPush` + `Crypto-Key`）を落とさない。**Mastodon は `standard` が false の購読へ旧形式で送るので、落とすと**本物のプリセットが詐称扱いになる**
+- ⚠ **「鍵が引けない」と「署名が無い / 違う」を同じ倒し方にしない。**前者は**こちらの障害**なので fail-open、後者は**プリセット扱いをやめる**。署名が無いのを fail-open にすると、**ヘッダを付けないだけで迂回できる**＝直したことにならない
+- ⚠ **`/register` では検証しない**（叩くのはクライアント自身で署名が存在しない）。**止めるのは `/push`** なので穴は残らない
+- ⚠ **`enforce` の有無に関わらず検証を走らせる**（`relay_vapid_verification_total`）。**閉じてから測ると止めてから気付く**
+
+⚠⚠ **`RELAY_ENTITLEMENT_ENFORCE` を立てる前に `relay_vapid_verification_total` を読む。**`verification="verified"` が `/push` のプリセット分をほぼ全部占めていることが条件。`unavailable` が多いなら**こちらが鍵を引けていない**（閉じても fail-open で素通りする）。
+
+⚠ **穴を塞いだのではない。**「プリセットに 1 アカウント持てば全部無償」は**完全に意図通り**で残す（capsicum `docs/paid-relay-plan.md` 1-2 / 未決事項 3）。塞ぐのは「**アカウントを作らずにプリセットを名乗れる**」ほうだけ。
 
 拒んだときの応答:
 

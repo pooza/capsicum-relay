@@ -32,7 +32,8 @@ module Relay
         # ⚠ **登録してから判定する。**行を作らずに拒むと、⚠ **フェーズ 3 で
         # ゲートを閉じた瞬間に「誰が止まったか」が DB から分からなくなる**
         # （観測 #59 の母数が消える）。行は残し、配送を `/push` で止める。
-        halt_entitlement_required! unless entitlement_allowed?(sub, route: 'register')
+        allowed, = entitlement_decision(sub, route: 'register')
+        halt_entitlement_required! unless allowed
 
         status 201
         sub.to_json

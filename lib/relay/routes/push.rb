@@ -21,7 +21,13 @@ module Relay
         # ⚠ **`410 Gone` を返す**と Mastodon / Misskey が購読を掃除するので、
         # サーバー側にゴミを残さず無駄な配送も止まる。黙って 200 を返すと
         # **失効後も永久に叩かれる。**
-        halt_entitlement_gone! unless entitlement_allowed?(sub, route: 'push')
+        allowed, gate_reason = entitlement_decision(sub, route: 'push')
+        # ⚠⚠ **競合は 503（再試行）、利用権なしは 410（購読を掃除させる）。**
+        # 混ぜると、**裏取りが混み合っただけで上流の購読が永久に消える。**
+        if !allowed && gate_reason == Relay::EntitlementGate::REASON_PRESET_BUSY
+          halt_entitlement_busy!(sub)
+        end
+        halt_entitlement_gone! unless allowed
         return {status: 'deduped'}.to_json if deduped?(sub)
 
         # ⚠⚠ **クライアント未設定は同期で 503。**キューに積んでから「未設定でした」と
@@ -101,6 +107,26 @@ module Relay
         # ⚠ 復帰には**再登録が要る**（設計書 未決事項 4・capsicum#1123 の導線）。
         def halt_entitlement_gone!
           halt 410, {error: 'Entitlement required'}.to_json
+        end
+
+        # 裏取りが競合した (capsicum#597 / #69・Codex P1 6 巡目)。
+        #
+        # ⚠⚠ **4xx にしてはいけない**（Mastodon が購読を destroy する・#66）。
+        # ⚠ **fail-open でも 410 でもない**——「いま判定できないので、もう一度
+        # 送ってくれ」。上流は 5xx を再送するので、**通知は失われない。**
+        #
+        # ⚠ **ここで metrics を足さない (#69・Codex P2 7 巡目)。**
+        # `relay_entitlement_gate_total` は [entitlement_decision] が
+        # `reason="preset_busy"` で既に 1 回数えている。ここで足すと**同じ要求を
+        # 2 回数える**ので、あの counter の合計が「判定の回数」でなくなり、
+        # ⚠ **ゲートを閉じてよいかを測る材料が濁る。**
+        # ⚠⚠ **`Retry-After` を 1 秒で固定しない（Codex 締めの P2）。**
+        # 引き直しの間隔（`MIN_REFRESH_INTERVAL` = 60 秒）で待たせている場合、
+        # 1 秒と答えると**上流は明けるまで 503 を受け続けて再試行の枠を使い切る**
+        # —— 通知が遅れる / 落ちる。残りを [Relay::VapidKeyLedger.retry_after] に訊く。
+        def halt_entitlement_busy!(sub)
+          headers['Retry-After'] = entitlement_retry_after(sub).to_s
+          halt 503, {error: 'Entitlement check busy', reason: 'busy'}.to_json
         end
 
         # 上流の孤児購読蓄積による重複 push を抑止 (capsicum#692 / #16)。

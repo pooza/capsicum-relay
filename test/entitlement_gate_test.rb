@@ -28,10 +28,11 @@ class EntitlementGateTest < Minitest::Test
     return {'server' => server, 'device_id' => device_id, 'account' => "a@#{server}"}
   end
 
-  def decide(env: ON, rows: [], database: nil, **overrides)
+  def decide(env: ON, rows: [], database: nil, verification: G::PRESET_NOT_CHECKED, **overrides)
     return G.decide(
       subscription: sub(**overrides),
       database: database || FakeDatabase.new(rows),
+      preset_verification: verification,
       env: env,
     )
   end
@@ -60,6 +61,88 @@ class EntitlementGateTest < Minitest::Test
   # 「プリセットに 1 アカウント持てば全部無償」の穴は残す（2026-09-12 決定）。
   def test_preset_staging_host_is_allowed
     assert_equal([true, 'preset'], decide(server: 'st2.mstdn.b-shock.org'))
+  end
+
+  # --- プリセットの名乗りの裏取り (#69) -----------------------------------
+
+  # ⚠⚠ **`/register` は検証しない。**叩くのはクライアント自身で fedi サーバーの
+  # 署名が無い。⚠ **止めるのは `/push`** なので、ここを通しても穴は残らない。
+  def test_not_checked_keeps_the_preset_shortcut
+    assert_equal(
+      [true, 'preset'],
+      decide(server: 'mstdn.b-shock.org', verification: G::PRESET_NOT_CHECKED),
+    )
+  end
+
+  def test_verified_preset_is_allowed
+    assert_equal(
+      [true, 'preset'],
+      decide(server: 'mstdn.b-shock.org', verification: G::PRESET_VERIFIED),
+    )
+  end
+
+  # ⚠⚠ **鍵が引けなかったのは「こちらの障害」なので fail-open。**
+  # ただし理由を分けて、ゲートが効いていないことに気付けるようにする。
+  def test_unavailable_key_fails_open
+    allowed, reason = decide(server: 'mstdn.b-shock.org', verification: G::PRESET_UNAVAILABLE)
+
+    assert(allowed, '鍵が引けないだけで本物のプリセットを止めない')
+    assert_equal('preset_unverifiable', reason)
+  end
+
+  # ⚠⚠ **#69 の核心。**署名が無いのを fail-open にすると、**ヘッダを付けないだけで
+  # 迂回できる**＝直したことにならない。
+  def test_unsigned_preset_claim_loses_the_shortcut
+    assert_equal(
+      [false, 'preset_unsigned'],
+      decide(server: 'mstdn.b-shock.org', verification: G::PRESET_UNSIGNED, rows: []),
+    )
+  end
+
+  # ⚠⚠ **詐称。**別のサーバーの鍵で署名されている。
+  def test_mismatched_key_loses_the_shortcut
+    assert_equal(
+      [false, 'preset_mismatch'],
+      decide(server: 'mstdn.b-shock.org', verification: G::PRESET_MISMATCH, rows: []),
+    )
+  end
+
+  # ⚠ **裏が取れなくても、購入していれば通る。**プリセットのホスト名で登録した
+  # 購入者を巻き添えにしない。
+  def test_a_failed_preset_claim_still_falls_through_to_the_entitlement
+    assert_equal(
+      [true, 'entitled'],
+      decide(
+        server: 'mstdn.b-shock.org',
+        verification: G::PRESET_UNSIGNED,
+        rows: [{'status' => 'active'}],
+      ),
+    )
+  end
+
+  # ⚠ 理由は `no_entitlement` に溶かさない。「利用権が無い」と「プリセットを
+  # 詐称した」は対処がまったく違う。
+  def test_the_denial_reason_names_the_preset_failure
+    _, reason = decide(server: 'mstdn.b-shock.org', verification: G::PRESET_MISMATCH)
+
+    refute_equal('no_entitlement', reason)
+  end
+
+  # ⚠ 非プリセットの判定は 1mm も変わらない（検証の値に関係なく利用権だけを見る）。
+  def test_verification_does_not_affect_non_preset_hosts
+    assert_equal([false, 'no_entitlement'], decide(verification: G::PRESET_MISMATCH))
+    assert_equal(
+      [true, 'entitled'],
+      decide(verification: G::PRESET_UNSIGNED, rows: [{'status' => 'active'}]),
+    )
+  end
+
+  # ⚠ 知らない値は**署名が無い**側へ倒す（黙って通さない）。
+  def test_an_unknown_verification_value_is_not_a_shortcut
+    assert_equal(
+      [false, 'preset_unsigned'],
+      decide(server: 'mstdn.b-shock.org', verification: :something_new),
+    )
   end
 
   def test_non_preset_without_entitlement_is_denied

@@ -17,6 +17,7 @@ require_relative 'push_helpers'
 require_relative 'push_queue'
 require_relative 'sentry_setup'
 require_relative 'structured_log'
+require_relative 'vapid_key_directory'
 require_relative 'wns_client'
 
 module Relay
@@ -95,6 +96,14 @@ module Relay
       if settings.config.dig('wns', 'package_sid')
         set :wns, Relay::WnsClient.new(settings.config, logger: settings.logger)
       end
+
+      # プリセットの名乗りの裏取り (capsicum#597 / #69)。⚠⚠ **引くのは一覧の
+      # ホストだけ**（`subscription['server']` をそのまま取りに行くと SSRF になる）。
+      # ⚠ logger は渡さない —— 引けなかったことは route 側が metrics とログに出す
+      # （構築時の logger を握ると、あとから `set :logger` しても差し替わらない）。
+      set :vapid_keys, Relay::VapidKeyDirectory.new(
+        hosts: Relay::PresetServers::HOSTS + Array(settings.config['extra_preset_hosts']),
+      )
 
       # 重複 push 抑止 (capsicum#692 / #16)。窓は ENV で調整可能、既定 1000ms。
       # 観測された重複バーストの広がりは <500ms なので余裕を持たせつつ、別通知

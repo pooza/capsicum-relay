@@ -44,6 +44,13 @@ module Relay
       # ⚠ `reason="enforce_off"` が全部を占めているのがフェーズ 2 の正常な状態。
       'relay_entitlement_gate_total' =>
         'Entitlement gate decisions, by route, decision and reason.',
+      # プリセットの名乗りの裏取り (#69)。⚠⚠ **ゲートを閉じる前にここを読む。**
+      # `verification="verified"` が `/push` のプリセット分をほぼ全部占めていること
+      # が、閉じてよいことの条件。⚠ `unavailable` が多いなら**こちらが鍵を引けて
+      # いない**（閉じると fail-open で素通りする）。⚠⚠ `unsigned` / `mismatch` は
+      # **詐称の候補**で、閉じた瞬間に止まるのがこれ。
+      'relay_vapid_verification_total' =>
+        'VAPID assertions on /push from subscriptions claiming a preset host.',
       # ⚠ **410 は上流の購読を消す副作用がある**ので、返した回数は観測できないと
       # いけない (#60)。増え続けているなら、クライアントが再登録していない
       # （＝通知が届かなくなっている）端末がある。
