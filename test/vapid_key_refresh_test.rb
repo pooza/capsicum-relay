@@ -233,4 +233,43 @@ class VapidKeyRefreshTest < Minitest::Test
 
     assert_equal('BNewKey', first.value)
   end
+
+  # --- ⚠⚠ 4 巡目の Codex P1（単発化が refresh にしか入っていなかった） -----
+
+  # ⚠⚠ **キャッシュミスの経路にも同じ雪崩があった。**起動直後や期限切れの
+  # 瞬間に同時要求が来ると、**全部が `discover` に入って puma のスレッドが
+  # 揃って timeout を待つ。**枠は `public_key_for` でも I/O の前に押さえる。
+  def test_a_cold_cache_burst_only_triggers_one_discovery
+    entered = Queue.new
+    release = Queue.new
+    responses = {
+      MASTODON_URL => lambda do
+        entered << true
+        release.pop
+        mastodon_body('BColdKey')
+      end,
+    }
+    dir, fetch = directory(responses)
+
+    first = Thread.new {dir.public_key_for(HOST)}
+    entered.pop # 1 本目が I/O に入るまで待つ
+
+    # ⚠ **この 4 本は I/O に入ってはいけない。**
+    4.times {assert_nil(dir.public_key_for(HOST), '引いている最中は nil')}
+
+    assert_equal(1, fetch.calls.size, '外向き HTTP は 1 本だけ')
+
+    release << true
+
+    assert_equal('BColdKey', first.value)
+  end
+
+  # ⚠ 引き終われば通常どおり手元から返る（枠の押さえが残り続けない）。
+  def test_the_reservation_is_released_once_the_fetch_succeeds
+    dir, fetch = directory({MASTODON_URL => mastodon_body('BColdKey')})
+
+    assert_equal('BColdKey', dir.public_key_for(HOST))
+    assert_equal('BColdKey', dir.public_key_for(HOST))
+    assert_equal(1, fetch.calls.size)
+  end
 end

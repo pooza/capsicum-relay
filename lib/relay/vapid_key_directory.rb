@@ -70,13 +70,23 @@ module Relay
     end
 
     # 引けたら base64url（パディング無し）に揃えた公開鍵、引けなければ nil。
+    #
+    # ⚠⚠ **ここも I/O の前に枠を押さえる (#69・PR #77 の Codex P1 4 巡目)。**
+    # 単発化を [refresh_key_for] にしか入れていなかったので、**起動直後や
+    # 期限切れの瞬間に来た同時要求が全部 `discover` に入れた** —— 相手が落ちて
+    # いると、**puma のスレッドが揃って timeout を待つ**形が残っていた。
+    #
+    # ⚠ **枠が取れなければ nil**（誰かが引いている最中 / 直前に試して失敗した）。
+    # 呼び出し側は fail-open に倒す。
     def public_key_for(server)
       host = allowed(server)
       return nil unless host
 
       cached = read_cache(host)
-      return cached.first if cached
+      return cached[KEY] if cached
+      return nil unless reserve_fetch(host)
 
+      # ⚠ 引けなければ negative cache（従来どおり）。手元の鍵は既に期限切れ。
       return store(host, discover(host))
     end
 
@@ -104,7 +114,7 @@ module Relay
     def refresh_key_for(server)
       host = allowed(server)
       return nil unless host
-      return throttled_result(host) unless reserve_refresh(host)
+      return throttled_result(host) unless reserve_fetch(host)
 
       key = discover(host)
       # ⚠ **引けなかったら手元の記録を壊さない。**negative cache で上書きすると、
@@ -143,7 +153,7 @@ module Relay
     #
     # ⚠ **悲観的に「失敗」を立ててから出ていく。**引いている最中に来た要求には
     # nil を返したい（＝ fail-open）ので、成功したときに [store] が倒す。
-    def reserve_refresh(host)
+    def reserve_fetch(host)
       now = @clock.call
       return @mon.synchronize do
         entry = @cache[host]
