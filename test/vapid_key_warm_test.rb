@@ -2,6 +2,7 @@ require_relative 'test_helper'
 require_relative 'support/vapid_test_keys'
 require 'json'
 require 'monitor'
+require 'timeout'
 require 'relay/vapid_key_directory'
 require 'relay/vapid_key_ledger'
 
@@ -89,7 +90,7 @@ class VapidKeyWarmTest < Minitest::Test
   # ことを見る。**
   def test_warm_fills_the_cache_so_later_lookups_make_no_requests
     dir, fetch = directory(bodies)
-    dir.warm!.join
+    dir.warm!(interval: nil).join
     warmed = fetch.calls.size
 
     assert_equal(3, warmed, '先読みで 3 本（Mastodon の形 2 回 + Misskey の形 1 回）')
@@ -103,7 +104,7 @@ class VapidKeyWarmTest < Minitest::Test
   # まだ温まっていないホストには手元の鍵も無い）。
   def test_warm_finishes_before_returning
     dir, = directory(bodies)
-    dir.warm!
+    dir.warm!(interval: nil)
 
     assert_equal({fresh: 2, total: 2}, dir.cached_counts, '返った時点で温まっている')
   end
@@ -114,7 +115,7 @@ class VapidKeyWarmTest < Minitest::Test
   def test_warm_stops_waiting_after_the_budget_and_continues_in_the_background
     dir, = directory(bodies, delay: 0.2)
     started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    thread = dir.warm!(budget: 0.05)
+    thread = dir.warm!(budget: 0.05, interval: nil)
     waited = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
 
     assert_operator(waited, :<, 0.2, '上限で待つのをやめる')
@@ -128,7 +129,7 @@ class VapidKeyWarmTest < Minitest::Test
   # ⚠⚠ **直列に引く。**並列にすると push の受け口と枠を奪い合う。
   def test_warm_never_runs_two_lookups_at_once
     dir, fetch = directory(bodies, delay: 0.02)
-    dir.warm!.join
+    dir.warm!(interval: nil).join
 
     assert_equal(1, fetch.max_concurrent, '先読みは 1 本ずつ')
   end
@@ -137,7 +138,7 @@ class VapidKeyWarmTest < Minitest::Test
   def test_warm_survives_a_server_that_cannot_be_reached
     dir, = directory({})
 
-    dir.warm!.join
+    dir.warm!(interval: nil).join
 
     assert_nil(dir.public_key_for('mstdn.b-shock.org'))
   end
@@ -220,7 +221,7 @@ class VapidKeyWarmTest < Minitest::Test
 
   def test_cached_counts_rises_after_warm
     dir, = directory(bodies)
-    dir.warm!.join
+    dir.warm!(interval: nil).join
 
     assert_equal({fresh: 2, total: 2}, dir.cached_counts)
   end
@@ -228,7 +229,7 @@ class VapidKeyWarmTest < Minitest::Test
   # ⚠ 引けなかったホストは数に入らない（negative cache を「持っている」にしない）。
   def test_a_host_that_could_not_be_fetched_is_not_counted
     dir, = directory({MASTODON_URL => bodies[MASTODON_URL]})
-    dir.warm!.join
+    dir.warm!(interval: nil).join
 
     assert_equal({fresh: 1, total: 2}, dir.cached_counts)
   end
@@ -246,12 +247,86 @@ class VapidKeyWarmTest < Minitest::Test
     dir = Relay::VapidKeyDirectory.new(
       hosts: HOSTS, fetch: fetch.to_proc, ttl: 60, clock: -> {now},
     )
-    dir.warm!
+    dir.warm!(interval: nil)
 
     assert_equal({fresh: 2, total: 2}, dir.cached_counts)
 
     now += 61
 
     assert_equal({fresh: 0, total: 2}, dir.cached_counts, '期限が切れたら数字が動く')
+  end
+
+  # --- ⚠⚠ TTL の前に引き直し続ける（PR #79 の Codex P1） -----------------
+
+  # `refresh_key_for` の呼ばれ方だけ見る代役。⚠ 実際の引き直しは
+  # [Relay::VapidKeyLedger::MIN_REFRESH_INTERVAL]（60 秒）で絞られているので、
+  # **本物を使うと短い間隔では 2 巡目が観測できない。**
+  class CountingDirectory < Relay::VapidKeyDirectory
+    attr_reader :refreshed
+
+    def initialize(**)
+      super
+      @refreshed = Queue.new
+    end
+
+    def refresh_key_for(host)
+      @refreshed << host
+      return nil
+    end
+  end
+
+  # ⚠⚠ **1 回だけ温めても足りない。**起動時に全ホストをほぼ同時に覚えるので、
+  # **TTL 後に一斉に期限切れになり、冷えたバーストがそのまま戻る。**
+  # ⚠ **この検査が無いと、長く動いているプロセスだけが踏む**（起動直後しか見て
+  # いない検査では一生出ない）。
+  def test_warm_keeps_refreshing_so_the_keys_never_expire_together
+    dir = CountingDirectory.new(hosts: HOSTS, fetch: FakeFetch.new(bodies).to_proc)
+    thread = dir.warm!(interval: 0.01)
+
+    begin
+      Timeout.timeout(3) do
+        assert_equal(HOSTS.to_a.sort, [dir.refreshed.pop, dir.refreshed.pop].sort)
+      end
+    ensure
+      thread.kill
+    end
+  end
+
+  # ⚠ 間隔を切れば 1 巡で終わる（テストと、繰り返したくない場面のため）。
+  def test_warm_without_an_interval_finishes
+    dir = CountingDirectory.new(hosts: HOSTS, fetch: FakeFetch.new(bodies).to_proc)
+    thread = dir.warm!(interval: nil)
+    thread.join
+
+    refute_predicate(thread, :alive?)
+    assert_empty(dir.refreshed)
+  end
+
+  # --- ⚠⚠ 1 台の妙な応答で残りを巻き添えにしない（Codex P2） -------------
+
+  # 🔴 **形は正しいが中身が違う JSON。**`{"configuration":"unexpected"}` は
+  # `String#dig` が無いので、素直に書くと **TypeError** が飛ぶ。
+  BROKEN_SHAPE = '{"configuration":"unexpected"}'.freeze
+
+  # ⚠⚠ **先読みが止まるだけの話ではない。**[public_key_for] は route から
+  # 呼ばれていて**例外を捕まえていない**ので、これが飛ぶと **`/push` が 500**。
+  def test_a_json_of_the_wrong_shape_does_not_raise
+    dir, = directory({MASTODON_URL => BROKEN_SHAPE, MISSKEY_URL => BROKEN_SHAPE})
+
+    assert_nil(dir.public_key_for(HOST_A))
+  end
+
+  # ⚠ 1 台が妙でも、残りのホストは温まる。
+  def test_one_odd_host_does_not_cancel_the_rest
+    dir, = directory(
+      {
+        MASTODON_URL => BROKEN_SHAPE,
+        "https://#{HOST_B}/api/v2/instance" => BROKEN_SHAPE,
+        MISSKEY_URL => JSON.generate({swPublickey: KEY_B}),
+      },
+    )
+    dir.warm!(interval: nil).join
+
+    assert_equal({fresh: 1, total: 2}, dir.cached_counts, '妙な 1 台の巻き添えにしない')
   end
 end

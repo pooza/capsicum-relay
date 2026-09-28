@@ -45,6 +45,18 @@ module Relay
     # 待ち過ぎは `busy` より悪い。
     WARM_BUDGET = 5
 
+    # 先読みを繰り返す間隔（秒・PR #79 の Codex P1）。
+    #
+    # ⚠⚠ **1 回だけ温めても足りない。**起動時に全ホストを**ほぼ同時**に覚えるので、
+    # **TTL（6 時間）後に 9 個が一斉に期限切れになる** —— そこで冷えたバーストが
+    # そのまま再現する（1 本目が枠を握り、残りが `busy`）。長く動いているプロセス
+    # ほど確実に踏む。
+    #
+    # ⚠ **TTL より十分短く**する。⚠ **引き直しは [Relay::VapidKeyLedger::
+    # MIN_REFRESH_INTERVAL]（60 秒）で絞られている**ので、これより短くしても
+    # 実際には引かない。
+    WARM_REFRESH_INTERVAL = 60 * 60
+
     # [hosts] は引いてよいホスト（プリセット + `extra_preset_hosts`）。
     # [fetch] はテスト用の差し替え口で、`->(uri, payload) { body or nil }`。
     # payload が nil なら GET、文字列なら JSON の POST。
@@ -168,14 +180,22 @@ module Relay
     # ⚠ **直列に引く** —— 枠は [Relay::VapidKeyLedger::MAX_CONCURRENT_DISCOVERY] で
     # 1 本に絞ってあるので、並列にしても意味が無いうえ受け口と枠を奪い合う。
     # ⚠ **失敗は無視してよい**（negative cache に入るだけ）。
-    def warm!(budget: WARM_BUDGET)
+    def warm!(budget: WARM_BUDGET, interval: WARM_REFRESH_INTERVAL)
+      warmed = Queue.new
       thread = Thread.new do
-        @hosts.each {|host| public_key_for(host)}
-      rescue StandardError
-        nil
+        each_host {|host| public_key_for(host)}
+        warmed << true
+        # ⚠⚠ **TTL の前に引き直し続ける。**1 回だけだと 6 時間後に全ホストが
+        # 一斉に期限切れになり、冷えたバーストがそのまま戻る（[WARM_REFRESH_INTERVAL]）。
+        while interval.to_f.positive?
+          sleep(interval)
+          each_host {|host| refresh_key_for(host)}
+        end
       end
-      # ⚠ `join(limit)` は時間切れで nil を返すが、**スレッドは走り続ける。**
-      thread.join(budget)
+      # ⚠⚠ **`join` で待たない。**繰り返すぶんスレッドは終わらないので、
+      # `join(budget)` だと**毎回 budget を丸ごと待つ**（実際に踏んだ）。
+      # **待つのは「1 巡目が終わったか」だけ。**
+      warmed.pop(timeout: budget)
       return thread
     end
 
@@ -192,6 +212,17 @@ module Relay
       return @hosts.include?(host) ? host : nil
     end
 
+    # ⚠⚠ **1 ホストずつ rescue する（PR #79 の Codex P2）。**ループ全体を囲うと、
+    # **1 台の妙な応答で以降のホストが全部冷えたまま**になり、その最初の同時 push が
+    # また `busy` になる。
+    def each_host
+      @hosts.each do |host|
+        yield(host)
+      rescue StandardError
+        next
+      end
+    end
+
     # ⚠ **Mastodon → Misskey の順に試す。**どちらでもなければ nil。
     def discover(host)
       return mastodon_key(host) || misskey_key(host)
@@ -199,12 +230,27 @@ module Relay
 
     def mastodon_key(host)
       body = call("https://#{host}/api/v2/instance", nil)
-      return normalize(parse(body)&.dig('configuration', 'vapid', 'public_key'))
+      return normalize(dig_in(parse(body), 'configuration', 'vapid', 'public_key'))
     end
 
     def misskey_key(host)
       body = call("https://#{host}/api/meta", '{"detail":false}')
-      return normalize(parse(body)&.[]('swPublickey'))
+      return normalize(dig_in(parse(body), 'swPublickey'))
+    end
+
+    # ⚠⚠ **`Hash#dig` を直に使わない（PR #79 の Codex P2）。**サーバーが
+    # `{"configuration":"unexpected"}` のような**形は正しいが中身が違う** JSON を
+    # 返すと、`String` に `dig` は無いので **TypeError が飛ぶ。**
+    #
+    # 🔴 **これは先読みが止まるだけの話ではない。**[public_key_for] は route から
+    # 呼ばれていて**例外を捕まえていない**ので、⚠⚠ **`/push` が 500 になる**
+    # （2026-09-28 に実測して確認した）。**途中が Hash でなければ nil にする。**
+    def dig_in(json, *path)
+      return path.reduce(json) do |node, key|
+        break nil unless node.is_a?(Hash)
+
+        node[key]
+      end
     end
 
     # ⚠ **何が起きても nil。**外向きの HTTP は落ちる前提で、push の受け口を
