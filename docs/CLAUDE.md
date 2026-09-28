@@ -42,6 +42,7 @@ flowchart LR
 | DELETE | `/register/:id` | X-Relay-Secret | 登録解除 |
 | POST | `/push/:push_token` | なし（トークンの推測困難性で保護） | Web Push 受信（Mastodon / Misskey → リレー） |
 | POST | `/entitlements` | X-Relay-Secret | 有償リレーの利用権の発行（capsicum#597 / [#58](https://github.com/pooza/capsicum-relay/issues/58)） |
+| GET | `/entitlements` | X-Relay-Secret + `X-Entitlement-Token` | 利用権の**現在の状態**を読む（⚠ 副作用なし・🔴 **token を URL に載せない**・[#80](https://github.com/pooza/capsicum-relay/issues/80)） |
 
 ### 通信フロー
 
@@ -161,6 +162,49 @@ erDiagram
 ### ⚠⚠ `unverified` を許可側に入れない
 
 `POST /entitlements` の認証は共有シークレット 1 本で、**そのシークレットはバイナリから取り出せる**（[capsicum#1121](https://github.com/pooza/capsicum/issues/1121)）。つまりこのエンドポイントは実質的に開いており、**誰でも好きな `purchase_id` で `unverified` の行を作れる**。フェーズ 3 でレシートを検証して初めて `active` になる。
+
+#### ⚠ 状態を読む口は `POST` と分ける（[#80](https://github.com/pooza/capsicum-relay/issues/80)）
+
+`GET /entitlements`（`X-Entitlement-Token` ヘッダ）は**手元の token のいまの状態**を返す。
+
+🔴 **token を URL に載せない。**`config/nginx.conf.sample` は素の `access_log` を有効にしており、**リクエスト行に完全なパスが残る** —— ⚠⚠ **token はそのまま利用権として使える capability** なので、平文でログに溜まる。⚠ **ヘッダは既定のログ書式に含まれない。**
+
+⚠⚠ **`POST /entitlements` を状態確認に使い回さない。**あちらは upsert なので冪等ではあるが、呼ぶたびに `relay_entitlement_token_total` が増え `entitlement.issued` が出る —— **「発行の回数」を数えている counter が「画面を開いた回数」に汚染され、ゲートを閉じてよいかの判断材料が濁る。**
+
+- ⚠ **副作用を持たない。**metrics もログも増やさない（テストで固定してある）
+- ⚠ **ストアへ問い合わせ直さない。**状態を書くのは通知（Apple V2 / Play RTDN）と再確認の仕事で、ここは DB を読むだけ
+
+#### 🔴🔴 `request.env` のヘッダ文字列は `ASCII-8BIT`（2026-09-28 実測）
+
+**Puma / Rack がヘッダから作る String はバイナリ**で、⚠⚠ **そのまま SQLite にバインドすると TEXT ではなく BLOB になる。**`WHERE token = ?` は TEXT と BLOB を比べることになり、**行があっても永久に一致しない。**
+
+```ruby
+# 🔴 引けない（BLOB として比較される）
+settings.database.find_entitlement_token(request.env['HTTP_X_ENTITLEMENT_TOKEN'])
+
+# ✅ UTF-8 へ直してから渡す
+value = raw.dup.force_encoding(Encoding::UTF_8)
+```
+
+⚠ **`request.env` から読むときだけの話。**`params`（URL 由来）と `json_body`（`JSON.parse` 由来）は UTF-8 なので起きない。
+
+⚠⚠ **気づきにくい理由が 2 つある。**
+
+1. **`authenticate!` は壊れない。**`X-Relay-Secret` は**文字列比較**なので encoding が違っても ASCII 同士なら `==` が true。**認証は通り、SQL へ渡す値だけが壊れる**
+2. 🔴🔴 **Rack::Test では再現しない。**env に**素の String（UTF-8）**を入れるので、**壊れた実装でも検査が緑になる** —— 実際にそう書いて、**1 件も引けない実装のまま検査だけ通っていた**。⚠ **ヘッダを読む route の検査は `force_encoding(Encoding::BINARY)` で渡す**
+
+#### 🔴 認証が要る応答はキャッシュさせない（[#81](https://github.com/pooza/capsicum-relay/pull/81) の Codex P2）
+
+`authenticate!` が `Cache-Control: private, no-store` を付ける。
+
+⚠⚠ **`GET /entitlements` で実際に穴になっていた。**区別する値（`X-Entitlement-Token`）が**カスタムヘッダにしか無い**ので、**キャッシュ鍵は全員同じ** —— ブラウザ / CDN / 前段のプロキシが**最初の呼び出し元の token と購入 ID を別人へ返しうる。**
+
+- ⚠ **`authenticate!` に置く理由は「入口を 1 本にする」。**route ごとに足すと、**認証付きの GET を増やしたときに付け忘れる**（`/metrics` も `/supporters` も同じ形で、鍵は全員同じ）
+- ⚠ **`Vary` では足りない** —— 知らない `Vary` を無視するキャッシュがある
+- ⚠ **`/health` には付かない**（無認証・秘密を返さない）
+
+⚠⚠ **ヘッダで capability を受ける口を足したら、`Relay::SentrySetup::SENSITIVE_HEADERS` にも足す。**例外が上がると Rack 統合がリクエストごと捕まえるので、入れ忘れると**丸ごと Sentry へ出る。**
+- ⚠⚠ **404 と「失効」を混ぜない。**クライアントから見て「知らない token」（端末の保存が壊れた / 消された）と「失効した token」（解約・支払い失敗）は**別の状況**で、案内が違う
 
 ### ⚠ 判定は `subscriptions.device_id` から引く
 

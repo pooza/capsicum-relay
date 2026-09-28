@@ -55,7 +55,63 @@ module Relay
         entitlement_response(token).to_json
       end
 
+      # 手元の token の**いまの状態**を読む (#80)。
+      #
+      # ⚠⚠ **`POST` を状態確認に使い回さないための口。**あちらは upsert なので
+      # 冪等ではあるが、呼ぶたびに `relay_entitlement_token_total` が増え
+      # `entitlement.issued` が出る —— **「発行の回数」を数えている counter が
+      # 「画面を開いた回数」に汚染され、ゲートを閉じてよいかの判断材料が濁る。**
+      #
+      # ⚠ **副作用を持たない。**metrics もログも増やさず、⚠ **ストアへも
+      # 問い合わせ直さない**（状態を書くのは通知と再確認の仕事・#61 / #62 / #63）。
+      #
+      # ⚠⚠ **404 と「失効」を混ぜない。**クライアントから見て「知らない token」
+      # （端末の保存が壊れた / 消された）と「失効した token」（解約・支払い失敗）は
+      # **別の状況**で、案内が違う。
+      #
+      # 🔴 **token を URL に載せない（PR #81 の Codex P2）。**`config/nginx.conf.sample`
+      # は素の `access_log` を有効にしており、**リクエスト行に完全なパスが残る** ——
+      # ⚠⚠ **token はそのまま利用権として使える capability** なので、
+      # `/var/log/nginx/capsicum-relay-access.log` に平文で溜まることになる。
+      # このファイル自身が「token はログに出さない」と書いているのと矛盾していた。
+      # ⚠ **ヘッダは既定のログ書式に含まれない**ので `X-Entitlement-Token` で受ける。
+      get '/entitlements' do
+        authenticate!
+
+        provided = header_token
+        halt 400, {error: 'X-Entitlement-Token required'}.to_json if provided.nil?
+
+        token = settings.database.find_entitlement_token(provided)
+        halt 404, {error: 'Unknown entitlement token'}.to_json unless token
+
+        entitlement_response(token).to_json
+      end
+
       helpers do
+        # `X-Entitlement-Token` を読む。無ければ nil。
+        #
+        # 🔴🔴 **encoding を UTF-8 へ直すのが本体（2026-09-28 に実測して判明）。**
+        # **Puma / Rack がヘッダから作る String は `ASCII-8BIT`（バイナリ）**で、
+        # ⚠⚠ **そのまま SQLite にバインドすると TEXT ではなく BLOB になる。**
+        # `WHERE token = ?` は TEXT と BLOB を比べることになり、**行があっても
+        # 永久に一致しない** —— 実際、直すまでこの口は 1 件も引けなかった。
+        #
+        # ⚠ **`request.env` から読むときだけの話。**`params`（URL 由来）と
+        # `json_body`（JSON.parse 由来）は UTF-8 なので起きない。
+        # ⚠ `authenticate!` の `X-Relay-Secret` は**文字列比較**なので影響が無い
+        # （ASCII 同士の `==` は encoding が違っても true）。**SQL へ渡す値だけ**が
+        # 壊れるので、⚠⚠ **気づきにくい。**
+        def header_token
+          raw = request.env['HTTP_X_ENTITLEMENT_TOKEN']
+          return nil if raw.nil?
+
+          value = raw.dup.force_encoding(Encoding::UTF_8)
+          return nil unless value.valid_encoding?
+          return nil if value.empty?
+
+          return value
+        end
+
         # ストアのクライアントがあればその場で確かめる。戻り値は `[token, outcome]`
         # （確かめなかったときの outcome は nil）。
         #
