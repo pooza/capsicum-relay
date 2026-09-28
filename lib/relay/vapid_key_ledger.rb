@@ -33,8 +33,19 @@ module Relay
     KEY = 0
     EXPIRES_AT = 1
     ATTEMPTED_AT = 2
-    FAILED = 3
-    private_constant :KEY, :EXPIRES_AT, :ATTEMPTED_AT, :FAILED
+    # ⚠⚠ **3 状態。**`:in_flight`（誰かが引いている最中）と `:failed`（引いて
+    # 失敗した）を**同じ値にしない (#69・Codex P1 6 巡目)。**畳むと、呼び出し側が
+    # **競合を外部障害と読んで fail-open し、同時リクエストで確定的にゲートを
+    # 抜けられる。**
+    STATE = 3
+    private_constant :KEY, :EXPIRES_AT, :ATTEMPTED_AT, :STATE
+
+    IN_FLIGHT = :in_flight
+    FAILED = :failed
+    OK = :ok
+
+    # 競合（枠が埋まっている / 誰かが引いている最中）。⚠ **外部障害と区別する。**
+    BUSY = :busy
 
     def initialize(ttl: DEFAULT_TTL, negative_ttl: DEFAULT_NEGATIVE_TTL, clock: -> {Time.now.to_f})
       @ttl = ttl
@@ -58,10 +69,19 @@ module Relay
     end
 
     # 期限内の記録があるか（鍵が nil でも true）。
+    #
+    # ⚠⚠ **引いている最中の「まだ鍵が無い」予約は fresh ではない。**
+    # [reserve] は期限を先に置くので、そのままだと**冷えたキャッシュへの同時要求が
+    # 「期限内の nil」を受け取り、競合を外部障害として fail-open する**（実測で
+    # 踏んだ）。⚠ **鍵を持ったままの引き直し中は fresh のまま**（手元の鍵は
+    # 期限まで有効で、返して問題ない）。
     def fresh?(host)
       return @mon.synchronize do
         entry = @entries[host]
-        !entry.nil? && entry[EXPIRES_AT] >= @clock.call
+        next false if entry.nil?
+        next false if entry[KEY].nil? && entry[STATE] == IN_FLIGHT
+
+        entry[EXPIRES_AT] >= @clock.call
       end
     end
 
@@ -76,13 +96,15 @@ module Relay
 
     # 間隔のあいだに来た要求への答え。
     #
-    # ⚠⚠ **直前の試みが失敗（または進行中）なら nil。**手元の古い鍵を返すと、
-    # 呼び出し側が**引き直した結果**と読んで詐称判定に倒し、410 で購読が消える。
+    # ⚠⚠ **直前の試みが失敗なら nil、引いている最中なら [BUSY]。**手元の古い鍵を
+    # 返すと、呼び出し側が**引き直した結果**と読んで詐称判定に倒し、410 で購読が
+    # 消える。⚠ **2 つを畳むと、競合が外部障害として fail-open される。**
     def throttled_result(host)
       return @mon.synchronize do
         entry = @entries[host]
         next nil if entry.nil?
-        next nil if entry[FAILED]
+        next BUSY if entry[STATE] == IN_FLIGHT
+        next nil if entry[STATE] == FAILED
 
         entry[KEY]
       end
@@ -91,8 +113,9 @@ module Relay
     # ⚠⚠ **I/O の前に枠を押さえる。**チェックと更新を 1 つの critical section に
     # 入れないと、**間隔が明けた直後の同時要求が全部素通りする**（Codex P1 3 巡目）。
     #
-    # ⚠ **悲観的に「失敗」を立ててから出ていく。**引いている最中に来た要求には
-    # nil を返したい（＝ fail-open）ので、成功したときに [store] が倒す。
+    # ⚠ **[IN_FLIGHT] を立ててから出ていく。**引いている最中に来た要求には
+    # [BUSY] を返したい（＝ **fail-open にしない**）ので、結末が出たら
+    # [store] / [mark_failed] が倒す。
     def reserve(host)
       now = @clock.call
       return @mon.synchronize do
@@ -100,18 +123,29 @@ module Relay
         next false if entry && (now - entry[ATTEMPTED_AT]) < MIN_REFRESH_INTERVAL
 
         @entries[host] = if entry.nil?
-          [nil, now + @negative_ttl, now, true]
+          [nil, now + @negative_ttl, now, IN_FLIGHT]
         else
-          [entry[KEY], entry[EXPIRES_AT], now, true]
+          [entry[KEY], entry[EXPIRES_AT], now, IN_FLIGHT]
         end
         true
       end
     end
 
+    # 引けなかった。⚠ **鍵と期限は残す**（一時的な障害で記録を壊さない）。
+    def mark_failed(host)
+      @mon.synchronize do
+        entry = @entries[host]
+        next if entry.nil?
+
+        @entries[host] = [entry[KEY], entry[EXPIRES_AT], entry[ATTEMPTED_AT], FAILED]
+      end
+      return nil
+    end
+
     def store(host, key)
       ttl = key.nil? ? @negative_ttl : @ttl
       now = @clock.call
-      @mon.synchronize {@entries[host] = [key, now + ttl, now, false]}
+      @mon.synchronize {@entries[host] = [key, now + ttl, now, OK]}
       return key
     end
 

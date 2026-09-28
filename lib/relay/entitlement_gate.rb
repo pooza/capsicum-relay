@@ -42,6 +42,12 @@ module Relay
     REASON_PRESET_UNSIGNED = 'preset_unsigned'.freeze
     # プリセットを名乗ったが、**そのホストの鍵ではない** (#69)。⚠⚠ **詐称。**
     REASON_PRESET_MISMATCH = 'preset_mismatch'.freeze
+    # プリセットを名乗ったが、**裏取りが競合した** (#69・Codex P1 6 巡目)。
+    #
+    # ⚠⚠ **fail-open にしない。**畳むと、**同時リクエストを撃つだけで確定的に
+    # ゲートを抜けられる** —— 1 本目が枠を取り、2 本目が「外部障害」として通る。
+    # ⚠ **410 でもない**（購読が消える）。route が **503 で再試行させる。**
+    REASON_PRESET_BUSY = 'preset_busy'.freeze
 
     # [decide] の `preset_verification` に渡せる値。
     #
@@ -54,6 +60,7 @@ module Relay
     PRESET_UNAVAILABLE = :unavailable
     PRESET_UNSIGNED = :unsigned
     PRESET_MISMATCH = :mismatch
+    PRESET_BUSY = :busy
 
     # ⚠⚠ **判定に失敗したので通した。**この理由が出ているあいだゲートは効いて
     # いないので、**数が 0 でないことに気付けるようにする**のがラベルの役目。
@@ -120,6 +127,7 @@ module Relay
       when PRESET_NOT_CHECKED, PRESET_VERIFIED then return [true, REASON_PRESET]
       when PRESET_UNAVAILABLE then return [true, REASON_PRESET_UNVERIFIABLE]
       when PRESET_MISMATCH then return [false, REASON_PRESET_MISMATCH]
+      when PRESET_BUSY then return [false, REASON_PRESET_BUSY]
       else return [false, REASON_PRESET_UNSIGNED]
       end
     end

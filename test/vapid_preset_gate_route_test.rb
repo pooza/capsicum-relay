@@ -2,6 +2,7 @@ require_relative 'support/request_test_case'
 require 'base64'
 require 'jwt'
 require 'openssl'
+require 'relay/vapid_key_ledger'
 
 # プリセットの名乗りを `/push` の VAPID 署名で裏取りする (capsicum#597 / #69)。
 #
@@ -328,5 +329,75 @@ class VapidPresetGateRouteTest < RequestTestCase
       metrics.value('relay_vapid_verification_total',
         {server: 'mastodon.social', outcome: 'absent', verification: 'unsigned'}),
     )
+  end
+
+  # --- ⚠⚠ 6 巡目の Codex P1（競合を fail-open にしていた） ---------------
+
+  # 手元は @key、引き直すと競合（BUSY）を返す代役。
+  class BusyDirectory
+    def initialize(host, cached)
+      @host = Relay::PresetServers.normalize(host)
+      @cached = cached
+    end
+
+    def public_key_for(host)
+      return Relay::PresetServers.normalize(host) == @host ? @cached : nil
+    end
+
+    def refresh_key_for(_host) = Relay::VapidKeyLedger::BUSY
+  end
+
+  # ⚠⚠ **競合を fail-open にすると、同時リクエストを撃つだけで確定的に
+  # ゲートを抜けられる。**1 本目が枠を取り、2 本目が「外部障害」として通る形。
+  #
+  # ⚠ **410 でもない**（購読が永久に消える）。**503 で再試行させる。**
+  #
+  # ⚠⚠ **ステータスだけで見ない。**fixture は apns 未設定なので、**素通りしても
+  # 503 になる**（`ensure_push_client!`）。本文の `reason` で区別する。
+  def test_a_busy_verification_is_503_not_allowed
+    Relay::BaseApp.set(:vapid_keys, BusyDirectory.new(PRESET, encode(@key)))
+
+    with_enforce do
+      # 別の鍵で署名 → 引き直しへ入る → 競合。
+      assert_equal(503, push_claiming_preset(authorization: vapid_header(@other)))
+    end
+
+    assert_equal('busy', json_response['reason'])
+  end
+
+  # ⚠ 上流に再送させるための手掛かりを付ける。
+  def test_a_busy_verification_asks_for_a_retry
+    Relay::BaseApp.set(:vapid_keys, BusyDirectory.new(PRESET, encode(@key)))
+    with_enforce {push_claiming_preset(authorization: vapid_header(@other))}
+
+    assert_equal('1', last_response.headers['Retry-After'])
+  end
+
+  # ⚠ 理由を `unverifiable`（外部障害）に溶かさない。
+  def test_busy_is_recorded_separately_from_an_external_failure
+    Relay::BaseApp.set(:vapid_keys, BusyDirectory.new(PRESET, encode(@key)))
+    with_enforce {push_claiming_preset(authorization: vapid_header(@other))}
+
+    assert_equal(
+      1,
+      metrics.value('relay_vapid_verification_total',
+        {server: PRESET, outcome: 'verified', verification: 'busy'}),
+    )
+    assert_equal(
+      0,
+      metrics.value('relay_entitlement_gate_total',
+        {route: 'push', decision: 'allow', reason: 'preset_unverifiable'}),
+    )
+  end
+
+  # ⚠⚠ **既定（enforce off）では 503 にしない。**ゲートが何も閉じていないのに
+  # 裏取りの競合だけで push を弾いたら、それこそ実害になる。
+  #
+  # ⚠ 素通りしても apns 未設定で 503 になるので、**本文で区別する。**
+  def test_a_busy_verification_does_not_reject_when_enforce_is_off
+    Relay::BaseApp.set(:vapid_keys, BusyDirectory.new(PRESET, encode(@key)))
+    push_claiming_preset(authorization: vapid_header(@other))
+
+    refute_equal('busy', json_response['reason'])
   end
 end

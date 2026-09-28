@@ -47,25 +47,35 @@ module Relay
       @ledger = Relay::VapidKeyLedger.new(ttl: ttl, negative_ttl: negative_ttl, clock: clock)
     end
 
-    # 引けたら base64url（パディング無し）に揃えた公開鍵、引けなければ nil。
+    # 引けたら base64url（パディング無し）に揃えた公開鍵。
     #
-    # ⚠⚠ **枠は 2 段階。プロセス全体 → ホストごと、の順に押さえる (#69・Codex P1)。**
-    # 順を逆にすると、**全体の枠が取れなかったときにホストの枠だけ焼く**ので、
-    # 引いてもいないのに 60 秒間そのホストが引き直せなくなる。
+    # ⚠⚠ **戻り値は 3 通り (#69・Codex P1 6 巡目)。**
     #
-    # ⚠ **枠が取れなければ nil**（誰かが引いている最中 / 直前に試して失敗した）。
-    # 呼び出し側は fail-open に倒す。
+    # | 戻り値 | 意味 | 呼び出し側 |
+    # | --- | --- | --- |
+    # | 鍵（String） | 引けた | 照合する |
+    # | `nil` | **外部の障害**で引けなかった | ⚠ fail-open |
+    # | [Relay::VapidKeyLedger::BUSY] | **競合**（枠が埋まっている） | ⚠⚠ **fail-open にしない**（再試行させる） |
+    #
+    # ⚠⚠ **競合を `nil` に畳まない。**畳むと、**同時リクエストを撃つだけで確定的に
+    # ゲートを抜けられる** —— 1 本目が枠を取り、2 本目が「外部障害」として通る。
+    #
+    # ⚠ **枠は 2 段階。プロセス全体 → ホストごと、の順に押さえる。**順を逆に
+    # すると、**全体の枠が取れなかったときにホストの枠だけ焼く**ので、引いても
+    # いないのに 60 秒間そのホストが引き直せなくなる。
     def public_key_for(server)
       host = allowed(server)
       return nil unless host
       return @ledger.read(host) if @ledger.fresh?(host)
-      return nil unless @ledger.acquire_slot
+      return Relay::VapidKeyLedger::BUSY unless @ledger.acquire_slot
 
       begin
-        return nil unless @ledger.reserve(host)
+        # ⚠ 枠は取れたのに予約が取れない ＝ 誰かが引いている最中 / 直前に試した。
+        return @ledger.throttled_result(host) unless @ledger.reserve(host)
 
+        key = discover(host)
         # ⚠ 引けなければ negative cache（従来どおり）。手元の鍵は既に期限切れ。
-        return @ledger.store(host, discover(host))
+        return @ledger.store(host, key)
       ensure
         @ledger.release_slot
       end
@@ -78,25 +88,21 @@ module Relay
     # いると 410 を返して上流の購読が永久に消える。**取り返しがつかないので、
     # 詐称と決める前に必ず引き直す。
     #
-    # 戻り値は **引き直せた鍵**。⚠ **引き直せなかったら nil**（呼び出し側は
-    # fail-open に倒す）—— 古い鍵をそのまま返すと、⚠ **上の事故がそのまま起きる。**
-    #
-    # ⚠⚠ **直前が失敗なら、間隔のあいだは nil を返し続ける** —— 手元の古い鍵を
-    # 返すと、呼び出し側がそれを**引き直した結果**と読んで詐称判定に倒す。
+    # 戻り値は [public_key_for] と同じ 3 通り。⚠ **古い鍵をそのまま返さない**
+    # （呼び出し側が**引き直した結果**と読んで詐称判定に倒す）。
     def refresh_key_for(server)
       host = allowed(server)
       return nil unless host
       # ⚠ **間隔の判定は枠の前。**I/O をしないので、枠を待たせる必要が無い。
       return @ledger.throttled_result(host) if @ledger.throttled?(host)
-      return nil unless @ledger.acquire_slot
+      return Relay::VapidKeyLedger::BUSY unless @ledger.acquire_slot
 
       begin
         return @ledger.throttled_result(host) unless @ledger.reserve(host)
 
         key = discover(host)
-        # ⚠ **引けなかったら手元の記録を壊さない。**予約の時点で「失敗」を
-        # 立ててあるので、間隔が明けるまでは nil が返る。
-        return nil if key.nil?
+        # ⚠ **引けなかったら手元の記録を壊さない。**`failed` を立てるだけ。
+        return @ledger.mark_failed(host) if key.nil?
 
         return @ledger.store(host, key)
       ensure

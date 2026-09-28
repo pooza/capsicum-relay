@@ -1,6 +1,7 @@
 require_relative 'entitlement_gate'
 require_relative 'preset_servers'
 require_relative 'vapid_assertion'
+require_relative 'vapid_key_ledger'
 
 module Relay
   # 認可ゲートを route から呼ぶための helper (capsicum#597 / #60)。
@@ -14,8 +15,10 @@ module Relay
     # 閉じる形（登録は拒むのに既存の購読は叩き続ける）になる。判定の規則は
     # [Relay::EntitlementGate] が正本。
     #
-    # [route] は metrics のラベル（`register` / `push`）。戻り値は許可か。
-    def entitlement_allowed?(subscription, route:)
+    # [route] は metrics のラベル（`register` / `push`）。
+    # 戻り値は `[許可か, 理由]`。⚠ **理由まで返す**のは、route が
+    # **410（購読を掃除させる）と 503（再試行させる）を分ける**ため (#69)。
+    def entitlement_decision(subscription, route:)
       allowed, reason = Relay::EntitlementGate.decide(
         subscription: subscription,
         database: settings.database,
@@ -27,7 +30,7 @@ module Relay
         {route: route, decision: allowed ? 'allow' : 'deny', reason: reason},
       )
       log_gate_decision(subscription, route: route, allowed: allowed, reason: reason)
-      return allowed
+      return [allowed, reason]
     end
 
     # プリセットの名乗りの裏を取る (#69)。
@@ -107,8 +110,12 @@ module Relay
     # ⚠⚠ **順序が意味を持つ。**鍵が引けないときは、署名の有無に関わらず
     # `unavailable`（＝ fail-open）。**こちらが確かめられなかったことを、相手の
     # 落ち度として数えない。**
+    #
+    # ⚠ **ただし競合（[Relay::VapidKeyLedger::BUSY]）は外部障害ではない。**
+    # fail-open にすると**同時リクエストで確定的に抜けられる**ので分ける。
     def classify_preset_claim(server, assertion)
       expected = settings.vapid_keys&.public_key_for(server)
+      return Relay::EntitlementGate::PRESET_BUSY if expected == Relay::VapidKeyLedger::BUSY
       return Relay::EntitlementGate::PRESET_UNAVAILABLE if expected.nil?
       return Relay::EntitlementGate::PRESET_UNSIGNED unless assertion.verified?
       return Relay::EntitlementGate::PRESET_VERIFIED if assertion.public_key == expected
@@ -122,10 +129,11 @@ module Relay
     # なる。そのあいだ本物の push が全部 `mismatch` になり、⚠⚠ **ゲートを閉じて
     # いると 410 を返して上流の購読が永久に消える。**
     #
-    # ⚠ **引き直せなかったら fail-open**（`unavailable`）。古い鍵のままで詐称と
-    # 決めると、上の事故がそのまま起きる。
+    # ⚠ **引き直せなかったら fail-open**（`unavailable`）。⚠⚠ **競合は別扱い**
+    # （`busy` → 503 で再試行）。
     def rotated_or_mismatch(server, assertion)
       fresh = settings.vapid_keys&.refresh_key_for(server)
+      return Relay::EntitlementGate::PRESET_BUSY if fresh == Relay::VapidKeyLedger::BUSY
       return Relay::EntitlementGate::PRESET_UNAVAILABLE if fresh.nil?
       return Relay::EntitlementGate::PRESET_VERIFIED if assertion.public_key == fresh
 

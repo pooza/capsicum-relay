@@ -1,6 +1,7 @@
 require_relative 'test_helper'
 require 'json'
 require 'relay/vapid_key_directory'
+require 'relay/vapid_key_ledger'
 
 # 鍵の引き直し (capsicum#597 / #69・PR #77 の Codex P1)。
 #
@@ -15,6 +16,7 @@ class VapidKeyRefreshTest < Minitest::Test
   HOSTS = ['mstdn.b-shock.org'].freeze
   MASTODON_URL = 'https://mstdn.b-shock.org/api/v2/instance'.freeze
   OTHER_HOST = 'precure.ml'.freeze
+  BUSY = Relay::VapidKeyLedger::BUSY
   OTHER_MASTODON_URL = 'https://precure.ml/api/v2/instance'.freeze
   HOST = 'mstdn.b-shock.org'.freeze
 
@@ -227,7 +229,7 @@ class VapidKeyRefreshTest < Minitest::Test
     entered.pop # 1 本目が I/O に入るまで待つ
 
     # ⚠ **この 4 本は I/O に入ってはいけない**（枠が押さえられているので即 nil）。
-    4.times {assert_nil(dir.refresh_key_for(HOST), '引いている最中は nil')}
+    4.times {assert_equal(BUSY, dir.refresh_key_for(HOST), '引いている最中は busy')}
 
     assert_equal(1, fetch.calls.size, '外向き HTTP は 1 本だけ')
 
@@ -257,7 +259,7 @@ class VapidKeyRefreshTest < Minitest::Test
     entered.pop # 1 本目が I/O に入るまで待つ
 
     # ⚠ **この 4 本は I/O に入ってはいけない。**
-    4.times {assert_nil(dir.public_key_for(HOST), '引いている最中は nil')}
+    4.times {assert_equal(BUSY, dir.public_key_for(HOST), '引いている最中は busy')}
 
     assert_equal(1, fetch.calls.size, '外向き HTTP は 1 本だけ')
 
@@ -301,7 +303,7 @@ class VapidKeyRefreshTest < Minitest::Test
     entered.pop # 1 本目が I/O に入るまで待つ
 
     # ⚠⚠ **別ホストでも I/O に入ってはいけない。**
-    assert_nil(dir.public_key_for(OTHER_HOST), '別ホストでも全体の枠で止まる')
+    assert_equal(BUSY, dir.public_key_for(OTHER_HOST), '別ホストでも全体の枠で止まる')
     assert_equal(1, fetch.calls.size, '外向き HTTP は 1 本だけ')
 
     release << true
@@ -325,7 +327,7 @@ class VapidKeyRefreshTest < Minitest::Test
     first = Thread.new {dir.public_key_for(HOST)}
     entered.pop
 
-    assert_nil(dir.public_key_for(OTHER_HOST), '全体の枠が無いので今は引けない')
+    assert_equal(BUSY, dir.public_key_for(OTHER_HOST), '全体の枠が無いので今は引けない')
 
     release << true
     first.value
