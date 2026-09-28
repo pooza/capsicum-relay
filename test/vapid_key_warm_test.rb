@@ -103,7 +103,7 @@ class VapidKeyWarmTest < Minitest::Test
     dir, = directory(bodies)
     dir.warm!
 
-    assert_equal([2, 2], dir.cached_counts, '返った時点で温まっている')
+    assert_equal({fresh: 2, held: 2, total: 2}, dir.cached_counts, '返った時点で温まっている')
   end
 
   # ⚠⚠ **ただし無制限には待たない。**ホストが落ちていると 1 台で最大 12 秒かかり、
@@ -116,11 +116,11 @@ class VapidKeyWarmTest < Minitest::Test
     waited = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
 
     assert_operator(waited, :<, 0.2, '上限で待つのをやめる')
-    refute_equal([2, 2], dir.cached_counts, 'まだ温め終えていない')
+    refute_equal({fresh: 2, held: 2, total: 2}, dir.cached_counts, 'まだ温め終えていない')
 
     thread.join
 
-    assert_equal([2, 2], dir.cached_counts, '背景で続きが進む')
+    assert_equal({fresh: 2, held: 2, total: 2}, dir.cached_counts, '背景で続きが進む')
   end
 
   # ⚠⚠ **直列に引く。**並列にすると push の受け口と枠を奪い合う。
@@ -207,14 +207,14 @@ class VapidKeyWarmTest < Minitest::Test
   def test_cached_counts_starts_empty
     dir, = directory(bodies)
 
-    assert_equal([0, 2], dir.cached_counts)
+    assert_equal({fresh: 0, held: 0, total: 2}, dir.cached_counts)
   end
 
   def test_cached_counts_rises_after_warm
     dir, = directory(bodies)
     dir.warm!.join
 
-    assert_equal([2, 2], dir.cached_counts)
+    assert_equal({fresh: 2, held: 2, total: 2}, dir.cached_counts)
   end
 
   # ⚠ 引けなかったホストは数に入らない（negative cache を「持っている」にしない）。
@@ -222,6 +222,32 @@ class VapidKeyWarmTest < Minitest::Test
     dir, = directory({MASTODON_URL => bodies[MASTODON_URL]})
     dir.warm!.join
 
-    assert_equal([1, 2], dir.cached_counts)
+    assert_equal({fresh: 1, held: 1, total: 2}, dir.cached_counts)
+  end
+
+  # ⚠⚠ **TTL が切れたら `fresh` は減り、`held` は残る（PR #79 の Codex P2）。**
+  #
+  # ⚠ **この 2 つを畳むと、「冷えている」が監視から読めなくなる** —— 期限切れでも
+  # 手元の鍵は残るので、畳んだ数字は**永久に満室のまま**になる。
+  #
+  # ⚠ 2 つはそれぞれ別の問いに答える:
+  #   `fresh` が減った ＝ 次の照合で引き直しが走る
+  #   `held` が減った ＝ ⚠⚠ **`busy`（503）になり得る**
+  def test_an_expired_key_lowers_fresh_but_not_held
+    now = 1000.0
+    fetch = FakeFetch.new(bodies)
+    dir = Relay::VapidKeyDirectory.new(
+      hosts: HOSTS, fetch: fetch.to_proc, ttl: 60, clock: -> {now},
+    )
+    dir.warm!
+
+    assert_equal({fresh: 2, held: 2, total: 2}, dir.cached_counts)
+
+    now += 61
+
+    assert_equal(
+      {fresh: 0, held: 2, total: 2}, dir.cached_counts,
+      '期限切れでも手元には残る（busy にはならないが引き直しは走る）'
+    )
   end
 end

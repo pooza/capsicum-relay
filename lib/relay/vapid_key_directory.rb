@@ -130,16 +130,28 @@ module Relay
       return @ledger.retry_after(host)
     end
 
-    # いま鍵を持っているホストの数 / 一覧の数（#78）。
+    # 鍵の温まり具合（#78）。`{fresh:, held:, total:}`。
     #
     # ⚠⚠ **先読みが効いたかを外から見るための口。**これが無いと、
     # **`warm!` が空振りしていても気付けない**（[warm!] は無言で、
     # `relay_vapid_verification_total` は push が来るまで 1 件も出ない）。
-    # ⚠ TTL 切れも同じ数字に出るので、**運用中の「冷えている」も読める。**
     #
-    # ⚠ 期限は見ない —— **手元にあるか**を数える（[stale_or] が使うのと同じ基準）。
+    # ⚠⚠ **`fresh` と `held` を分ける（PR #79 の Codex P2）。**畳むと
+    # **TTL が切れても数字が動かず、「冷えている」が読めない。**
+    #
+    # | | 数えるもの | 答える問い |
+    # | --- | --- | --- |
+    # | `fresh` | **期限内**の鍵 | ⚠ 次の照合で**引き直しが要るか**（TTL 切れの検出） |
+    # | `held` | 期限を問わず**手元にある**鍵 | ⚠⚠ **`busy` になり得るか**（[stale_or] が使うのと同じ基準） |
+    #
+    # ⚠ **2 つはずれる。**期限が切れても手元の鍵は残るので `held` は減らない ——
+    # **そのぶん `busy` にはならないが、引き直しは走る。**
     def cached_counts
-      return [@hosts.count {|host| !@ledger.stale_key(host).nil?}, @hosts.size]
+      return {
+        fresh: @hosts.count {|host| !@ledger.read(host).nil?},
+        held: @hosts.count {|host| !@ledger.stale_key(host).nil?},
+        total: @hosts.size,
+      }
     end
 
     # ⚠⚠ **起動時にプリセットの鍵を引いておく (#78)。**

@@ -32,14 +32,22 @@ module Relay
         # 冷えていないか」を**押し掛けて確かめられない。**
         # ⚠ **冷えていると、同時に来た push が `busy`（503）になる**
         # —— 🔴 Misskey は 5xx を再送しないので通知が消える。
+        # ⚠⚠ **`fresh` と `held` を分ける（PR #79 の Codex P2）。**畳むと
+        # **TTL が切れても数字が動かず、「冷えている」が読めない。**
         def vapid_gauges
-          cached, total = settings.vapid_keys&.cached_counts || [0, 0]
+          counts = settings.vapid_keys&.cached_counts || {fresh: 0, held: 0, total: 0}
           return {
-            'relay_vapid_keys_cached' => [
-              'Preset hosts whose VAPID public key is held (⚠ cold cache makes pushes busy).',
-              cached,
+            'relay_vapid_keys_fresh' => [
+              'Preset hosts whose VAPID key is within its TTL (⚠ below hosts means refetching).',
+              counts[:fresh],
             ],
-            'relay_vapid_keys_hosts' => ['Preset hosts the relay may fetch keys for.', total],
+            'relay_vapid_keys_held' => [
+              'Preset hosts holding a VAPID key at all (⚠ below hosts means busy).',
+              counts[:held],
+            ],
+            'relay_vapid_keys_hosts' => [
+              'Preset hosts the relay may fetch keys for.', counts[:total]
+            ],
           }
         end
 
