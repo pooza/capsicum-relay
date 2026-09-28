@@ -22,7 +22,29 @@ module Relay
       helpers do
         # DB から都度読む現在値。counter と違って再起動をまたいで意味を保つ。
         def gauges
-          return push_gauges.merge(entitlement_gauges)
+          return push_gauges.merge(entitlement_gauges).merge(vapid_gauges)
+        end
+
+        # 裏取りの鍵がいくつ手元にあるか (#78)。
+        #
+        # ⚠⚠ **counter では代わりにならない。**`relay_vapid_verification_total` は
+        # **push が来るまで 1 件も出ない**ので、「先読みが効いたか」「TTL が切れて
+        # 冷えていないか」を**押し掛けて確かめられない。**
+        # ⚠ **冷えていると、同時に来た push が `busy`（503）になる**
+        # —— 🔴 Misskey は 5xx を再送しないので通知が消える。
+        # ⚠ **数えるのは期限内の鍵だけ**（PR #79 の Codex P2）。期限切れを混ぜると
+        # **TTL が切れても数字が動かず、「冷えている」が読めない。**
+        def vapid_gauges
+          counts = settings.vapid_keys&.cached_counts || {fresh: 0, total: 0}
+          return {
+            'relay_vapid_keys_fresh' => [
+              'Preset hosts whose VAPID key is within its TTL (⚠ below hosts means refetching).',
+              counts[:fresh],
+            ],
+            'relay_vapid_keys_hosts' => [
+              'Preset hosts the relay may fetch keys for.', counts[:total]
+            ],
+          }
         end
 
         def push_gauges
