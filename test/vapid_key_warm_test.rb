@@ -180,4 +180,30 @@ class VapidKeyWarmTest < Minitest::Test
     release << true
     first.join
   end
+
+  # --- ⚠⚠ 先読みが効いたかを外から見る（#78） ----------------------------
+  #
+  # ⚠ **counter では代わりにならない。**`relay_vapid_verification_total` は
+  # push が来るまで 1 件も出ないので、**空振りに気付けない。**
+
+  def test_cached_counts_starts_empty
+    dir, = directory(bodies)
+
+    assert_equal([0, 2], dir.cached_counts)
+  end
+
+  def test_cached_counts_rises_after_warm
+    dir, = directory(bodies)
+    dir.warm!.join
+
+    assert_equal([2, 2], dir.cached_counts)
+  end
+
+  # ⚠ 引けなかったホストは数に入らない（negative cache を「持っている」にしない）。
+  def test_a_host_that_could_not_be_fetched_is_not_counted
+    dir, = directory({MASTODON_URL => bodies[MASTODON_URL]})
+    dir.warm!.join
+
+    assert_equal([1, 2], dir.cached_counts)
+  end
 end

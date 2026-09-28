@@ -121,6 +121,18 @@ module Relay
       return @ledger.retry_after(host)
     end
 
+    # いま鍵を持っているホストの数 / 一覧の数（#78）。
+    #
+    # ⚠⚠ **先読みが効いたかを外から見るための口。**これが無いと、
+    # **`warm!` が空振りしていても気付けない**（[warm!] は無言で、
+    # `relay_vapid_verification_total` は push が来るまで 1 件も出ない）。
+    # ⚠ TTL 切れも同じ数字に出るので、**運用中の「冷えている」も読める。**
+    #
+    # ⚠ 期限は見ない —— **手元にあるか**を数える（[stale_or] が使うのと同じ基準）。
+    def cached_counts
+      return [@hosts.count {|host| !@ledger.stale_key(host).nil?}, @hosts.size]
+    end
+
     # ⚠⚠ **起動時にプリセットの鍵を引いておく (#78)。**
     #
     # これが無いと、**再起動直後に同時に来た push が全部 `busy`（503）になる** ——
