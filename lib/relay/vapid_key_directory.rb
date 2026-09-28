@@ -110,6 +110,17 @@ module Relay
       end
     end
 
+    # [Relay::VapidKeyLedger::BUSY] を返したときに、上流へ伝える待ち時間（秒）。
+    #
+    # ⚠ **一覧の外のホストはここへ来ない**（[BUSY] にならない）が、呼び出し側が
+    # 分岐を持たなくて済むよう既定値を返す。
+    def retry_after_for(server)
+      host = allowed(server)
+      return Relay::VapidKeyLedger::CONTENTION_RETRY_AFTER if host.nil?
+
+      return @ledger.retry_after(host)
+    end
+
     # テストと、設定を読み直したときのための口。
     def reset!
       @ledger.clear

@@ -30,6 +30,10 @@ module Relay
     # 好きなホストを名乗れる**ので、攻撃者がこれを起こせる。
     MAX_CONCURRENT_DISCOVERY = 1
 
+    # 枠の取り合いで待たせるときの `Retry-After`（秒）。引き終わるまでなので、
+    # 最長でも discover の timeout 2 本ぶん。
+    CONTENTION_RETRY_AFTER = 5
+
     KEY = 0
     EXPIRES_AT = 1
     ATTEMPTED_AT = 2
@@ -115,6 +119,33 @@ module Relay
         next nil if entry[STATE] == FAILED
 
         BUSY
+      end
+    end
+
+    # [BUSY] を返すときに上流へ伝える待ち時間（秒）。
+    #
+    # ⚠⚠ **一律に 1 秒と答えてはいけない（PR #77 の Codex 締めの P2）。**
+    # [BUSY] には由来が 2 つあり、**明けるまでの長さが 1 桁違う**:
+    #
+    # | 由来 | 明けるまで |
+    # | --- | --- |
+    # | 枠の取り合い（[acquire_slot] / [IN_FLIGHT]） | 引き終わるまで＝[CONTENTION_RETRY_AFTER] |
+    # | 引き直しの間隔（[MIN_REFRESH_INTERVAL]） | ⚠ **最大 60 秒** |
+    #
+    # ⚠ 後者に 1 秒と答えると、**上流は間隔が明けるまで 503 を受け続け、
+    # 再試行の枠を使い切る** —— 通知が遅れる / 落ちる。
+    #
+    # ⚠ **短いほうへ丸めない**（残りが短ければそのぶんだけ待たせる）。
+    def retry_after(host)
+      now = @clock.call
+      return @mon.synchronize do
+        entry = @entries[host]
+        next CONTENTION_RETRY_AFTER if entry.nil?
+
+        remaining = MIN_REFRESH_INTERVAL - (now - entry[ATTEMPTED_AT])
+        next CONTENTION_RETRY_AFTER if remaining <= CONTENTION_RETRY_AFTER
+
+        remaining.ceil
       end
     end
 

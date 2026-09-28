@@ -345,4 +345,57 @@ class VapidKeyRefreshTest < Minitest::Test
     # ⚠ 枠が空いたら、間隔を待たずに引ける。
     assert_equal(OTHER_KEY, dir.public_key_for(OTHER_HOST))
   end
+
+  # --- ⚠⚠ 待たせる長さ（PR #77 の Codex 締めの P2） ------------------------
+  #
+  # ⚠⚠ **この期待値が短過ぎると何が起きるか:** 上流は言われたとおりに再送し、
+  # **間隔が明けるまで 503 を受け続けて再試行の枠を使い切る** —— 通知が遅れる /
+  # 落ちる。⚠ 逆に長過ぎると、枠の取り合いで待たせただけの push を無用に遅らせる。
+  # **由来で長さが 1 桁違うので、一律の固定値にしない。**
+
+  CONTENTION = Relay::VapidKeyLedger::CONTENTION_RETRY_AFTER
+  INTERVAL = Relay::VapidKeyLedger::MIN_REFRESH_INTERVAL
+
+  # 記録が無い（＝枠の取り合いだけ）なら短い既定値。
+  def test_an_unknown_host_waits_only_for_the_contention
+    dir, = directory({})
+
+    assert_equal(CONTENTION, dir.retry_after_for(HOST))
+  end
+
+  # ⚠⚠ **引いた直後は、間隔が明けるまでの丸ごとを待たせる。**
+  def test_just_after_a_fetch_waits_for_the_whole_interval
+    now = 1000.0
+    dir, = directory({MASTODON_URL => mastodon_body(OLD_KEY)}, clock: -> {now})
+    dir.public_key_for(HOST)
+
+    assert_equal(INTERVAL, dir.retry_after_for(HOST))
+  end
+
+  # ⚠ 途中なら残りだけ。
+  def test_partway_through_the_window_waits_for_the_remainder
+    now = 1000.0
+    dir, = directory({MASTODON_URL => mastodon_body(OLD_KEY)}, clock: -> {now})
+    dir.public_key_for(HOST)
+    now += 40
+
+    assert_equal(20, dir.retry_after_for(HOST))
+  end
+
+  # ⚠ 明けていても 0 や負にしない（枠の取り合いは残る）。
+  def test_after_the_window_falls_back_to_the_contention_wait
+    now = 1000.0
+    dir, = directory({MASTODON_URL => mastodon_body(OLD_KEY)}, clock: -> {now})
+    dir.public_key_for(HOST)
+    now += INTERVAL + 10
+
+    assert_equal(CONTENTION, dir.retry_after_for(HOST))
+  end
+
+  # ⚠ 一覧の外は待たせる意味が無いので既定値（呼び出し側に分岐を作らない）。
+  def test_a_host_outside_the_list_gets_the_default
+    dir, = directory({})
+
+    assert_equal(CONTENTION, dir.retry_after_for('evil.example.test'))
+  end
 end

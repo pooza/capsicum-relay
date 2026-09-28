@@ -25,7 +25,7 @@ module Relay
         # ⚠⚠ **競合は 503（再試行）、利用権なしは 410（購読を掃除させる）。**
         # 混ぜると、**裏取りが混み合っただけで上流の購読が永久に消える。**
         if !allowed && gate_reason == Relay::EntitlementGate::REASON_PRESET_BUSY
-          halt_entitlement_busy!
+          halt_entitlement_busy!(sub)
         end
         halt_entitlement_gone! unless allowed
         return {status: 'deduped'}.to_json if deduped?(sub)
@@ -120,8 +120,12 @@ module Relay
         # `reason="preset_busy"` で既に 1 回数えている。ここで足すと**同じ要求を
         # 2 回数える**ので、あの counter の合計が「判定の回数」でなくなり、
         # ⚠ **ゲートを閉じてよいかを測る材料が濁る。**
-        def halt_entitlement_busy!
-          headers['Retry-After'] = '1'
+        # ⚠⚠ **`Retry-After` を 1 秒で固定しない（Codex 締めの P2）。**
+        # 引き直しの間隔（`MIN_REFRESH_INTERVAL` = 60 秒）で待たせている場合、
+        # 1 秒と答えると**上流は明けるまで 503 を受け続けて再試行の枠を使い切る**
+        # —— 通知が遅れる / 落ちる。残りを [Relay::VapidKeyLedger.retry_after] に訊く。
+        def halt_entitlement_busy!(sub)
+          headers['Retry-After'] = entitlement_retry_after(sub).to_s
           halt 503, {error: 'Entitlement check busy', reason: 'busy'}.to_json
         end
 

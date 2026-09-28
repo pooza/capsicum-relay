@@ -123,6 +123,13 @@ module Relay
       return rotated_or_mismatch(server, assertion)
     end
 
+    # 競合で待たせるときの `Retry-After`（秒）。理由は
+    # [Relay::VapidKeyLedger.retry_after] にある。
+    def entitlement_retry_after(sub)
+      return settings.vapid_keys&.retry_after_for(sub['server']) ||
+          Relay::VapidKeyLedger::CONTENTION_RETRY_AFTER
+    end
+
     # ⚠⚠ **詐称と決める前に、鍵の更新を 1 度だけ疑う (#69・PR #77 の Codex P1)。**
     #
     # プリセットサーバーが VAPID を作り直すと、TTL のあいだ手元は古い鍵のままに

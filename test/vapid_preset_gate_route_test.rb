@@ -19,6 +19,8 @@ require 'relay/vapid_key_ledger'
 # 4. ⚠ **既定（enforce off）では 1mm も変わらない**
 class VapidPresetGateRouteTest < RequestTestCase
   PRESET = 'mstdn.b-shock.org'.freeze
+  # ⚠ **1 でも `CONTENTION_RETRY_AFTER` でもない値**にする。素通しだと気付けない。
+  RETRY_AFTER = 47
 
   # `public_key_for` だけを持つ最小の代役。[keys] は host => 鍵（nil で「引けない」）。
   class FakeDirectory
@@ -345,6 +347,8 @@ class VapidPresetGateRouteTest < RequestTestCase
     end
 
     def refresh_key_for(_host) = Relay::VapidKeyLedger::BUSY
+    # ⚠ 引き直しの間隔で待たせている想定（枠の取り合いより桁が大きい）。
+    def retry_after_for(_host) = RETRY_AFTER
   end
 
   # ⚠⚠ **競合を fail-open にすると、同時リクエストを撃つだけで確定的に
@@ -366,11 +370,15 @@ class VapidPresetGateRouteTest < RequestTestCase
   end
 
   # ⚠ 上流に再送させるための手掛かりを付ける。
-  def test_a_busy_verification_asks_for_a_retry
+  #
+  # ⚠⚠ **固定値にしない（Codex 締めの P2）。**引き直しの間隔（60 秒）で待たせて
+  # いるのに「1 秒後に」と答えると、**上流は明けるまで 503 を受け続けて再試行の
+  # 枠を使い切る** —— 通知が遅れる / 落ちる。残りをそのまま伝えること。
+  def test_a_busy_verification_asks_for_a_retry_after_the_remaining_window
     Relay::BaseApp.set(:vapid_keys, BusyDirectory.new(PRESET, encode(@key)))
     with_enforce {push_claiming_preset(authorization: vapid_header(@other))}
 
-    assert_equal('1', last_response.headers['Retry-After'])
+    assert_equal(RETRY_AFTER.to_s, last_response.headers['Retry-After'])
   end
 
   # ⚠ 理由を `unverifiable`（外部障害）に溶かさない。
