@@ -190,6 +190,19 @@ module Relay
       # `missing` はビルド時に値を渡し忘れた形、`mismatch` は値が古い形で、
       # 対処が違う。
       def authenticate!
+        # ⚠⚠ **認証が要る応答はキャッシュさせない（PR #81 の Codex P2）。**
+        #
+        # 🔴 **`GET /entitlements` で実際に穴になっていた。**区別する値
+        # （`X-Entitlement-Token`）が**カスタムヘッダにしか無い**ので、
+        # **キャッシュ鍵は全員同じ** —— ブラウザ / CDN / 前段のプロキシが
+        # **最初の呼び出し元の token と購入 ID を別人へ返しうる。**
+        #
+        # ⚠ **ここに置く理由は「入口を 1 本にする」。**route ごとに足すと、
+        # **認証付きの GET を増やしたときに付け忘れる**（`/metrics` も
+        # `/supporters` も同じ形で、鍵は全員同じ）。
+        # ⚠ `Vary` では足りない —— **知らない `Vary` を無視するキャッシュがある。**
+        headers['Cache-Control'] = 'private, no-store'
+
         secret = settings.config['shared_secret']
         provided = request.env['HTTP_X_RELAY_SECRET']
         return if provided == secret

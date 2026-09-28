@@ -192,6 +192,18 @@ value = raw.dup.force_encoding(Encoding::UTF_8)
 
 1. **`authenticate!` は壊れない。**`X-Relay-Secret` は**文字列比較**なので encoding が違っても ASCII 同士なら `==` が true。**認証は通り、SQL へ渡す値だけが壊れる**
 2. 🔴🔴 **Rack::Test では再現しない。**env に**素の String（UTF-8）**を入れるので、**壊れた実装でも検査が緑になる** —— 実際にそう書いて、**1 件も引けない実装のまま検査だけ通っていた**。⚠ **ヘッダを読む route の検査は `force_encoding(Encoding::BINARY)` で渡す**
+
+#### 🔴 認証が要る応答はキャッシュさせない（[#81](https://github.com/pooza/capsicum-relay/pull/81) の Codex P2）
+
+`authenticate!` が `Cache-Control: private, no-store` を付ける。
+
+⚠⚠ **`GET /entitlements` で実際に穴になっていた。**区別する値（`X-Entitlement-Token`）が**カスタムヘッダにしか無い**ので、**キャッシュ鍵は全員同じ** —— ブラウザ / CDN / 前段のプロキシが**最初の呼び出し元の token と購入 ID を別人へ返しうる。**
+
+- ⚠ **`authenticate!` に置く理由は「入口を 1 本にする」。**route ごとに足すと、**認証付きの GET を増やしたときに付け忘れる**（`/metrics` も `/supporters` も同じ形で、鍵は全員同じ）
+- ⚠ **`Vary` では足りない** —— 知らない `Vary` を無視するキャッシュがある
+- ⚠ **`/health` には付かない**（無認証・秘密を返さない）
+
+⚠⚠ **ヘッダで capability を受ける口を足したら、`Relay::SentrySetup::SENSITIVE_HEADERS` にも足す。**例外が上がると Rack 統合がリクエストごと捕まえるので、入れ忘れると**丸ごと Sentry へ出る。**
 - ⚠⚠ **404 と「失効」を混ぜない。**クライアントから見て「知らない token」（端末の保存が壊れた / 消された）と「失効した token」（解約・支払い失敗）は**別の状況**で、案内が違う
 
 ### ⚠ 判定は `subscriptions.device_id` から引く

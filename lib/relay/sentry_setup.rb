@@ -10,7 +10,14 @@ module Relay
     # Web Push のレガシー暗号鍵ヘッダ。before_send で event から除去する
     # (#10 Phase E)。RequestInterface はヘッダ名をタイトルケース化するため
     # その表記で並べ、念のため downcase も併せて削る。
-    SENSITIVE_HEADERS = ['X-Relay-Secret', 'Authorization', 'Crypto-Key', 'Encryption'].freeze
+    # ⚠⚠ **Sentry へ送らないヘッダ。**例外が上がると Rack 統合がリクエストごと
+    # 捕まえるので、**capability をここへ入れ忘れると丸ごと外部へ出る。**
+    #
+    # ⚠ `X-Entitlement-Token` は**そのまま利用権として使える**（PR #81 の Codex P2）。
+    # ⚠ **ヘッダで capability を受ける口を足したら、必ずここにも足す。**
+    SENSITIVE_HEADERS = [
+      'X-Relay-Secret', 'X-Entitlement-Token', 'Authorization', 'Crypto-Key', 'Encryption'
+    ].freeze
 
     def self.init!
       dsn = ENV.fetch('SENTRY_DSN', nil)
