@@ -53,6 +53,24 @@ module Relay
     # → ⚠⚠ **鍵の照合だけでは通ってしまう。**`aud` まで見て初めて「この要求が
     # この relay 宛てに作られた」と言える。
     OUTCOME_AUDIENCE_MISMATCH = 'audience_mismatch'.freeze
+    # 署名は本物だが `exp` が無い / 数値でない / 上限より先（PR #77 の Codex 9 巡目）。
+    #
+    # `exp` が無いと **JWT 側は期限を見ない**（`verify_expiration` は claim が
+    # 在るときだけ効く）ので、⚠ **拾ったヘッダを永久に貼り直せる。**
+    OUTCOME_EXPIRY_UNACCEPTABLE = 'expiry_unacceptable'.freeze
+
+    # `exp` の上限（RFC 8292 §2 の「要求時刻から 24 時間を超えない」）。
+    MAX_EXPIRY = 24 * 60 * 60
+
+    # ⚠⚠ **時計のズレの許容。**上限を素で当ててはいけない ——
+    # **Mastodon は `exp` をちょうど 24 時間後に置く**（`PAYLOAD_EXPIRATION = 24.hours`・
+    # 2026-09-28 に fork のソースで確認）。つまり**常に上限ぴったり**なので、
+    # 相手の時計がこちらより進んでいるだけで上限超過になる。
+    #
+    # ⚠⚠ **超過と判定すると `unsigned` ＝ プリセット扱いをやめる ＝ 閉じていれば
+    # 410 で上流の購読が永久に消える。**弾く側へ倒す理由が「こちらの時計」で
+    # あってはならないので、5 分ぶんの余裕を持たせる。
+    EXPIRY_SKEW = 5 * 60
 
     Result = Struct.new(:outcome, :public_key, :subject, :audience, keyword_init: true) do
       def verified?
@@ -139,27 +157,44 @@ module Relay
 
     # ⚠ **`exp` は JWT 側が見る**（`verify_expiration` の既定が true）。
     # Mastodon は 24 時間、Misskey（`web-push`）は 12 時間で切る。
+    #
+    # ⚠⚠ **ただし `exp` が無ければ JWT 側は何も見ない。**`required_claims` で
+    # **在ることを要求する**（[OUTCOME_EXPIRY_UNACCEPTABLE]）。
     def self.decode_token(token, raw, encoded_key, audience)
-      payload, = JWT.decode(token, public_key_from(raw), true, algorithm: ALGORITHM)
+      payload, = JWT.decode(
+        token, public_key_from(raw), true, algorithm: ALGORITHM, required_claims: ['exp']
+      )
+      return Result.new(outcome: OUTCOME_EXPIRY_UNACCEPTABLE) unless expiry_ok?(payload['exp'])
+
+      return result_for(payload, encoded_key, audience)
+    rescue JWT::MissingRequiredClaim
+      return Result.new(outcome: OUTCOME_EXPIRY_UNACCEPTABLE)
+    rescue JWT::DecodeError
+      return Result.new(outcome: OUTCOME_BAD_SIGNATURE)
+    end
+
+    # ⚠ **`aud` が違っても公開鍵は返す**（ログで「どのサーバー宛ての署名を
+    # 貼り直したか」が読めるように）。⚠⚠ **ただし `verified?` にはしない。**
+    def self.result_for(payload, encoded_key, audience)
       claimed = payload['aud']
-      unless audience_ok?(claimed, audience)
-        # ⚠ **署名は本物なので、公開鍵は返す**（ログで「どのサーバー宛ての
-        # 署名を貼り直したか」が読めるように）。判定は呼び出し側。
-        return Result.new(
-          outcome: OUTCOME_AUDIENCE_MISMATCH,
-          public_key: normalize_key(encoded_key),
-          subject: payload['sub'],
-          audience: claimed,
-        )
-      end
+      outcome = audience_ok?(claimed, audience) ? OUTCOME_VERIFIED : OUTCOME_AUDIENCE_MISMATCH
       return Result.new(
-        outcome: OUTCOME_VERIFIED,
+        outcome: outcome,
         public_key: normalize_key(encoded_key),
         subject: payload['sub'],
         audience: claimed,
       )
-    rescue JWT::DecodeError
-      return Result.new(outcome: OUTCOME_BAD_SIGNATURE)
+    end
+
+    # ⚠ **数値であることまで見る。**文字列の `exp` は JWT 側が `to_i` で読むので、
+    # `"abc"` が 0（＝期限切れ）、`"9999999999"` が遠い未来として通りうる。
+    #
+    # ⚠ 上限は [MAX_EXPIRY] + [EXPIRY_SKEW]（**余裕を持たせる理由は
+    # [EXPIRY_SKEW] の説明** —— 上限を素で当てると本物が全部落ちる）。
+    def self.expiry_ok?(claimed)
+      return false unless claimed.is_a?(Numeric)
+
+      return claimed <= Time.now.to_i + MAX_EXPIRY + EXPIRY_SKEW
     end
 
     # ⚠ **末尾の `/` と大小だけの違いで落とさない。**Mastodon は

@@ -188,6 +188,71 @@ class VapidAssertionTest < Minitest::Test
     assert_equal(@encoded, V.normalize_key(standard))
   end
 
+  # --- ⚠⚠ `exp` の要求と上限（PR #77 の Codex 9 巡目） ---------------------
+  #
+  # ⚠ **`exp` が無いと JWT 側は期限を見ない**（`verify_expiration` は claim が
+  # 在るときだけ効く）ので、拾ったヘッダを永久に貼り直せる。
+  #
+  # ⚠⚠ **この期待値が厳し過ぎると何が起きるか:** 超過と判定した assertion は
+  # `verified?` にならず、`classify_preset_claim` が `unsigned` ＝ プリセット扱いを
+  # やめる。**閉じていれば 410 ＝ 上流の購読が永久に消える。**
+  # **本物を落とさないことのほうが、上限を厳密にすることより重い。**
+
+  # 期限の無いトークン（`exp` を入れない）。
+  def token_without_exp
+    return JWT.encode({aud: AUDIENCE, sub: 'mailto:ops@example.test'}, @key, 'ES256')
+  end
+
+  def test_a_token_without_exp_is_not_verified
+    result = V.verify(authorization: "vapid t=#{token_without_exp},k=#{@encoded}")
+
+    refute_predicate(result, :verified?)
+    assert_equal(V::OUTCOME_EXPIRY_UNACCEPTABLE, result.outcome)
+  end
+
+  def test_an_exp_far_beyond_the_limit_is_not_verified
+    far = token(exp: Time.now.to_i + (48 * 60 * 60))
+    result = V.verify(authorization: "vapid t=#{far},k=#{@encoded}")
+
+    refute_predicate(result, :verified?)
+    assert_equal(V::OUTCOME_EXPIRY_UNACCEPTABLE, result.outcome)
+  end
+
+  # ⚠⚠ **`JWT.decode` は文字列の `exp` を素通りさせる**（2026-09-28 に jwt 3.2.0 で
+  # 実測。`"9999999999"` がそのまま payload に入って通った）。期限の検査が丸ごと
+  # 効かないので、**こちらで数値であることまで見る。**
+  #
+  # ⚠ `JWT.encode` は文字列の `exp` を拒むので、`JWT::Token` で直に署名して作る。
+  def test_a_non_numeric_exp_is_not_verified
+    token = JWT::Token.new(
+      payload: {'aud' => AUDIENCE, 'exp' => '9999999999'}, header: {'typ' => 'JWT'},
+    )
+    token.sign!(algorithm: 'ES256', key: @key)
+    result = V.verify(authorization: "vapid t=#{token.jwt},k=#{@encoded}")
+
+    refute_predicate(result, :verified?)
+    assert_equal(V::OUTCOME_EXPIRY_UNACCEPTABLE, result.outcome)
+  end
+
+  # ⚠⚠ **本物を落とさないための検査。**Mastodon は `exp` を**ちょうど 24 時間後**
+  # に置く（`PAYLOAD_EXPIRATION = 24.hours`）ので、**上限を素で当てるとここが落ちる。**
+  def test_exactly_twenty_four_hours_is_still_verified
+    exact = token(exp: Time.now.to_i + V::MAX_EXPIRY)
+
+    assert_predicate(V.verify(authorization: "vapid t=#{exact},k=#{@encoded}"), :verified?)
+  end
+
+  # ⚠⚠ **相手の時計がこちらより 1 分進んでいても落とさない。**
+  #
+  # ⚠ **ずらす量は定数から計算しない。**`V::EXPIRY_SKEW / 2` と書くと、許容を 0 に
+  # しても 0 のままなので**検査が素通りする**（2026-09-28 に実際に書いて踏んだ）。
+  # ⚠⚠ **許容そのものを固定したいので、literal で書く。**
+  def test_a_clock_a_minute_ahead_of_ours_is_still_verified
+    skewed = token(exp: Time.now.to_i + V::MAX_EXPIRY + 60)
+
+    assert_predicate(V.verify(authorization: "vapid t=#{skewed},k=#{@encoded}"), :verified?)
+  end
+
   # --- ⚠⚠ 取ってきた値が鍵として読めるか（PR #77 の Codex 8 巡目） --------
   #
   # ⚠⚠ **ここが true を返し過ぎると、壊れた値が「引けた鍵」として覚えられ、
