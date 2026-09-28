@@ -96,13 +96,31 @@ class VapidKeyWarmTest < Minitest::Test
     assert_equal(warmed, fetch.calls.size, '先読み済みなので外向き HTTP は増えない')
   end
 
-  # ⚠ **起動をブロックしない**（別スレッドで走る）。
-  def test_warm_returns_a_thread_without_blocking
-    dir, = directory(bodies, delay: 0.05)
-    thread = dir.warm!
+  # ⚠⚠ **温め終えてから返る**（PR #79 の Codex P1）。背景に投げっぱなしにすると、
+  # **温めている最中に来た push が `busy` になる**（warm が唯一の枠を握るうえ、
+  # まだ温まっていないホストには手元の鍵も無い）。
+  def test_warm_finishes_before_returning
+    dir, = directory(bodies)
+    dir.warm!
 
-    assert_instance_of(Thread, thread)
+    assert_equal([2, 2], dir.cached_counts, '返った時点で温まっている')
+  end
+
+  # ⚠⚠ **ただし無制限には待たない。**ホストが落ちていると 1 台で最大 12 秒かかり、
+  # ⚠ **待っている間 puma は listen していない ＝ nginx が 502**。🔴 Misskey は
+  # 502 でも通知を捨てるので、待ち過ぎは `busy` より悪い。
+  def test_warm_stops_waiting_after_the_budget_and_continues_in_the_background
+    dir, = directory(bodies, delay: 0.2)
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    thread = dir.warm!(budget: 0.05)
+    waited = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+
+    assert_operator(waited, :<, 0.2, '上限で待つのをやめる')
+    refute_equal([2, 2], dir.cached_counts, 'まだ温め終えていない')
+
     thread.join
+
+    assert_equal([2, 2], dir.cached_counts, '背景で続きが進む')
   end
 
   # ⚠⚠ **直列に引く。**並列にすると push の受け口と枠を奪い合う。

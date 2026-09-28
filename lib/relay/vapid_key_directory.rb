@@ -36,6 +36,15 @@ module Relay
     OPEN_TIMEOUT = 3
     READ_TIMEOUT = 3
 
+    # 起動時の先読みを待つ上限（秒・#78）。
+    #
+    # ⚠ **9 ホスト直列の実測は 488ms**（2026-09-28）なので、**通常は待ち切れる。**
+    # ⚠⚠ **上限が要るのは、ホストが落ちている場合。**1 台で最大 12 秒（Mastodon の
+    # 形 6 秒 + Misskey の形 6 秒）かかり、⚠ **待っている間 puma は listen して
+    # いない ＝ nginx が 502**。🔴 **Misskey は 502 でも通知を捨てる**ので、
+    # 待ち過ぎは `busy` より悪い。
+    WARM_BUDGET = 5
+
     # [hosts] は引いてよいホスト（プリセット + `extra_preset_hosts`）。
     # [fetch] はテスト用の差し替え口で、`->(uri, payload) { body or nil }`。
     # payload が nil なら GET、文字列なら JSON の POST。
@@ -139,18 +148,32 @@ module Relay
     # 2026-09-28 の本番投入直後に **3 通中 2 通**で実測した。🔴 **Misskey は 5xx を
     # 再送しないので、その通知は黙って消える。**
     #
-    # ⚠ **起動をブロックしない**（別スレッド）。⚠ **直列に引く** —— 枠は
-    # [Relay::VapidKeyLedger::MAX_CONCURRENT_DISCOVERY] で 1 本に絞ってあるので、
-    # 並列にしても意味が無いうえ、push の受け口と枠を奪い合う。
+    # ⚠⚠ **温め終えてから受け付ける**（PR #79 の Codex P1）。背景に投げっぱなしに
+    # すると、**温めている最中に来た push が `busy` になる** —— warm は唯一の枠を
+    # 握るので、**まだ温まっていないホストには手元の鍵も無く、倒しようがない。**
     #
-    # ⚠ **失敗は無視してよい。**negative cache に入るだけで、次の push が
-    # 従来どおりの経路を通る。
-    def warm!
-      return Thread.new do
+    # ⚠ **実測 488ms**（9 ホスト直列・2026-09-28）。**待っても実質ゼロコスト。**
+    #
+    # ⚠⚠ **ただし無制限に待たない。**ホストが落ちていると **1 台で最大 12 秒**
+    # （Mastodon の形 6 秒 + Misskey の形 6 秒）かかり、9 台なら 100 秒を超える。
+    # **待っている間 puma は listen していない ＝ nginx が 502 を返す**ので、
+    # 🔴 **Misskey 宛はそこでも落ちる**（再送しないため）。**どちらも失うなら
+    # 短いほうを選ぶ。**
+    #
+    # → **[budget] 秒だけ待ち、終わらなければ残りは背景で続ける。**
+    #
+    # ⚠ **直列に引く** —— 枠は [Relay::VapidKeyLedger::MAX_CONCURRENT_DISCOVERY] で
+    # 1 本に絞ってあるので、並列にしても意味が無いうえ受け口と枠を奪い合う。
+    # ⚠ **失敗は無視してよい**（negative cache に入るだけ）。
+    def warm!(budget: WARM_BUDGET)
+      thread = Thread.new do
         @hosts.each {|host| public_key_for(host)}
       rescue StandardError
         nil
       end
+      # ⚠ `join(limit)` は時間切れで nil を返すが、**スレッドは走り続ける。**
+      thread.join(budget)
+      return thread
     end
 
     # テストと、設定を読み直したときのための口。
