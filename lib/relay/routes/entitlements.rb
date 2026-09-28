@@ -68,10 +68,20 @@ module Relay
       # ⚠⚠ **404 と「失効」を混ぜない。**クライアントから見て「知らない token」
       # （端末の保存が壊れた / 消された）と「失効した token」（解約・支払い失敗）は
       # **別の状況**で、案内が違う。
-      get '/entitlements/:token' do
+      #
+      # 🔴 **token を URL に載せない（PR #81 の Codex P2）。**`config/nginx.conf.sample`
+      # は素の `access_log` を有効にしており、**リクエスト行に完全なパスが残る** ——
+      # ⚠⚠ **token はそのまま利用権として使える capability** なので、
+      # `/var/log/nginx/capsicum-relay-access.log` に平文で溜まることになる。
+      # このファイル自身が「token はログに出さない」と書いているのと矛盾していた。
+      # ⚠ **ヘッダは既定のログ書式に含まれない**ので `X-Entitlement-Token` で受ける。
+      get '/entitlements' do
         authenticate!
 
-        token = settings.database.find_entitlement_token(params[:token])
+        provided = request.env['HTTP_X_ENTITLEMENT_TOKEN'].to_s
+        halt 400, {error: 'X-Entitlement-Token required'}.to_json if provided.empty?
+
+        token = settings.database.find_entitlement_token(provided)
         halt 404, {error: 'Unknown entitlement token'}.to_json unless token
 
         entitlement_response(token).to_json

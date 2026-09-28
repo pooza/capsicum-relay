@@ -42,7 +42,7 @@ flowchart LR
 | DELETE | `/register/:id` | X-Relay-Secret | 登録解除 |
 | POST | `/push/:push_token` | なし（トークンの推測困難性で保護） | Web Push 受信（Mastodon / Misskey → リレー） |
 | POST | `/entitlements` | X-Relay-Secret | 有償リレーの利用権の発行（capsicum#597 / [#58](https://github.com/pooza/capsicum-relay/issues/58)） |
-| GET | `/entitlements/:token` | X-Relay-Secret | 利用権の**現在の状態**を読む（⚠ 副作用なし・[#80](https://github.com/pooza/capsicum-relay/issues/80)） |
+| GET | `/entitlements` | X-Relay-Secret + `X-Entitlement-Token` | 利用権の**現在の状態**を読む（⚠ 副作用なし・🔴 **token を URL に載せない**・[#80](https://github.com/pooza/capsicum-relay/issues/80)） |
 
 ### 通信フロー
 
@@ -165,7 +165,9 @@ erDiagram
 
 #### ⚠ 状態を読む口は `POST` と分ける（[#80](https://github.com/pooza/capsicum-relay/issues/80)）
 
-`GET /entitlements/:token` は**手元の token のいまの状態**を返す。
+`GET /entitlements`（`X-Entitlement-Token` ヘッダ）は**手元の token のいまの状態**を返す。
+
+🔴 **token を URL に載せない。**`config/nginx.conf.sample` は素の `access_log` を有効にしており、**リクエスト行に完全なパスが残る** —— ⚠⚠ **token はそのまま利用権として使える capability** なので、平文でログに溜まる。⚠ **ヘッダは既定のログ書式に含まれない。**
 
 ⚠⚠ **`POST /entitlements` を状態確認に使い回さない。**あちらは upsert なので冪等ではあるが、呼ぶたびに `relay_entitlement_token_total` が増え `entitlement.issued` が出る —— **「発行の回数」を数えている counter が「画面を開いた回数」に汚染され、ゲートを閉じてよいかの判断材料が濁る。**
 
