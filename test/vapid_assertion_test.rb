@@ -187,4 +187,42 @@ class VapidAssertionTest < Minitest::Test
     assert_equal(@encoded, result.public_key)
     assert_equal(@encoded, V.normalize_key(standard))
   end
+
+  # --- ⚠⚠ 取ってきた値が鍵として読めるか（PR #77 の Codex 8 巡目） --------
+  #
+  # ⚠⚠ **ここが true を返し過ぎると、壊れた値が「引けた鍵」として覚えられ、
+  # 本物の署名が永久に一致しない ＝ enforce 下で 410 で購読が消える。**
+  # 逆に厳し過ぎると本物の鍵を捨てて fail-open になる（安全側だが穴は開く）。
+
+  def test_a_real_public_key_reads_as_one
+    assert(V.public_key?(@encoded))
+  end
+
+  # ⚠ サーバーが標準 base64（`+/`・パディング有り）で返しても受ける。
+  def test_a_standard_base64_key_reads_as_one
+    standard = Base64.strict_encode64(@key.public_key.to_octet_string(:uncompressed))
+
+    assert(V.public_key?(standard))
+  end
+
+  def test_an_empty_value_does_not_read_as_a_key
+    refute(V.public_key?(''))
+    refute(V.public_key?(nil))
+  end
+
+  def test_a_short_value_does_not_read_as_a_key
+    refute(V.public_key?('BOldKey'))
+  end
+
+  def test_a_non_base64_value_does_not_read_as_a_key
+    refute(V.public_key?('!!! not base64 !!!'))
+  end
+
+  # ⚠⚠ **長さと先頭バイトだけを見る検査では通ってしまう値。**65 バイトで
+  # `0x04` 始まりでも、曲線上に無ければ公開鍵ではない。
+  def test_a_point_outside_the_curve_does_not_read_as_a_key
+    off_curve = Base64.urlsafe_encode64("\x04#{'A' * 64}").delete('=')
+
+    refute(V.public_key?(off_curve))
+  end
 end

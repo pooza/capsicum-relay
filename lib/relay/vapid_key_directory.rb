@@ -156,11 +156,17 @@ module Relay
     end
 
     # ⚠ ヘッダ側と同じ形へ揃えてから覚える（[Relay::VapidAssertion.normalize_key]）。
+    #
+    # ⚠⚠ **揃えるだけでなく、P-256 の公開鍵として読めるかまで見る**（Codex 8 巡目）。
+    # 空でない壊れた値をそのまま覚えると、**本物の署名が永久に一致せず 410 で
+    # 購読が消える。**読めない値は nil ＝「引けなかった」にして fail-open させる
+    # （Mastodon の形で壊れていれば、この後 Misskey の形も試される）。
     def normalize(value)
       key = value.to_s.strip
       return nil if key.empty?
 
-      return Relay::VapidAssertion.normalize_key(key)
+      normalized = Relay::VapidAssertion.normalize_key(key)
+      return Relay::VapidAssertion.public_key?(normalized) ? normalized : nil
     end
 
     # ⚠ **リダイレクトを追わない。**追うと一覧の外のホストへ出て行けてしまう。

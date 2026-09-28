@@ -1,4 +1,5 @@
 require_relative 'test_helper'
+require_relative 'support/vapid_test_keys'
 require 'json'
 require 'relay/vapid_key_directory'
 require 'relay/vapid_key_ledger'
@@ -14,6 +15,8 @@ require 'relay/vapid_key_ledger'
 # 好きなだけ HTTP を出させられる。**成功でも失敗でもスロットルが効くこと。
 class VapidKeyRefreshTest < Minitest::Test
   HOSTS = ['mstdn.b-shock.org'].freeze
+  # ⚠ **本物の P-256 公開鍵を使う**（[VapidTestKeys] の注意書き）。
+  OLD_KEY, NEW_KEY, COLD_KEY, ONLY_KEY, OTHER_KEY = VapidTestKeys.generate(5)
   MASTODON_URL = 'https://mstdn.b-shock.org/api/v2/instance'.freeze
   OTHER_HOST = 'precure.ml'.freeze
   BUSY = Relay::VapidKeyLedger::BUSY
@@ -51,17 +54,17 @@ class VapidKeyRefreshTest < Minitest::Test
   # **鍵の更新を詐称と誤らないための口。**誤ると 410 で上流の購読が永久に消える。
   def test_refresh_bypasses_the_cache_and_picks_up_the_new_key
     now = 1000.0
-    body = mastodon_body('BOldKey')
+    body = mastodon_body(OLD_KEY)
     dir, = directory({MASTODON_URL => -> {body}}, clock: -> {now})
 
-    assert_equal('BOldKey', dir.public_key_for('mstdn.b-shock.org'))
+    assert_equal(OLD_KEY, dir.public_key_for('mstdn.b-shock.org'))
 
-    body = mastodon_body('BNewKey')
+    body = mastodon_body(NEW_KEY)
     now += 61
 
-    assert_equal('BNewKey', dir.refresh_key_for('mstdn.b-shock.org'))
+    assert_equal(NEW_KEY, dir.refresh_key_for('mstdn.b-shock.org'))
     # 引き直した値が手元にも残る。
-    assert_equal('BNewKey', dir.public_key_for('mstdn.b-shock.org'))
+    assert_equal(NEW_KEY, dir.public_key_for('mstdn.b-shock.org'))
   end
 
   # ⚠⚠ **DoS の踏み台にしない。**合わない鍵で叩き続けるだけで、プリセット
@@ -69,7 +72,7 @@ class VapidKeyRefreshTest < Minitest::Test
   def test_refresh_is_throttled
     now = 1000.0
     dir, fetch = directory(
-      {MASTODON_URL => mastodon_body('BOldKey')}, clock: -> {now}
+      {MASTODON_URL => mastodon_body(OLD_KEY)}, clock: -> {now}
     )
     dir.public_key_for('mstdn.b-shock.org')
     before = fetch.calls.size
@@ -88,7 +91,7 @@ class VapidKeyRefreshTest < Minitest::Test
   # 「更新ではない＝詐称」と決めてしまう。
   def test_refresh_returns_nil_when_the_fetch_fails
     now = 1000.0
-    responses = {MASTODON_URL => mastodon_body('BOldKey')}
+    responses = {MASTODON_URL => mastodon_body(OLD_KEY)}
     dir, = directory(responses, clock: -> {now})
     dir.public_key_for('mstdn.b-shock.org')
 
@@ -102,7 +105,7 @@ class VapidKeyRefreshTest < Minitest::Test
   # 通信障害のあとに「鍵が無い」状態が居座る。
   def test_a_failed_refresh_keeps_the_previous_key
     now = 1000.0
-    responses = {MASTODON_URL => mastodon_body('BOldKey')}
+    responses = {MASTODON_URL => mastodon_body(OLD_KEY)}
     dir, = directory(responses, clock: -> {now})
     dir.public_key_for('mstdn.b-shock.org')
 
@@ -110,7 +113,7 @@ class VapidKeyRefreshTest < Minitest::Test
     now += 61
     dir.refresh_key_for('mstdn.b-shock.org')
 
-    assert_equal('BOldKey', dir.public_key_for('mstdn.b-shock.org'))
+    assert_equal(OLD_KEY, dir.public_key_for('mstdn.b-shock.org'))
   end
 
   # ⚠⚠ **失敗した引き直しもスロットルされる（#69・Codex P1 2 巡目）。**
@@ -119,7 +122,7 @@ class VapidKeyRefreshTest < Minitest::Test
   # 叩き続ける。
   def test_a_failed_refresh_is_throttled_too
     now = 1000.0
-    responses = {MASTODON_URL => mastodon_body('BOldKey')}
+    responses = {MASTODON_URL => mastodon_body(OLD_KEY)}
     dir, fetch = directory(responses, clock: -> {now})
     dir.public_key_for('mstdn.b-shock.org')
 
@@ -136,7 +139,7 @@ class VapidKeyRefreshTest < Minitest::Test
   # ⚠ ただし手元の鍵は残る（失敗で記録を壊さない）。
   def test_a_throttled_failure_still_keeps_the_previous_key
     now = 1000.0
-    responses = {MASTODON_URL => mastodon_body('BOldKey')}
+    responses = {MASTODON_URL => mastodon_body(OLD_KEY)}
     dir, = directory(responses, clock: -> {now})
     dir.public_key_for('mstdn.b-shock.org')
 
@@ -144,7 +147,7 @@ class VapidKeyRefreshTest < Minitest::Test
     now += 61
     dir.refresh_key_for('mstdn.b-shock.org')
 
-    assert_equal('BOldKey', dir.public_key_for('mstdn.b-shock.org'))
+    assert_equal(OLD_KEY, dir.public_key_for('mstdn.b-shock.org'))
     # ⚠ 間隔が明けたら、手元の鍵を返しつつ引き直しは再開する。
     now += 61
 
@@ -169,7 +172,7 @@ class VapidKeyRefreshTest < Minitest::Test
   # 古い鍵を「最新」として返していた。
   def test_a_throttled_failure_keeps_returning_nil
     now = 1000.0
-    responses = {MASTODON_URL => mastodon_body('BOldKey')}
+    responses = {MASTODON_URL => mastodon_body(OLD_KEY)}
     dir, = directory(responses, clock: -> {now})
     dir.public_key_for(HOST)
 
@@ -185,7 +188,7 @@ class VapidKeyRefreshTest < Minitest::Test
   # ⚠ ただし手元の鍵は生きている（期限まで有効）。引き直しの成否とは別の話。
   def test_a_throttled_failure_does_not_invalidate_the_cached_key
     now = 1000.0
-    responses = {MASTODON_URL => mastodon_body('BOldKey')}
+    responses = {MASTODON_URL => mastodon_body(OLD_KEY)}
     dir, = directory(responses, clock: -> {now})
     dir.public_key_for(HOST)
 
@@ -193,7 +196,7 @@ class VapidKeyRefreshTest < Minitest::Test
     now += 61
     dir.refresh_key_for(HOST)
 
-    assert_equal('BOldKey', dir.public_key_for(HOST))
+    assert_equal(OLD_KEY, dir.public_key_for(HOST))
   end
 
   # ⚠⚠ **成功した直後でも、間隔の中では BUSY（#69・Codex P1 7 巡目）。**
@@ -205,14 +208,14 @@ class VapidKeyRefreshTest < Minitest::Test
   # 判定し、410 で上流の購読を永久に消す。**
   def test_a_throttled_success_is_busy_not_a_confirmation
     now = 1000.0
-    body = mastodon_body('BOldKey')
+    body = mastodon_body(OLD_KEY)
     dir, = directory({MASTODON_URL => -> {body}}, clock: -> {now})
     dir.public_key_for(HOST)
 
-    body = mastodon_body('BNewKey')
+    body = mastodon_body(NEW_KEY)
     now += 61
 
-    assert_equal('BNewKey', dir.refresh_key_for(HOST), '間隔が明けたので引き直せる')
+    assert_equal(NEW_KEY, dir.refresh_key_for(HOST), '間隔が明けたので引き直せる')
     # ⚠ ここで「BNewKey」を返すと、**その 60 秒の間に更新された鍵を詐称と判定する。**
     assert_equal(BUSY, dir.refresh_key_for(HOST), '間隔の中は確認したことにしない')
   end
@@ -227,7 +230,7 @@ class VapidKeyRefreshTest < Minitest::Test
       MASTODON_URL => lambda do
         entered << true
         release.pop
-        mastodon_body('BNewKey')
+        mastodon_body(NEW_KEY)
       end,
     }
     dir, fetch = directory(responses)
@@ -242,7 +245,7 @@ class VapidKeyRefreshTest < Minitest::Test
 
     release << true
 
-    assert_equal('BNewKey', first.value)
+    assert_equal(NEW_KEY, first.value)
   end
 
   # --- ⚠⚠ 4 巡目の Codex P1（単発化が refresh にしか入っていなかった） -----
@@ -257,7 +260,7 @@ class VapidKeyRefreshTest < Minitest::Test
       MASTODON_URL => lambda do
         entered << true
         release.pop
-        mastodon_body('BColdKey')
+        mastodon_body(COLD_KEY)
       end,
     }
     dir, fetch = directory(responses)
@@ -272,15 +275,15 @@ class VapidKeyRefreshTest < Minitest::Test
 
     release << true
 
-    assert_equal('BColdKey', first.value)
+    assert_equal(COLD_KEY, first.value)
   end
 
   # ⚠ 引き終われば通常どおり手元から返る（枠の押さえが残り続けない）。
   def test_the_reservation_is_released_once_the_fetch_succeeds
-    dir, fetch = directory({MASTODON_URL => mastodon_body('BColdKey')})
+    dir, fetch = directory({MASTODON_URL => mastodon_body(COLD_KEY)})
 
-    assert_equal('BColdKey', dir.public_key_for(HOST))
-    assert_equal('BColdKey', dir.public_key_for(HOST))
+    assert_equal(COLD_KEY, dir.public_key_for(HOST))
+    assert_equal(COLD_KEY, dir.public_key_for(HOST))
     assert_equal(1, fetch.calls.size)
   end
 
@@ -298,7 +301,7 @@ class VapidKeyRefreshTest < Minitest::Test
     slow = lambda do
       entered << true
       release.pop
-      mastodon_body('BKey')
+      mastodon_body(ONLY_KEY)
     end
     counter = FakeFetch.new({MASTODON_URL => slow, OTHER_MASTODON_URL => slow})
     dir = Relay::VapidKeyDirectory.new(
@@ -315,7 +318,7 @@ class VapidKeyRefreshTest < Minitest::Test
 
     release << true
 
-    assert_equal('BKey', first.value)
+    assert_equal(ONLY_KEY, first.value)
   end
 
   # ⚠ 全体の枠が取れなかっただけで、そのホストの枠を焼かない。
@@ -326,9 +329,9 @@ class VapidKeyRefreshTest < Minitest::Test
     slow = lambda do
       entered << true
       release.pop
-      mastodon_body('BKey')
+      mastodon_body(ONLY_KEY)
     end
-    counter = FakeFetch.new({MASTODON_URL => slow, OTHER_MASTODON_URL => mastodon_body('BOther')})
+    counter = FakeFetch.new({MASTODON_URL => slow, OTHER_MASTODON_URL => mastodon_body(OTHER_KEY)})
     dir = Relay::VapidKeyDirectory.new(hosts: [HOST, OTHER_HOST], fetch: counter.to_proc)
 
     first = Thread.new {dir.public_key_for(HOST)}
@@ -340,6 +343,6 @@ class VapidKeyRefreshTest < Minitest::Test
     first.value
 
     # ⚠ 枠が空いたら、間隔を待たずに引ける。
-    assert_equal('BOther', dir.public_key_for(OTHER_HOST))
+    assert_equal(OTHER_KEY, dir.public_key_for(OTHER_HOST))
   end
 end

@@ -204,5 +204,25 @@ module Relay
     def self.normalize_key(encoded)
       return encoded.to_s.tr('+/', '-_').delete('=')
     end
+
+    # 取ってきた値が本当に P-256 の公開鍵か（PR #77 の Codex 8 巡目）。
+    #
+    # ⚠⚠ **壊れた値を「引けた鍵」として覚えると、本物の署名が永久に一致しない。**
+    # プリセットサーバーの設定ミスや直列化の事故で `public_key` / `swPublickey` が
+    # 空でない壊れた値になったとき、そのまま覚えると **正しい push が毎回
+    # `PRESET_MISMATCH` になり、enforce 下で 410 ＝ 上流の購読が永久に消える。**
+    # 形が読めない値は「引けなかった」側へ倒して fail-open させる。
+    #
+    # ⚠ **長さと先頭バイトだけでは足りない。**65 バイトで `0x04` 始まりでも曲線上に
+    # 無い点はありうるので、[public_key_from] に通して OpenSSL に判定させる。
+    def self.public_key?(encoded)
+      raw = decode_key(encoded.to_s)
+      return false if raw.nil?
+
+      public_key_from(raw)
+      return true
+    rescue StandardError
+      return false
+    end
   end
 end
