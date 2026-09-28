@@ -28,9 +28,17 @@ class EntitlementStatusRouteTest < RequestTestCase
     return json_response['token']
   end
 
+  # 🔴🔴 **ヘッダの値を `ASCII-8BIT` で渡す（2026-09-28 の実測に合わせる）。**
+  #
+  # **Puma / Rack がヘッダから作る String はバイナリ**で、⚠⚠ **そのまま SQLite へ
+  # バインドすると TEXT ではなく BLOB になり、行があっても永久に一致しない。**
+  #
+  # ⚠⚠⚠ **素の String（UTF-8）で渡すと、この検査は壊れた実装でも緑になる** ——
+  # 実際にそう書いてしまい、**実装が 1 件も引けないまま検査だけ通っていた。**
+  # Rack::Test は env をそのまま使うので、**実 HTTP の条件はこちらで作る。**
   def get_status(token, secret: SECRET)
     return get('/entitlements', {}, auth_headers(secret: secret).merge(
-      'HTTP_X_ENTITLEMENT_TOKEN' => token,
+      'HTTP_X_ENTITLEMENT_TOKEN' => token.dup.force_encoding(Encoding::BINARY),
     ))
   end
 

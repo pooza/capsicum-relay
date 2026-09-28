@@ -173,6 +173,25 @@ erDiagram
 
 - ⚠ **副作用を持たない。**metrics もログも増やさない（テストで固定してある）
 - ⚠ **ストアへ問い合わせ直さない。**状態を書くのは通知（Apple V2 / Play RTDN）と再確認の仕事で、ここは DB を読むだけ
+
+#### 🔴🔴 `request.env` のヘッダ文字列は `ASCII-8BIT`（2026-09-28 実測）
+
+**Puma / Rack がヘッダから作る String はバイナリ**で、⚠⚠ **そのまま SQLite にバインドすると TEXT ではなく BLOB になる。**`WHERE token = ?` は TEXT と BLOB を比べることになり、**行があっても永久に一致しない。**
+
+```ruby
+# 🔴 引けない（BLOB として比較される）
+settings.database.find_entitlement_token(request.env['HTTP_X_ENTITLEMENT_TOKEN'])
+
+# ✅ UTF-8 へ直してから渡す
+value = raw.dup.force_encoding(Encoding::UTF_8)
+```
+
+⚠ **`request.env` から読むときだけの話。**`params`（URL 由来）と `json_body`（`JSON.parse` 由来）は UTF-8 なので起きない。
+
+⚠⚠ **気づきにくい理由が 2 つある。**
+
+1. **`authenticate!` は壊れない。**`X-Relay-Secret` は**文字列比較**なので encoding が違っても ASCII 同士なら `==` が true。**認証は通り、SQL へ渡す値だけが壊れる**
+2. 🔴🔴 **Rack::Test では再現しない。**env に**素の String（UTF-8）**を入れるので、**壊れた実装でも検査が緑になる** —— 実際にそう書いて、**1 件も引けない実装のまま検査だけ通っていた**。⚠ **ヘッダを読む route の検査は `force_encoding(Encoding::BINARY)` で渡す**
 - ⚠⚠ **404 と「失効」を混ぜない。**クライアントから見て「知らない token」（端末の保存が壊れた / 消された）と「失効した token」（解約・支払い失敗）は**別の状況**で、案内が違う
 
 ### ⚠ 判定は `subscriptions.device_id` から引く

@@ -78,8 +78,8 @@ module Relay
       get '/entitlements' do
         authenticate!
 
-        provided = request.env['HTTP_X_ENTITLEMENT_TOKEN'].to_s
-        halt 400, {error: 'X-Entitlement-Token required'}.to_json if provided.empty?
+        provided = header_token
+        halt 400, {error: 'X-Entitlement-Token required'}.to_json if provided.nil?
 
         token = settings.database.find_entitlement_token(provided)
         halt 404, {error: 'Unknown entitlement token'}.to_json unless token
@@ -88,6 +88,30 @@ module Relay
       end
 
       helpers do
+        # `X-Entitlement-Token` を読む。無ければ nil。
+        #
+        # 🔴🔴 **encoding を UTF-8 へ直すのが本体（2026-09-28 に実測して判明）。**
+        # **Puma / Rack がヘッダから作る String は `ASCII-8BIT`（バイナリ）**で、
+        # ⚠⚠ **そのまま SQLite にバインドすると TEXT ではなく BLOB になる。**
+        # `WHERE token = ?` は TEXT と BLOB を比べることになり、**行があっても
+        # 永久に一致しない** —— 実際、直すまでこの口は 1 件も引けなかった。
+        #
+        # ⚠ **`request.env` から読むときだけの話。**`params`（URL 由来）と
+        # `json_body`（JSON.parse 由来）は UTF-8 なので起きない。
+        # ⚠ `authenticate!` の `X-Relay-Secret` は**文字列比較**なので影響が無い
+        # （ASCII 同士の `==` は encoding が違っても true）。**SQL へ渡す値だけ**が
+        # 壊れるので、⚠⚠ **気づきにくい。**
+        def header_token
+          raw = request.env['HTTP_X_ENTITLEMENT_TOKEN']
+          return nil if raw.nil?
+
+          value = raw.dup.force_encoding(Encoding::UTF_8)
+          return nil unless value.valid_encoding?
+          return nil if value.empty?
+
+          return value
+        end
+
         # ストアのクライアントがあればその場で確かめる。戻り値は `[token, outcome]`
         # （確かめなかったときの outcome は nil）。
         #
