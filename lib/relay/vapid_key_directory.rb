@@ -67,11 +67,11 @@ module Relay
       host = allowed(server)
       return nil unless host
       return @ledger.read(host) if @ledger.fresh?(host)
-      return Relay::VapidKeyLedger::BUSY unless @ledger.acquire_slot
+      return stale_or(host, Relay::VapidKeyLedger::BUSY) unless @ledger.acquire_slot
 
       begin
         # ⚠ 枠は取れたのに予約が取れない ＝ 誰かが引いている最中 / 直前に試した。
-        return @ledger.throttled_outcome(host) unless @ledger.reserve(host)
+        return stale_or(host, @ledger.throttled_outcome(host)) unless @ledger.reserve(host)
 
         key = discover(host)
         # ⚠ 引けなければ negative cache（従来どおり）。手元の鍵は既に期限切れ。
@@ -121,6 +121,26 @@ module Relay
       return @ledger.retry_after(host)
     end
 
+    # ⚠⚠ **起動時にプリセットの鍵を引いておく (#78)。**
+    #
+    # これが無いと、**再起動直後に同時に来た push が全部 `busy`（503）になる** ——
+    # 2026-09-28 の本番投入直後に **3 通中 2 通**で実測した。🔴 **Misskey は 5xx を
+    # 再送しないので、その通知は黙って消える。**
+    #
+    # ⚠ **起動をブロックしない**（別スレッド）。⚠ **直列に引く** —— 枠は
+    # [Relay::VapidKeyLedger::MAX_CONCURRENT_DISCOVERY] で 1 本に絞ってあるので、
+    # 並列にしても意味が無いうえ、push の受け口と枠を奪い合う。
+    #
+    # ⚠ **失敗は無視してよい。**negative cache に入るだけで、次の push が
+    # 従来どおりの経路を通る。
+    def warm!
+      return Thread.new do
+        @hosts.each {|host| public_key_for(host)}
+      rescue StandardError
+        nil
+      end
+    end
+
     # テストと、設定を読み直したときのための口。
     def reset!
       @ledger.clear
@@ -164,6 +184,22 @@ module Relay
       return json.is_a?(Hash) ? json : nil
     rescue JSON::ParserError
       return nil
+    end
+
+    # 枠が取れなかったときの答え。⚠⚠ **手元に鍵があるなら、期限が切れていても
+    # それを返して `busy` を出さない (#78)。**
+    #
+    # 🔴 **`busy`（503）は Misskey 宛だと通知が消える** —— `.catch` が 410 しか
+    # 見ていない（2026-09-28 に 2026.9.1 のソースで確認）。Mastodon は `retry: 5`
+    # で再送するので遅れるだけ。**弱いほうに合わせる。**
+    #
+    # ⚠ **穴にはならない。**返した鍵が合わなければ呼び出し側が
+    # [refresh_key_for] へ進むので、鍵の更新はそちらで拾う。
+    # ⚠ [fallback] は経路ごとに違う（枠なし ＝ `BUSY` / 予約なし ＝ 直前の結末）。
+    # **畳まないこと** —— 畳むと「外部障害」と「競合」が混ざる。
+    def stale_or(host, fallback)
+      stale = @ledger.stale_key(host)
+      return stale.nil? ? fallback : stale
     end
 
     # ⚠ ヘッダ側と同じ形へ揃えてから覚える（[Relay::VapidAssertion.normalize_key]）。
