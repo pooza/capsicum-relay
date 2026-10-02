@@ -119,10 +119,17 @@ module Relay
       line = Array(json['lineItems']).max_by {|item| item['expiryTime'].to_s}
       expiry = parse_time(line&.dig('expiryTime'))
       status = status_for(json['subscriptionState'], expiry)
-      # ⚠⚠ **許可側の状態なのに期限が読めない応答は使わない**（Codex P2・PR #76）。ゲートは
-      # 状態しか見ないので、期限の無い `active` を保存すると**無期限に通る**。形の崩れた
-      # 応答・API の変更は「確かめられなかった」として、いまの状態を残す。
-      if Relay::EntitlementGate::ENTITLED_STATUSES.include?(status) && expiry.nil?
+      # ⚠⚠ **購読の期間がある状態なのに期限が読めない応答は使わない**（Codex P2・PR #76）。
+      # 形の崩れた応答・API の変更は「確かめられなかった」として、いまの状態を残す。
+      #
+      # ⚠ **見るのは [Relay::EntitlementGate::STATUSES_WITH_PERIOD]**（#63）。以前は
+      # 許可側の `ENTITLED_STATUSES` を流用していたが、**2026-10-03 に `grace` が
+      # 許可側から外れたとき、この検査が黙って緩んだ**（期限の無い `grace` を
+      # 受け入れるようになった）。「通すか」と「応答が妥当か」は別の問い。
+      #
+      # ⚠ ゲートは `expires_at` も見るようになったが（#63）、**読めない値は
+      # fail-open で通す**ので、ここで弾く意味は残っている。
+      if Relay::EntitlementGate::STATUSES_WITH_PERIOD.include?(status) && expiry.nil?
         raise Relay::StoreResponseInvalid, "#{status} without a valid expiryTime"
       end
 

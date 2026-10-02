@@ -153,9 +153,10 @@ class EntitlementGateTest < Minitest::Test
     assert_equal([true, 'entitled'], decide(rows: [{'status' => 'active'}]))
   end
 
-  # ⚠ 支払い猶予は通す（課金リトライ中に通知が止まると気付けない）。
-  def test_grace_is_allowed
-    assert_equal([true, 'entitled'], decide(rows: [{'status' => 'grace'}]))
+  # ⚠⚠ **支払い猶予は止める**（2026-10-03 pooza 判断・#63）。以前は通していた。
+  # 状態と期限の組み合わせは entitlement_gate_period_test.rb。
+  def test_unpaid_statuses_are_denied
+    assert_equal([false, 'unpaid'], decide(rows: [{'status' => 'grace'}]))
   end
 
   # ⚠⚠ **これがゲートの核心。**`POST /entitlements` は共有シークレットしか見ておらず、
@@ -165,9 +166,11 @@ class EntitlementGateTest < Minitest::Test
     assert_equal([false, 'no_entitlement'], decide(rows: [{'status' => 'unverified'}]))
   end
 
+  # ⚠ 理由は `expired`（`no_entitlement` と分ける・#63）。返金済みで期限の無い行も
+  # ここに落ちる（詳細は entitlement_gate_period_test.rb）。
   def test_expired_and_revoked_are_not_entitled
-    assert_equal([false, 'no_entitlement'], decide(rows: [{'status' => 'expired'}]))
-    assert_equal([false, 'no_entitlement'], decide(rows: [{'status' => 'revoked'}]))
+    assert_equal([false, 'expired'], decide(rows: [{'status' => 'expired'}]))
+    assert_equal([false, 'expired'], decide(rows: [{'status' => 'revoked'}]))
   end
 
   # ⚠ 上流が status を増やしたときに勝手に通さない。
