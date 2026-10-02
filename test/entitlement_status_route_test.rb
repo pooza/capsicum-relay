@@ -104,7 +104,69 @@ class EntitlementStatusRouteTest < RequestTestCase
     assert_equal(400, last_response.status)
   end
 
+  # --- entitled / reason (#63) ---------------------------------------------
+
+  # ⚠⚠ **クライアントに判定を書き直させない。**`status` と `expires_at` だけ返すと、
+  # `active` のまま期限が過ぎた行を画面が「有効」と出し、**ゲートと別の結論**になる。
+  def test_response_carries_the_gate_decision
+    token = issue
+    get_status(token)
+    body = json_response
+
+    assert(body.key?('entitled'), 'entitled を返す')
+    assert(body.key?('reason'), 'reason を返す')
+    # ⚠ **真偽値であることを固定する。**下の検査は `refute` で書く（RuboCop の
+    # Minitest/RefuteFalse）ので、**nil でも通ってしまう** —— 型はここで押さえる。
+    assert_includes([true, false], body['entitled'], 'entitled は真偽値')
+    # ストア未設定の環境なので `unverified` のまま＝通らない。
+    assert_equal('unverified', body['status'])
+    refute(body['entitled'])
+    assert_equal('no_entitlement', body['reason'])
+  end
+
+  # ⚠⚠ **`RELAY_ENTITLEMENT_ENFORCE` を見ない。**見てしまうと、enforce を立てる前は
+  # 画面が常に「有効」になる。知りたいのは「閉じたらどう扱われるか」。
+  def test_the_decision_does_not_depend_on_the_enforce_flag
+    token = issue
+    with_env('RELAY_ENTITLEMENT_ENFORCE' => 'true') do
+      get_status(token)
+
+      refute(json_response['entitled'])
+    end
+    get_status(token)
+
+    refute(json_response['entitled'])
+  end
+
+  # 期限の切れた `active` は「有効」と出さない（#63 の核心が口にも届く）。
+  def test_active_past_its_expiry_is_reported_as_expired
+    token = issue
+    settings_database.apply_entitlement_verification(
+      settings_database.find_entitlement_token(token)['entitlement_id'],
+      Relay::Database::EntitlementVerification.new(
+        store: 'apple', purchase_id: VALID[:purchase_id], product_id: VALID[:product_id],
+        status: 'active', expires_at: '2020-01-01 00:00:00', environment: 'Production',
+        signed_at: 1
+      ),
+    )
+    get_status(token)
+
+    assert_equal('active', json_response['status'])
+    refute(json_response['entitled'])
+    assert_equal('expired', json_response['reason'])
+  end
+
   private
+
+  def settings_database = app.settings.database
+
+  def with_env(values)
+    saved = values.keys.to_h {|key| [key, ENV.fetch(key, nil)]}
+    values.each {|key, value| ENV[key] = value}
+    yield
+  ensure
+    saved.each {|key, value| ENV[key] = value}
+  end
 
   # `/metrics` から 1 系列の合計を読む。無ければ 0。
   def metrics_value(name)

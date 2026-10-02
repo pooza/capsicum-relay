@@ -21,6 +21,11 @@ module Relay
     BATCH = 20
     WINDOW_DAYS = 7
 
+    # 検証済みの行を引き直す間隔の目安 (#63)。⚠ **これは「最後に触ってから」の
+    # 日数**で、期限切れ・期限不明の行は日数を待たずに毎周引く
+    # （[Relay::Database#stale_entitlements]）。
+    STALE_DAYS = 7
+
     # どのストアのクライアントも無い・`reverify_interval` が 0 以下なら起動しない（nil）。
     # ⚠ 間隔は `app_store.reverify_interval` を見る（最初に入った設定の置き場。Google だけの
     # 構成でも既定の 600 秒で動く）。
@@ -70,8 +75,25 @@ module Relay
 
     private
 
+    # ⚠ **2 種類を回す。**`unverified`（誰でも作れる行・期間と件数で縛る）と、
+    # **検証済みだが状態を信用できない行**（通知の取りこぼし・#63）。
+    # ⚠⚠ **件数はそれぞれ [BATCH] 件。**片方が枠を食い切って、もう片方が永久に
+    # 回らない形にしない。
     def run_store(store)
-      rows = @settings.database.unverified_entitlements(store, days: WINDOW_DAYS, limit: BATCH)
+      unverified = @settings.database.unverified_entitlements(
+        store, days: WINDOW_DAYS, limit: BATCH
+      )
+      stale = @settings.database.stale_entitlements(
+        store, limit: BATCH, stale_days: STALE_DAYS
+      )
+      verify_rows(store, unverified, sweep: 'unverified')
+      verify_rows(store, stale, sweep: 'stale')
+      return unverified.size + stale.size
+    end
+
+    # ⚠ `sweep` のラベルを分ける —— **どちらの掃除が当たっているか**が分からないと、
+    # 「通知の取りこぼしが実際に起きているのか」を測れない。
+    def verify_rows(store, rows, sweep:)
       rows.each do |row|
         outcome, = Relay::StoreVerification.verify!(
           @settings, store: store, entitlement_id: row['id'], purchase_ref: row['purchase_id']
@@ -79,9 +101,8 @@ module Relay
         # 反映されなかった行（見つからない・届かない）を順番の後ろへ回す。
         @settings.database.touch_entitlement(row['id'])
         @settings.metrics.increment('relay_entitlement_verify_total',
-          {store: store, outcome: outcome})
+          {store: store, outcome: outcome, sweep: sweep})
       end
-      return rows.size
     end
   end
 end

@@ -378,6 +378,41 @@ module Relay
       SQL
     end
 
+    # 確かめ直す「検証は済んでいるが、いまの状態を信用できない」購入 (#63)。
+    #
+    # ⚠⚠ **通知は落ちる。**Apple の V2 / Google の RTDN を取りこぼすと、行は更新前の
+    # 状態で残り続ける —— ⚠ **更新を取りこぼした `active` は期限が過ぎても `active`**
+    # で、ゲートが `expires_at` を見るようになった（#63）とはいえ、**本当は払われて
+    # いる購読を止めてしまう**。逆に失効を取りこぼせば通し続ける。**どちらも通知
+    # 任せでは直らない**ので、ここで引き直す。
+    #
+    # 引くのは次のどれかに当たる行:
+    #
+    # - `expires_at` が過ぎている（更新か失効のどちらかが起きているはず）
+    # - `expires_at` が無い（⚠ ゲートが fail-open で通す側なので、放置できない）
+    # - 最後に触ってから [stale_days] 日より長く動いていない（通知の取りこぼしの保険）
+    #
+    # ⚠ **終端の状態（`expired` / `revoked`）は引かない。**変化するのは利用者が
+    # 買い直したときで、そのときは**クライアント自身の `POST /entitlements` が
+    # その場で確かめる**（あの口はストアを引く）。ここで追い続けると、終わった購入に
+    # 永久に API を叩くことになる。
+    #
+    # ⚠ `unverified` は [unverified_entitlements] の担当（あちらは誰でも作れる行なので
+    # 期間と件数の縛りが違う）。
+    def stale_entitlements(store, limit:, stale_days:)
+      window = "-#{Integer(stale_days)} days"
+      skipped = [ENTITLEMENT_STATUS_UNVERIFIED, 'expired', 'revoked']
+      return @db.execute(<<~SQL, [store, *skipped, window, limit])
+        SELECT * FROM entitlements
+        WHERE store = ? AND status NOT IN (?, ?, ?)
+          AND (expires_at IS NULL OR expires_at = ''
+               OR expires_at <= datetime('now')
+               OR updated_at <= datetime('now', ?))
+        ORDER BY updated_at ASC, id ASC
+        LIMIT ?
+      SQL
+    end
+
     # 確かめ直した行を順番の後ろへ回す（同じ行ばかり引かないように）。
     def touch_entitlement(entitlement_id)
       @db.execute("UPDATE entitlements SET updated_at = datetime('now') WHERE id = ?",

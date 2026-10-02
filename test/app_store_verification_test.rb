@@ -43,12 +43,15 @@ class AppStoreVerificationTest < Minitest::Test
     )
   end
 
-  def result(status, original: '1000', signed_at: nil)
+  def result(status, original: '1000', signed_at: nil, expires_at: nil)
     return Relay::AppStoreClient::Result.new(
       original_transaction_id: original, product_id: 'relay.monthly', status: status,
-      expires_at: nil, environment: 'Production', signed_at: signed_at
+      expires_at: expires_at, environment: 'Production', signed_at: signed_at
     )
   end
+
+  # 期限が先にある `active`（確かめ直しの対象にならない形）。
+  FUTURE = '2099-01-01 00:00:00'.freeze
 
   def entitlement(purchase_id, device_id: 'device-1')
     return @db.issue_entitlement_token(
@@ -125,11 +128,48 @@ class AppStoreVerificationTest < Minitest::Test
     assert_nil(@db.find_entitlement('apple', '2000'))
   end
 
-  # 検証済みの行は確かめ直さない（Apple API を無駄に叩かない）。
-  def test_reverifier_skips_verified_purchases
+  # 期限が先にある検証済みの行は確かめ直さない（Apple API を無駄に叩かない）。
+  def test_reverifier_skips_verified_purchases_within_their_period
+    entitlement('2000')
+    first = FakeAppStore.new {result('active', expires_at: FUTURE)}
+    Relay::EntitlementReverifier.new(settings(first)).run_once
+    fake = FakeAppStore.new {result('active', expires_at: FUTURE)}
+
+    assert_equal(0, Relay::EntitlementReverifier.new(settings(fake)).run_once)
+    assert_equal(0, fake.calls.size)
+  end
+
+  # ⚠⚠ **期限の無い検証済みの行は引き直す (#63)。**ゲートは期限が読めない `active` を
+  # fail-open で通すので、放置すると**無期限に通る行**が残る。
+  def test_reverifier_rechecks_verified_purchases_without_an_expiry
     entitlement('2000')
     Relay::EntitlementReverifier.new(settings(FakeAppStore.new {result('active')})).run_once
-    fake = FakeAppStore.new {result('active')}
+    fake = FakeAppStore.new {result('active', expires_at: FUTURE)}
+
+    assert_equal(1, Relay::EntitlementReverifier.new(settings(fake)).run_once)
+    assert_equal(1, fake.calls.size)
+    assert_equal(FUTURE, @db.find_entitlement('apple', '1000')['expires_at'])
+  end
+
+  # ⚠⚠ **期限を過ぎた `active` は引き直す (#63)。**更新の通知を取りこぼすと行は
+  # `active` のまま残るので、**払われている購読を止めてしまう**（逆に失効を
+  # 取りこぼせば通し続ける）。どちらも通知任せでは直らない。
+  def test_reverifier_rechecks_active_rows_past_their_expiry
+    entitlement('2000')
+    past = FakeAppStore.new {result('active', expires_at: '2020-01-01 00:00:00')}
+    Relay::EntitlementReverifier.new(settings(past)).run_once
+    fake = FakeAppStore.new {result('active', expires_at: FUTURE)}
+
+    assert_equal(1, Relay::EntitlementReverifier.new(settings(fake)).run_once)
+    assert_equal(FUTURE, @db.find_entitlement('apple', '1000')['expires_at'])
+  end
+
+  # ⚠ 終端の状態は引き直さない（終わった購入に永久に API を叩かない）。買い直しは
+  # クライアント自身の `POST /entitlements` がその場で確かめる。
+  def test_reverifier_leaves_terminal_rows_alone
+    entitlement('2000')
+    Relay::EntitlementReverifier.new(settings(FakeAppStore.new {result('expired')})).run_once
+    fake = FakeAppStore.new {result('active', expires_at: FUTURE)}
 
     assert_equal(0, Relay::EntitlementReverifier.new(settings(fake)).run_once)
     assert_equal(0, fake.calls.size)
