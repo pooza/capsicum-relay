@@ -47,6 +47,31 @@ class DatabaseTest < Minitest::Test
     assert_equal('CASCADE', fk['on_delete'])
   end
 
+  # #82: 端末単位の購読先は索引で引く（PR #83 の Codex P1）。
+  # ⚠ 索引が「ある」だけでなく、**実際の問い合わせが使う**ことを見る。
+  def test_servers_for_device_uses_the_device_index
+    open_database
+    rows = raw do |db|
+      db.execute(
+        'EXPLAIN QUERY PLAN SELECT DISTINCT server FROM subscriptions WHERE device_id = ?',
+        ['d1'],
+      )
+    end
+
+    assert_match(/idx_subscriptions_device_id/, rows.map {|row| row['detail']}.join("\n"))
+  end
+
+  def test_servers_for_device_returns_each_server_once
+    db = open_database
+    db.register(token: 't1', device_type: 'ios', account: 'a@x', server: 'x.test', device_id: 'd1')
+    db.register(token: 't1', device_type: 'ios', account: 'b@x', server: 'x.test', device_id: 'd1')
+    db.register(token: 't1', device_type: 'ios', account: 'c@y', server: 'y.test', device_id: 'd1')
+    db.register(token: 't2', device_type: 'ios', account: 'd@z', server: 'z.test', device_id: 'd2')
+
+    assert_equal(['x.test', 'y.test'], db.servers_for_device('d1').sort)
+    assert_empty(db.servers_for_device(nil))
+  end
+
   # FK が壊れていると効かなくなる実害そのもの。subscription を消したら
   # お知らせ購読も道連れになること。
   def test_deleting_a_subscription_cascades_to_its_announcement_subscription

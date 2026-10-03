@@ -564,6 +564,16 @@ module Relay
         ON subscriptions(account, server, device_id)
         WHERE device_id IS NOT NULL
       SQL
+      # 端末単位で購読先を引く (#82・PR #83 の Codex P1)。⚠ **上の
+      # `idx_subscriptions_device` は `account` が先頭なので device_id で引けない。**
+      # enforce 中は非プリセットの `/push` が毎回ここを通り、DB アクセスは直列化
+      # されているので、全件走査だと購読の総数に比例して無関係な要求まで待たせる。
+      # ⚠ `server` まで含めて索引だけで答えられるようにする。
+      @db.execute(<<~SQL)
+        CREATE INDEX IF NOT EXISTS idx_subscriptions_device_id
+        ON subscriptions(device_id, server)
+        WHERE device_id IS NOT NULL
+      SQL
     end
 
     def subscriptions_schema
