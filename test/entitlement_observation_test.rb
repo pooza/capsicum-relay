@@ -22,6 +22,11 @@ class EntitlementObservationTest < Minitest::Test
     assert_equal('yes', classify(preset: true)[:preset])
   end
 
+  # #82: 同じ端末にプリセットがある外部の行は、止まる候補（`no`）に数えない。
+  def test_external_row_on_a_preset_device
+    assert_equal('device', classify(preset: O::PRESET_DEVICE)[:preset])
+  end
+
   def test_entitlement_status_from_device_tokens
     result = classify(device_tokens: [{'status' => 'active'}])
 

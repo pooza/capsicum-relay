@@ -35,12 +35,27 @@ module Relay
 
     # [device_tokens] は `Database#entitlement_tokens_for_device` の戻り。
     # [claimed] は `Database#find_entitlement_token` の戻り（送られた token・無ければ nil）。
+    #
+    # [preset] は `true`（この行がプリセット）/ [PRESET_DEVICE] / `false`。
     def self.classify(preset:, device_tokens:, claimed:, device_id:, token_sent:)
       return {
-        preset: preset ? 'yes' : 'no',
+        preset: preset_label(preset),
         entitlement: best_status(device_tokens),
         token: token_state(claimed: claimed, device_id: device_id, token_sent: token_sent),
       }
+    end
+
+    # この行は非プリセットだが、**同じ端末にプリセットの購読がある** (#82)。
+    #
+    # ⚠⚠ **ゲートはこれを通す**ので、`no` に混ぜると**閉じたときに止まる人を
+    # 多く見積もる**（PR #83 の Codex P2）。ラベルは `device` で分ける。
+    PRESET_DEVICE = :device
+
+    def self.preset_label(preset)
+      return 'device' if preset == PRESET_DEVICE
+      return 'yes' if preset
+
+      return 'no'
     end
 
     def self.best_status(device_tokens)

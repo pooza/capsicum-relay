@@ -35,7 +35,8 @@ module Relay
       'relay_entitlement_token_total' =>
         'Entitlement tokens issued, by store (⚠ not verified in phase 1).',
       # ⚠⚠ **フェーズ 3 でゲートを閉じたときに誰が止まるかを先に測る系列** (#59)。
-      # `preset="no"` かつ `entitlement="none"` が止まる候補。⚠ `token="mismatch"`
+      # `preset="no"` かつ `entitlement="none"` が止まる候補。⚠ `preset="device"` は
+      # 非プリセットの行だが同じ端末にプリセットがあり、**止まらない**側 (#82)。⚠ `token="mismatch"`
       # は「token を送れているのに止まる」いちばん分かりにくい形。
       'relay_register_entitlement_total' =>
         'Registrations by preset host, entitlement status and claimed-token state.',

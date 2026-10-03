@@ -400,6 +400,7 @@ $ curl -s -H "X-Relay-Secret: $SECRET" https://relay.capsicum.shrieker.net/metri
 ```
 
 - `preset="no"` かつ `entitlement="none"` … **止まる候補**
+- `preset="device"` … 行は非プリセットだが**同じ端末にプリセットの購読がある**。⚠ **ゲートは通す**（[#82](https://github.com/pooza/capsicum-relay/issues/82)）ので止まる候補に**数えない**
 - `token="mismatch"` … ⚠ **token を送れているのに止まる**いちばん分かりにくい形（別の端末の token を持っている）
 - `token="unknown"` … relay が知らない token（別の relay 向け・手で作った値・DB を戻した後）
 
