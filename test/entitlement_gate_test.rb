@@ -8,15 +8,24 @@ require 'relay/entitlement_gate'
 class EntitlementGateTest < Minitest::Test
   G = Relay::EntitlementGate
 
-  # `entitlement_tokens_for_device` だけを持つ最小の DB 代役。
+  # `entitlement_tokens_for_device` と `servers_for_device` だけを持つ最小の DB 代役。
   class FakeDatabase
-    def initialize(rows) = @rows = rows
+    def initialize(rows, servers = [])
+      @rows = rows
+      @servers = servers
+    end
+
     def entitlement_tokens_for_device(_device_id) = @rows
+    def servers_for_device(_device_id) = @servers
   end
 
   # 呼ばれたら落ちる DB（fail-open の検査用）。
   class BrokenDatabase
     def entitlement_tokens_for_device(_device_id)
+      raise SQLite3::BusyException, 'database is locked'
+    end
+
+    def servers_for_device(_device_id)
       raise SQLite3::BusyException, 'database is locked'
     end
   end
@@ -28,10 +37,12 @@ class EntitlementGateTest < Minitest::Test
     return {'server' => server, 'device_id' => device_id, 'account' => "a@#{server}"}
   end
 
+  # ⚠ 同じ端末の購読先 (#82) は `servers:` で渡す。引数を増やさないため DB 代役に持たせる。
   def decide(env: ON, rows: [], database: nil, verification: G::PRESET_NOT_CHECKED, **overrides)
+    servers = overrides.delete(:servers) || []
     return G.decide(
       subscription: sub(**overrides),
-      database: database || FakeDatabase.new(rows),
+      database: database || FakeDatabase.new(rows, servers),
       preset_verification: verification,
       env: env,
     )
@@ -61,6 +72,48 @@ class EntitlementGateTest < Minitest::Test
   # 「プリセットに 1 アカウント持てば全部無償」の穴は残す（2026-09-12 決定）。
   def test_preset_staging_host_is_allowed
     assert_equal([true, 'preset'], decide(server: 'st2.mstdn.b-shock.org'))
+  end
+
+  # --- プリセットと外部を併用する端末 (#82) ---------------------------------
+
+  # ⚠⚠ **#82 の核心。**行の `server` だけで決めると、併用者の外部側が止まる。
+  def test_external_row_passes_when_the_device_has_a_preset
+    assert_equal(
+      [true, 'preset_device'],
+      decide(servers: ['mastodon.social', 'mstdn.b-shock.org'], rows: []),
+    )
+  end
+
+  # ⚠ 表記の揺れは [Relay::PresetServers.preset?] が揃える。
+  def test_preset_device_tolerates_spelling_variants
+    assert_equal([true, 'preset_device'], decide(servers: ['MSTDN.B-Shock.org.']))
+  end
+
+  def test_external_only_device_still_needs_an_entitlement
+    assert_equal(
+      [false, 'no_entitlement'],
+      decide(servers: ['mastodon.social', 'misskey.io'], rows: []),
+    )
+  end
+
+  # ⚠ 旧クライアント（`device_id` 無し）は端末で束ねられない。
+  def test_preset_device_needs_a_device_id
+    assert_equal(
+      [false, 'no_entitlement'],
+      decide(device_id: nil, servers: ['mstdn.b-shock.org']),
+    )
+  end
+
+  # ⚠⚠ **#69 は緩めない。**プリセットの行そのものへの署名無しの push は、
+  # 同じ端末に別のプリセット行があっても止める。
+  def test_unsigned_preset_row_is_not_rescued_by_the_device
+    assert_equal(
+      [false, 'preset_unsigned'],
+      decide(
+        server: 'mstdn.b-shock.org', verification: G::PRESET_UNSIGNED,
+        servers: ['mstdn.b-shock.org', 'precure.ml']
+      ),
+    )
   end
 
   # --- プリセットの名乗りの裏取り (#69) -----------------------------------
