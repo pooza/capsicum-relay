@@ -244,10 +244,13 @@ value = raw.dup.force_encoding(Encoding::UTF_8)
 | 1 | `RELAY_ENTITLEMENT_ENFORCE` が `true` でない | allow（`enforce_off`） |
 | 2 | プリセットホストで、**名乗りの裏が取れた** | allow（`preset`） |
 | 2' | プリセットホストだが**鍵が引けなかった** | ⚠⚠ allow（`preset_unverifiable`）＝ fail-open |
-| 2'' | プリセットホストだが**署名が無い / 鍵が違う** | ⚠ **プリセット扱いをやめて 3 へ** |
+| 2'' | プリセットホストだが**署名が無い / 鍵が違う** | ⚠ **プリセット扱いをやめて 3 へ**（2''' は通らない） |
+| 2''' | **非プリセット**の行だが、**同じ `device_id` にプリセットを名乗る購読がある**（[#82](https://github.com/pooza/capsicum-relay/issues/82)） | allow（`preset_device`） |
 | 3 | その端末に `active` / `grace` の利用権がある | allow（`entitled`） |
 | 4 | それ以外 | **deny**（`no_entitlement` / `preset_unsigned` / `preset_mismatch`） |
 | — | 判定中に例外 | ⚠⚠ **allow**（`error`）＝ fail-open |
+
+⚠⚠ **2''' は仕様そのもの**（「プリセットに 1 アカウント持てば全部無償」・設計書 1-2）。**穴として塞がない。**クライアントは `server` に**そのアカウント自身のホスト**を送るので、行の `server` だけで決めると**併用者の外部サーバー側が止まる** —— しかもその人の画面には課金の表示が出ない（capsicum#1123）ので**黙って通知が消える**。⚠ **名乗りは申告のまま認める**（2026-10-03 pooza 判断）。VAPID の裏取りを条件にすると、プリセットのアカウントにほとんど通知が来ない人が外部の通知を失う。⚠ `device_id` の無い行（旧クライアント）には効かない。
 
 ### プリセットの名乗りの裏取り（[#69](https://github.com/pooza/capsicum-relay/issues/69)）
 
@@ -397,6 +400,7 @@ $ curl -s -H "X-Relay-Secret: $SECRET" https://relay.capsicum.shrieker.net/metri
 ```
 
 - `preset="no"` かつ `entitlement="none"` … **止まる候補**
+- `preset="device"` … 行は非プリセットだが**同じ端末にプリセットの購読がある**。⚠ **ゲートは通す**（[#82](https://github.com/pooza/capsicum-relay/issues/82)）ので止まる候補に**数えない**
 - `token="mismatch"` … ⚠ **token を送れているのに止まる**いちばん分かりにくい形（別の端末の token を持っている）
 - `token="unknown"` … relay が知らない token（別の relay 向け・手で作った値・DB を戻した後）
 

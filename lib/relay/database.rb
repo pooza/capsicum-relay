@@ -312,6 +312,19 @@ module Relay
       SQL
     end
 
+    # 同じ端末が登録しているサーバー (capsicum-relay#82)。
+    #
+    # ⚠ **プリセットかどうかはここで判定しない。**表記の揺れ（大小・末尾のドット）を
+    # 揃えるのは [Relay::PresetServers.preset?] の仕事で、SQL で比べると揺れた行を
+    # 取りこぼす。
+    def servers_for_device(device_id)
+      return [] if device_id.to_s.empty?
+
+      return @db.execute(
+        'SELECT DISTINCT server FROM subscriptions WHERE device_id = ?', [device_id]
+      ).map {|row| row['server']}
+    end
+
     # 1 購入にぶら下がっている端末 (#58)。
     #
     # ⚠ **上限は設けない**（#57）。対象者 0 人から始まるので先回りで制限せず、
@@ -549,6 +562,16 @@ module Relay
       @db.execute(<<~SQL)
         CREATE UNIQUE INDEX IF NOT EXISTS idx_subscriptions_device
         ON subscriptions(account, server, device_id)
+        WHERE device_id IS NOT NULL
+      SQL
+      # 端末単位で購読先を引く (#82・PR #83 の Codex P1)。⚠ **上の
+      # `idx_subscriptions_device` は `account` が先頭なので device_id で引けない。**
+      # enforce 中は非プリセットの `/push` が毎回ここを通り、DB アクセスは直列化
+      # されているので、全件走査だと購読の総数に比例して無関係な要求まで待たせる。
+      # ⚠ `server` まで含めて索引だけで答えられるようにする。
+      @db.execute(<<~SQL)
+        CREATE INDEX IF NOT EXISTS idx_subscriptions_device_id
+        ON subscriptions(device_id, server)
         WHERE device_id IS NOT NULL
       SQL
     end
