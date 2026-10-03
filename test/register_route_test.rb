@@ -141,6 +141,22 @@ class RegisterRouteTest < RequestTestCase
     )
   end
 
+  # #82（PR #83 の Codex P2）: enforce off のまま測る観測も、ゲートと同じく
+  # 端末単位のプリセットを数える。⚠ でないと閉じたときに止まる人を多く見積もる。
+  def test_external_registration_on_a_preset_device_is_not_a_stop_candidate
+    device = {device_id: 'observe-device-1'}
+    post_json('/register', VALID.merge(device, account: 'p@mstdn.b-shock.org',
+      server: 'mstdn.b-shock.org'))
+    post_json('/register', VALID.merge(device))
+
+    assert_equal(201, last_response.status)
+    assert_equal(
+      1,
+      metrics.value('relay_register_entitlement_total',
+        {preset: 'device', entitlement: 'none', token: 'none'}),
+    )
+  end
+
   # ⚠ 知らない token を送られても拒まない（拒むのはフェーズ 2 以降）。
   def test_registers_with_unknown_entitlement_token
     post_json('/register', VALID.merge(device_id: 'd1', entitlement_token: 'bogus'))

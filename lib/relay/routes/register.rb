@@ -96,14 +96,24 @@ module Relay
         def observe_entitlement(sub)
           claimed = json_body['entitlement_token'].to_s
           return Relay::EntitlementObservation.classify(
-            preset: Relay::PresetServers.preset?(
-              sub['server'], extra: settings.config['extra_preset_hosts']
-            ),
+            preset: observed_preset(sub),
             device_tokens: settings.database.entitlement_tokens_for_device(sub['device_id']),
             claimed: claimed.empty? ? nil : settings.database.find_entitlement_token(claimed),
             device_id: sub['device_id'],
             token_sent: !claimed.empty?,
           )
+        end
+
+        # ⚠ **端末単位のプリセットはゲートと同じ判定を使う**（#82・PR #83 の Codex P2）。
+        # 別に書くと観測とゲートがずれ、止まる人の見積もりが狂う。
+        def observed_preset(sub)
+          extra = settings.config['extra_preset_hosts']
+          return true if Relay::PresetServers.preset?(sub['server'], extra: extra)
+          if Relay::EntitlementGate.preset_device?(settings.database, sub['device_id'], extra)
+            return Relay::EntitlementObservation::PRESET_DEVICE
+          end
+
+          return false
         end
 
         def validate_device_type!
