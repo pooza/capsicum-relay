@@ -117,6 +117,60 @@ class EntitlementGateRouteTest < RequestTestCase
     )
   end
 
+  # --- プリセットと外部を併用する端末 (#82) ---------------------------------
+
+  PRESET_SAME_DEVICE = VALID.merge(
+    token: 'device-token', account: 'pooza@mstdn.b-shock.org', server: 'mstdn.b-shock.org',
+  ).freeze
+
+  # ⚠⚠ **#82 の核心。**「プリセットに 1 アカウント持てば全部無償」は仕様。
+  # 外部サーバー側の行も、同じ端末にプリセットがあれば `/push` で止めない。
+  def test_external_push_passes_when_the_device_has_a_preset
+    post_json('/register', PRESET_SAME_DEVICE)
+    post_json('/register', VALID)
+    push_token = json_response['push_token']
+
+    with_enforce do
+      post("/push/#{push_token}", 'body', {'CONTENT_TYPE' => 'application/octet-stream'})
+    end
+
+    refute_equal(410, last_response.status)
+    assert_equal(
+      1,
+      metrics.value('relay_entitlement_gate_total',
+        {route: 'push', decision: 'allow', reason: 'preset_device'}),
+    )
+  end
+
+  def test_external_register_passes_when_the_device_has_a_preset
+    with_enforce do
+      post_json('/register', PRESET_SAME_DEVICE)
+      post_json('/register', VALID)
+    end
+
+    assert_equal(201, last_response.status)
+    assert_equal(
+      1,
+      metrics.value('relay_entitlement_gate_total',
+        {route: 'register', decision: 'allow', reason: 'preset_device'}),
+    )
+  end
+
+  # ⚠ **別の端末のプリセットは効かない。**束ねるのは `device_id` 単位。
+  def test_preset_on_another_device_does_not_help
+    post_json(
+      '/register', PRESET_SAME_DEVICE.merge(token: 'other-token', device_id: 'other-device')
+    )
+    post_json('/register', VALID)
+    push_token = json_response['push_token']
+
+    with_enforce do
+      post("/push/#{push_token}", 'body', {'CONTENT_TYPE' => 'application/octet-stream'})
+    end
+
+    assert_equal(410, last_response.status)
+  end
+
   def test_active_entitlement_passes_when_enforcing
     post_json('/entitlements', {
       store: 'apple', purchase_id: 'gate-purchase-1', device_id: VALID[:device_id]

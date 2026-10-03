@@ -312,6 +312,19 @@ module Relay
       SQL
     end
 
+    # 同じ端末が登録しているサーバー (capsicum-relay#82)。
+    #
+    # ⚠ **プリセットかどうかはここで判定しない。**表記の揺れ（大小・末尾のドット）を
+    # 揃えるのは [Relay::PresetServers.preset?] の仕事で、SQL で比べると揺れた行を
+    # 取りこぼす。
+    def servers_for_device(device_id)
+      return [] if device_id.to_s.empty?
+
+      return @db.execute(
+        'SELECT DISTINCT server FROM subscriptions WHERE device_id = ?', [device_id]
+      ).map {|row| row['server']}
+    end
+
     # 1 購入にぶら下がっている端末 (#58)。
     #
     # ⚠ **上限は設けない**（#57）。対象者 0 人から始まるので先回りで制限せず、

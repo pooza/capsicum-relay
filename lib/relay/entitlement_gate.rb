@@ -30,6 +30,12 @@ module Relay
     # 許可した / 拒んだ理由。metrics のラベルに出す。
     REASON_ENFORCE_OFF = 'enforce_off'.freeze
     REASON_PRESET = 'preset'.freeze
+    # 非プリセットの行だが、**同じ端末にプリセットの購読がある**ので通した (#82)。
+    #
+    # ⚠ **`preset` と分ける。**こちらは「プリセットに 1 アカウント持てば全部無償」で
+    # 無償になった外部サーバーの分で、**その量が見えなくなると、仕様の効き方を
+    # 測れない**。
+    REASON_PRESET_DEVICE = 'preset_device'.freeze
     REASON_ENTITLED = 'entitled'.freeze
     REASON_NO_ENTITLEMENT = 'no_entitlement'.freeze
 
@@ -108,6 +114,13 @@ module Relay
         # 「利用権が無い」と「プリセットを詐称した」は対処がまったく違う。
         return [false, reason]
       end
+      # ⚠⚠ **購読 1 行の `server` だけで決めない (#82)。**クライアントは `server` に
+      # そのアカウント自身のホストを送るので、行だけを見ると**プリセットと外部を
+      # 併用する人の外部側が止まる** —— 仕様（全部無償）に反するうえ、その人の
+      # 画面には課金の表示が出ない（capsicum#1123）ので**黙って通知が消える。**
+      if preset_device?(database, subscription['device_id'], extra_preset_hosts)
+        return [true, REASON_PRESET_DEVICE]
+      end
       return [true, REASON_ENTITLED] if entitled?(database, subscription['device_id'])
 
       return [false, REASON_NO_ENTITLEMENT]
@@ -140,6 +153,22 @@ module Relay
 
       return database.entitlement_tokens_for_device(device_id).any? do |row|
         ENTITLED_STATUSES.include?(row['status'])
+      end
+    end
+
+    # 同じ端末にプリセットを名乗る購読があるか (#82)。
+    #
+    # ⚠⚠ **名乗りは申告のまま認める（2026-10-03 pooza 判断）。**VAPID の裏取り（#69）を
+    # 条件にすると、**プリセットのアカウントにほとんど通知が来ない人**は裏が取れず、
+    # 外部の通知を黙って失う。偽装による迂回は許すことになるが、⚠ **プリセットの行
+    # そのものへの push の裏取り（#69）はそのまま効く**（[preset_decision]）。
+    #
+    # ⚠ **`device_id` が無い行（旧クライアント）は端末をまたいで束ねられない**ので false。
+    def self.preset_device?(database, device_id, extra_preset_hosts)
+      return false if device_id.to_s.empty?
+
+      return database.servers_for_device(device_id).any? do |server|
+        Relay::PresetServers.preset?(server, extra: extra_preset_hosts)
       end
     end
   end
