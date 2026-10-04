@@ -292,6 +292,27 @@ class AppStoreVerificationTest < Minitest::Test
     assert_nil(row['not_found_since'])
   end
 
+  # ⚠⚠ **`unverified` の行も終端へ落ちる**（PR #86 の Codex P2）。`not_found_since` が
+  # 立つのは最初の掃除（作成 + 数分）なので、`created_at` 基準の窓（WINDOW_DAYS）は
+  # 終端（NOT_FOUND_TERMINAL_DAYS・同じ 7 日）より**必ず先に閉じる** ＝ 連続が始まった
+  # 行を窓だけで切ると、**約束した `revoked` に永久に到達しない。**
+  def test_reverifier_revokes_an_unverified_row_that_aged_out_of_the_window
+    id = entitlement('2000')
+    fake = FakeAppStore.new {nil}
+    reverifier = Relay::EntitlementReverifier.new(settings(fake))
+    reverifier.run_once
+    raw_update(
+      "UPDATE entitlements SET created_at = datetime('now', '-8 days') WHERE id = #{id}",
+    )
+    forget_since(id, days: Relay::EntitlementReverifier::NOT_FOUND_TERMINAL_DAYS + 1)
+    reverifier.run_once
+
+    assert_equal('revoked', @db.find_entitlement('apple', '2000')['status'])
+    raw_update("UPDATE entitlements SET updated_at = datetime('now', '-2 days') WHERE id = #{id}")
+
+    assert_equal(0, reverifier.run_once, '終端にした行をまだ引いている')
+  end
+
   # ⚠⚠ **「届かない」は「知らない」ではない。**`unavailable` は fail-open なので、
   # バックオフも終端の数えも進めない（ストア障害で有効な購読を失効させない）。
   def test_reverifier_does_not_count_unavailable_as_not_found

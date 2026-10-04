@@ -383,13 +383,23 @@ module Relay
     # 増えないようにするため。
     # ⚠ [grace] / [backoff_days] は「知らない」と言われ続けている行の間隔
     # （[not_found_backoff_sql] の doc）。
+    #
+    # ⚠⚠ **連続が始まっている行は、作成の窓を過ぎても引き続き引く**（PR #86 の Codex P2）。
+    # そうしないと **約束した終端（`revoked`）に永久に到達しない** —— `not_found_since` が
+    # 立つのは最初の掃除（作成 + 数分）なので、`created_at` 基準の窓（[days] 日）が
+    # [record_entitlement_not_found] の終端（同じ 7 日）より**必ず先に閉じる**。
+    #
+    # ⚠ **叩く量は増えない。**連続が猶予を越えた行はバックオフで 1 日 1 回に落ち、
+    # 7 日で `revoked` になって `status` の条件から外れる ＝ **1 行あたり 10 回前後で打ち止め**
+    # （直す前は 7 日間 10 分ごと ＝ 1,000 回超だった）。
     def unverified_entitlements(store, days:, limit:, grace:, backoff_days:)
       window = "-#{Integer(days)} days"
       values = [store, ENTITLEMENT_STATUS_UNVERIFIED, window, grace,
         "-#{Integer(backoff_days)} days", limit]
       return @db.execute(<<~SQL, values)
         SELECT * FROM entitlements
-        WHERE store = ? AND status = ? AND created_at >= datetime('now', ?)
+        WHERE store = ? AND status = ?
+          AND (created_at >= datetime('now', ?) OR not_found_since IS NOT NULL)
           AND #{not_found_backoff_sql}
         ORDER BY updated_at ASC, id ASC
         LIMIT ?
