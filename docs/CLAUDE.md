@@ -500,12 +500,13 @@ gh api -X POST   repos/pooza/capsicum-relay/branches/main/protection/enforce_adm
 
 ⚠⚠ **`ssh` を 2 行並べてから共通のコマンドを書かない**（PR #70 の Codex P2）。最初の `ssh` が triton のシェルを開いてしまい、**残りのコマンドがそちらで動く** ＝ **本番にしか当たらず、ステージングが未デプロイのまま「両方やった」ことになる。**ステージング先という手順そのものが壊れるので、**ホストごとに完結したブロックにする。**
 
+⚠⚠ **リモート側も行頭に `cd` を書かない**（2026-10-05 に貼れなくなっていたのを直した）。capsicum の `.claude/hooks/deny-bare-cd-chain.sh` は**コマンド文字列の行頭 `cd` を見る**ので、ssh の引用符の中に書いた `cd` も拒否する（ローカルの cwd は動かないので誤検出だが、**回避する書き方を探さない**のが規約・capsicum#1198）。⚠ `git -C` と `(cd … && …)` で書けば通り、**リモートの cwd を残さない**ぶん下の「`ssh` を 2 行並べない」とも同じ向きになる。
+
 ```bash
 # 1. ステージング（triton・develop を追う）
 ssh deploy@triton.b-shock.local '
-  cd ~/repos/capsicum-relay &&
-  git pull &&
-  bundle install &&
+  git -C ~/repos/capsicum-relay pull &&
+  (cd ~/repos/capsicum-relay && bundle install) &&
   sudo -n systemctl restart capsicum-relay
 '
 ```
@@ -513,9 +514,8 @@ ssh deploy@triton.b-shock.local '
 ```bash
 # 2. 本番（flauros・main を追う）。⚠ develop → main の PR をマージし、1 の疎通確認が通ってから
 ssh deploy@flauros.b-shock.co.jp '
-  cd ~/repos/capsicum-relay &&
-  git pull &&
-  bundle install &&
+  git -C ~/repos/capsicum-relay pull &&
+  (cd ~/repos/capsicum-relay && bundle install) &&
   sudo -n systemctl restart capsicum-relay
 '
 ```
