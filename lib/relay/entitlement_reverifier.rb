@@ -26,6 +26,23 @@ module Relay
     # （[Relay::Database#stale_entitlements]）。
     STALE_DAYS = 7
 
+    # ストアが「その購入は知らない」と答え続ける行の扱い (#63)。
+    #
+    # ⚠⚠ **`not_found` は行を触らない**（ストアの応答で状態を上書きしない fail-open の
+    # 一種）ので、**何もしなければ終端にも落ちず、掃除の除外にも入らない。**
+    # ステージングでは行 3 つに対して not_found が 694 回出ていた（2026-10-05 実測）。
+    #
+    # - [NOT_FOUND_GRACE_CHECKS]: ここまでは従来どおり毎周引く。⚠ **買った直後の
+    #   伝播待ちを待たせないため** —— その行は `unverified` でゲートが deny し、
+    #   自動で治す経路はこの掃除だけ（クライアントは起動時に `POST /entitlements` を
+    #   送り直さない）。既定の 600 秒間隔なら約 30 分ぶん
+    # - [NOT_FOUND_BACKOFF_DAYS]: 猶予を使い切った行を引き直す間隔
+    # - [NOT_FOUND_TERMINAL_DAYS]: ここまで続いたら `revoked` へ落とす
+    #   （[Relay::Database#record_entitlement_not_found]）
+    NOT_FOUND_GRACE_CHECKS = 3
+    NOT_FOUND_BACKOFF_DAYS = 1
+    NOT_FOUND_TERMINAL_DAYS = 7
+
     # どのストアのクライアントも無い・`reverify_interval` が 0 以下なら起動しない（nil）。
     # ⚠ 間隔は `app_store.reverify_interval` を見る（最初に入った設定の置き場。Google だけの
     # 構成でも既定の 600 秒で動く）。
@@ -81,10 +98,10 @@ module Relay
     # 回らない形にしない。
     def run_store(store)
       unverified = @settings.database.unverified_entitlements(
-        store, days: WINDOW_DAYS, limit: BATCH
+        store, days: WINDOW_DAYS, limit: BATCH, **not_found_pacing
       )
       stale = @settings.database.stale_entitlements(
-        store, limit: BATCH, stale_days: STALE_DAYS
+        store, limit: BATCH, stale_days: STALE_DAYS, **not_found_pacing
       )
       verify_rows(store, unverified, sweep: 'unverified')
       verify_rows(store, stale, sweep: 'stale')
@@ -98,11 +115,35 @@ module Relay
         outcome, = Relay::StoreVerification.verify!(
           @settings, store: store, entitlement_id: row['id'], purchase_ref: row['purchase_id']
         )
-        # 反映されなかった行（見つからない・届かない）を順番の後ろへ回す。
-        @settings.database.touch_entitlement(row['id'])
+        record_outcome(row['id'], outcome)
         @settings.metrics.increment('relay_entitlement_verify_total',
           {store: store, outcome: outcome, sweep: sweep})
       end
+    end
+
+    # ⚠⚠ **「知らない」と「届かない」を同じ扱いにしない** (#63)。
+    #
+    # | outcome | ここでやること |
+    # | --- | --- |
+    # | `not_found` | 連続を数え、[NOT_FOUND_TERMINAL_DAYS] 日続いたら終端へ落とす |
+    # | `unavailable` / `invalid` | 順番の後ろへ回すだけ（⚠ **ストア障害で失効させない**） |
+    # | ストアの状態 | 何もしない（[Relay::Database#update_entitlement_verification!] が数えを戻す） |
+    def record_outcome(entitlement_id, outcome)
+      if outcome == 'not_found'
+        return @settings.database.record_entitlement_not_found(
+          entitlement_id, terminal_days: NOT_FOUND_TERMINAL_DAYS
+        )
+      end
+
+      # 反映されなかった行（届かない・署名が合わない）を順番の後ろへ回す。
+      return @settings.database.touch_entitlement(entitlement_id) if
+        ['unavailable', 'invalid'].include?(outcome)
+
+      return nil
+    end
+
+    def not_found_pacing
+      return {grace: NOT_FOUND_GRACE_CHECKS, backoff_days: NOT_FOUND_BACKOFF_DAYS}
     end
   end
 end

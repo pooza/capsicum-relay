@@ -218,7 +218,102 @@ class AppStoreVerificationTest < Minitest::Test
     assert_nil(Relay::EntitlementReverifier.start_from_settings(settings(nil)))
   end
 
+  # --- ストアが「知らない」と言い続ける行 (#63) ----------------------------------
+
+  # ⚠⚠ **買った直後は待たせない。**ストアへの伝播が遅れると行は `unverified` のまま
+  # 残り、**ゲートは deny する**。自動で治す経路はこの掃除だけ（クライアントは起動時に
+  # `POST /entitlements` を送り直さず、持っている token で読むだけ）なので、
+  # 最初の [NOT_FOUND_GRACE_CHECKS] 回は従来どおり毎周引く。
+  def test_reverifier_keeps_rechecking_right_after_a_not_found
+    entitlement('2000')
+    fake = FakeAppStore.new {nil}
+    reverifier = Relay::EntitlementReverifier.new(settings(fake))
+    Relay::EntitlementReverifier::NOT_FOUND_GRACE_CHECKS.times {reverifier.run_once}
+
+    assert_equal(Relay::EntitlementReverifier::NOT_FOUND_GRACE_CHECKS, fake.calls.size)
+  end
+
+  # ⚠⚠ **毎周を永久に続けない。**猶予を使い切ったらバックオフする。ステージングでは
+  # 行 3 つに対して not_found が 694 回出ており（2026-10-05 実測）、**ストアが知らない
+  # 購入へ 10 分ごとに永久に API を叩いていた**。
+  def test_reverifier_backs_off_after_repeated_not_found
+    entitlement('2000')
+    fake = FakeAppStore.new {nil}
+    reverifier = Relay::EntitlementReverifier.new(settings(fake))
+    (Relay::EntitlementReverifier::NOT_FOUND_GRACE_CHECKS + 2).times {reverifier.run_once}
+
+    assert_equal(Relay::EntitlementReverifier::NOT_FOUND_GRACE_CHECKS, fake.calls.size,
+      '猶予を使い切った行をまだ毎周引いている')
+  end
+
+  # バックオフが明けたら 1 回だけ引く（諦めてはいない）。
+  def test_reverifier_rechecks_once_a_day_while_the_store_denies_it
+    id = entitlement('2000')
+    fake = FakeAppStore.new {nil}
+    reverifier = Relay::EntitlementReverifier.new(settings(fake))
+    (Relay::EntitlementReverifier::NOT_FOUND_GRACE_CHECKS + 1).times {reverifier.run_once}
+    before = fake.calls.size
+    raw_update("UPDATE entitlements SET updated_at = datetime('now', '-2 days') WHERE id = #{id}")
+    reverifier.run_once
+
+    assert_equal(before + 1, fake.calls.size)
+  end
+
+  # ⚠⚠ **[NOT_FOUND_TERMINAL_DAYS] 日続いたら終端へ落とす。**ゲートは期限の読めない
+  # `active` を fail-open で通すので、放置すると「**ストアが知らない購入が無期限に
+  # 通る**」行が残る。終端にすれば掃除の対象からも外れる。
+  def test_reverifier_revokes_a_purchase_the_store_has_forgotten
+    id = entitlement('2000')
+    Relay::EntitlementReverifier.new(settings(FakeAppStore.new {result('active')})).run_once
+    fake = FakeAppStore.new {nil}
+    reverifier = Relay::EntitlementReverifier.new(settings(fake))
+    reverifier.run_once
+    forget_since(id, days: Relay::EntitlementReverifier::NOT_FOUND_TERMINAL_DAYS + 1)
+    reverifier.run_once
+    calls = fake.calls.size
+
+    assert_equal('revoked', @db.find_entitlement('apple', '1000')['status'])
+    raw_update("UPDATE entitlements SET updated_at = datetime('now', '-2 days') WHERE id = #{id}")
+
+    assert_equal(0, reverifier.run_once, '終端にした行をまだ引いている')
+    assert_equal(calls, fake.calls.size)
+  end
+
+  # ⚠ ストアが答えたら数え直す（バックオフも終端までの日数も解ける）。
+  def test_reverifier_clears_the_not_found_streak_when_the_store_answers
+    entitlement('2000')
+    nothing = FakeAppStore.new {nil}
+    reverifier = Relay::EntitlementReverifier.new(settings(nothing))
+    (Relay::EntitlementReverifier::NOT_FOUND_GRACE_CHECKS - 1).times {reverifier.run_once}
+    Relay::EntitlementReverifier.new(settings(FakeAppStore.new {result('active')})).run_once
+    row = @db.find_entitlement('apple', '1000')
+
+    assert_equal(0, row['not_found_streak'])
+    assert_nil(row['not_found_since'])
+  end
+
+  # ⚠⚠ **「届かない」は「知らない」ではない。**`unavailable` は fail-open なので、
+  # バックオフも終端の数えも進めない（ストア障害で有効な購読を失効させない）。
+  def test_reverifier_does_not_count_unavailable_as_not_found
+    entitlement('2000')
+    fake = FakeAppStore.new {raise(Relay::StoreUnavailable, 'boom')}
+    reverifier = Relay::EntitlementReverifier.new(settings(fake))
+    runs = Relay::EntitlementReverifier::NOT_FOUND_GRACE_CHECKS + 2
+    runs.times {reverifier.run_once}
+
+    assert_equal(runs, fake.calls.size, 'ストア障害でバックオフに入っている')
+    assert_equal(0, @db.find_entitlement('apple', '2000')['not_found_streak'])
+  end
+
   private
+
+  # その行を「[days] 日前から not_found が続いている」状態にし、バックオフも明けさせる。
+  def forget_since(id, days:)
+    raw_update(
+      "UPDATE entitlements SET not_found_since = datetime('now', '-#{Integer(days)} days')," \
+        " updated_at = datetime('now', '-2 days') WHERE id = #{Integer(id)}",
+    )
+  end
 
   def raw_update(sql)
     db = SQLite3::Database.new(File.join(@dir, 'relay.sqlite3'))

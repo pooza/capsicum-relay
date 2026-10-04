@@ -390,6 +390,24 @@ Apple と**同じ判断**（`Relay::StoreVerification`）に乗る。ストア�
 | ⚠ **Pub/Sub は 1 トピックに購読を複数付けられる** | 本番とステージングの両方へ届けられる（Apple は環境ごとに URL が 1 つ） |
 | ⚠ **Proc を `set` しない** | Sinatra は Proc の設定を読み出しのたびに呼ぶ。OIDC の検証器は `call` を持つモジュール（`GooglePlayClient::OidcVerifier`） |
 
+### ストアが「知らない」と言い続ける購入（[#63](https://github.com/pooza/capsicum-relay/issues/63)）
+
+⚠⚠ **`not_found` は行を触らない**（ストアの応答で状態を上書きしない fail-open の一種）。そのため **何もしなければ終端にも落ちず、掃除の除外条件にも入らない** —— `stale_entitlements` は `expires_at` が NULL / 過去なら**毎周引く**ので、`touch_entitlement` では止まらない。
+
+🔴 **2026-10-05 にステージングで実測: 行 3 つに対して `not_found` が 694 回**（`sweep="unverified"` 416 / `sweep="stale"` 278）。**ストアが知らない購入へ 10 分ごとに永久に API を叩いていた**うえ、⚠⚠ **その行はゲートを fail-open で通り続ける**（期限の読めない `active` は通す側）＝ **無期限に無償で通る行**が残る。
+
+| 連続した `not_found` | 扱い |
+| --- | --- |
+| `NOT_FOUND_GRACE_CHECKS`（3）回まで | **従来どおり毎周引く。**⚠⚠ **買った直後の伝播待ちを待たせないため** —— その行は `unverified` でゲートが deny し、**自動で治す経路はこの掃除だけ**（クライアントは起動時に `POST /entitlements` を送り直さず、持っている token で `GET` するだけ）。既定の 600 秒間隔なら約 30 分ぶん |
+| それ以降 | `NOT_FOUND_BACKOFF_DAYS`（1 日）に 1 回へ落とす |
+| `NOT_FOUND_TERMINAL_DAYS`（7 日）続いたら | **`revoked` へ落とす**（終端なので `stale_entitlements` の除外に入り、掃除が止まる） |
+
+⚠ **終端にするかは「回数」ではなく `not_found_since`（いつから続いているか）で決める** —— 掃除の間隔を変えても判断が動かないようにするため。
+
+⚠⚠ **「届かない」（`unavailable`）では数えない。**ストア障害で有効な購読を失効させてはいけないので、あちらは順番の後ろへ回すだけ（`invalid` も同じ）。⚠ ストアが答えたら `not_found_streak` / `not_found_since` は 0 / NULL に戻る（`update_entitlement_verification!`・**書けたときだけ** —— 古い結果が順序で弾かれた回に数えを消すと終端までの日数が延びる）。
+
+⚠ 買い直したときは**クライアント自身の `POST /entitlements`** がその場で確かめるので、終端にしても回復経路は残る。
+
 ### 観測（[#59](https://github.com/pooza/capsicum-relay/issues/59)）
 
 `relay_register_entitlement_total{preset,entitlement,token}` が、フェーズ 3 でゲートを閉じたときに誰が止まるかを先に示す。
