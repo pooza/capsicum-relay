@@ -1,3 +1,4 @@
+require_relative '../entitlement_gate'
 require_relative '../store_verification'
 require_relative '../base_app'
 
@@ -150,7 +151,14 @@ module Relay
         #
         # ⚠ `purchase_id` は**返す**（送ってきた値なので新しい情報ではなく、
         # どの購入に対する応答かを突き合わせられる）。
+        #
+        # ⚠⚠ **`entitled` / `reason` を載せる（#63）。**`status` と `expires_at` を
+        # 返すだけだと、**クライアントが同じ判定を書き直すことになる** ——
+        # `status` が `active` のまま期限が過ぎた行（更新の通知を取りこぼした形）を
+        # 「有効」と表示してしまい、**画面とゲートで別の結論が出る**。判定は
+        # [Relay::EntitlementGate] の 1 か所に置く、が #60 からの方針。
         def entitlement_response(token)
+          entitled, reason = entitlement_state(token)
           return {
             token: token['token'],
             store: token['store'],
@@ -159,7 +167,23 @@ module Relay
             status: token['status'],
             expires_at: token['expires_at'],
             environment: token['environment'],
+            entitled: entitled,
+            reason: reason,
           }
+        end
+
+        # その行がいま利用権として通るか。戻り値は `[通るか, 理由]`。
+        #
+        # ⚠⚠ **[Relay::EntitlementGate.decide] ではなく [row_decision] を呼ぶ。**
+        # あちらは `RELAY_ENTITLEMENT_ENFORCE` が false なら即 `enforce_off` で通す
+        # ので、**enforce を立てる前は画面が常に「有効」になってしまう**。ここで
+        # 知りたいのは「ゲートを閉じたらどう扱われるか」で、**いま閉じているかでは
+        # ない**（設計書 2-4 の「閉じる前に測る」と同じ向き）。
+        #
+        # ⚠ プリセットの迂回もここでは見ない —— この口は**購入の状態**を返すもので、
+        # 「プリセットだから通る」はその購入の性質ではない。
+        def entitlement_state(token)
+          return Relay::EntitlementGate.row_decision(token)
         end
       end
     end

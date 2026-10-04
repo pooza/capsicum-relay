@@ -80,7 +80,16 @@ module Relay
 
     def self.verify_locked(settings, store, entitlement_id, purchase_ref)
       result = client_for(settings, store).purchase_status(purchase_ref)
-      return ['not_found', entitlement_id] unless result
+      unless result
+        # ⚠⚠ **数えるのは鍵の中**（PR #86 の Codex P2）。鍵の外で数えると、同じ購入の
+        # **成功した検証と競合して、通ったばかりの行に連続を書き戻す**（連続が
+        # [Relay::Database::NOT_FOUND_TERMINAL_DAYS] 日に達していれば `revoked` まで
+        # 行く ＝ **正当な購読者が次の明示的な検証まで拒否されたままになる**）。
+        # ⚠ **前景（`POST /entitlements` / 通知）でも数える** —— 掃除だけで数えると、
+        # purchase_id を知っている者が前景で叩き続けるだけで終端を先送りできた。
+        settings.database.record_entitlement_not_found(entitlement_id)
+        return ['not_found', entitlement_id]
+      end
 
       id = settings.database.apply_entitlement_verification(
         entitlement_id, verification_of(store, result)

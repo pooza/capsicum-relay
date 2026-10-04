@@ -43,6 +43,23 @@ module Relay
       'revoked'
     ].freeze
 
+    # ストアが「その購入は知らない」と言い続ける行の扱い (#63)。
+    #
+    # ⚠⚠ **`not_found` は行を触らない**（ストアの応答で状態を上書きしない fail-open の
+    # 一種）ので、**何もしなければ終端にも落ちず、掃除の除外にも入らない。**
+    # ステージングでは行 3 つに対して not_found が 694 回出ていた（2026-10-05 実測）。
+    #
+    # - [NOT_FOUND_GRACE_CHECKS]: ここまでは毎周引く。⚠ **買った直後の伝播待ちを
+    #   待たせないため**（既定 600 秒間隔なら約 30 分ぶん）
+    # - [NOT_FOUND_BACKOFF_DAYS]: 猶予を使い切った行を引き直す間隔
+    # - [NOT_FOUND_TERMINAL_DAYS]: ここまで続いたら `revoked` へ落とす
+    #
+    # ⚠ **掃除のワーカーではなく行の側に置く** —— 前景の検証（`POST /entitlements` /
+    # 通知）でも同じ数えが進むため（PR #86 の Codex P2）。
+    NOT_FOUND_GRACE_CHECKS = 3
+    NOT_FOUND_BACKOFF_DAYS = 1
+    NOT_FOUND_TERMINAL_DAYS = 7
+
     # device_id を持たない古い行を掃除してよいと判断するまでの猶予 (capsicum#949)。
     # 生きている端末は起動のたびに register して updated_at が進むので、これを
     # 超えるのは実際に使われていない行だけになる。詳細は purge_legacy_rows 参照。
@@ -381,14 +398,119 @@ module Relay
     # ⚠ `unverified` の行は誰でも作れる（`POST /entitlements` は共有シークレットだけ）。
     # **件数と期間で縛る**のは、でたらめな行を大量に作られても Apple API を叩く量が
     # 増えないようにするため。
+    # ⚠ [grace] / [backoff_days] は「知らない」と言われ続けている行の間隔
+    # （[not_found_backoff_sql] の doc）。
+    #
+    # ⚠⚠ **連続が始まっている行は、作成の窓を過ぎても引き続き引く**（PR #86 の Codex P2）。
+    # そうしないと **約束した終端（`revoked`）に永久に到達しない** —— `not_found_since` が
+    # 立つのは最初の掃除（作成 + 数分）なので、`created_at` 基準の窓（[days] 日）が
+    # [record_entitlement_not_found] の終端（同じ 7 日）より**必ず先に閉じる**。
+    #
+    # ⚠ **叩く量は増えない。**連続が猶予を越えた行はバックオフで 1 日 1 回に落ち、
+    # 7 日で `revoked` になって `status` の条件から外れる ＝ **1 行あたり 10 回前後で打ち止め**
+    # （直す前は 7 日間 10 分ごと ＝ 1,000 回超だった）。
     def unverified_entitlements(store, days:, limit:)
       window = "-#{Integer(days)} days"
-      return @db.execute(<<~SQL, [store, ENTITLEMENT_STATUS_UNVERIFIED, window, limit])
+      values = [store, ENTITLEMENT_STATUS_UNVERIFIED, window, limit]
+      return @db.execute(<<~SQL, values)
         SELECT * FROM entitlements
-        WHERE store = ? AND status = ? AND created_at >= datetime('now', ?)
+        WHERE store = ? AND status = ?
+          AND (created_at >= datetime('now', ?) OR not_found_since IS NOT NULL)
+          AND #{not_found_backoff_sql}
         ORDER BY updated_at ASC, id ASC
         LIMIT ?
       SQL
+    end
+
+    # 「知らない」と言われ続けている行を毎周引かないための条件 (#63)。
+    #
+    # ⚠⚠ **最初の [grace] 回は素通りさせる**（＝従来どおり毎周引く）。買った直後は
+    # ストアへの伝播が遅れていることがあり、その行は `unverified` のままで
+    # **ゲートが deny する**。自動で治す経路はこの掃除だけなので（クライアントは
+    # 起動時に `POST /entitlements` を送り直さず、持っている token で読むだけ）、
+    # **最初から 1 日待たせると買った人が最大 1 日使えない。**
+    #
+    # ⚠ 猶予を使い切った行は、**最後に「知らない」と言われてから**
+    # [NOT_FOUND_BACKOFF_DAYS] 日より経っているときだけ引く。
+    #
+    # ⚠⚠ **`updated_at` で測ってはいけない**（PR #86 の Codex P2）。あれは
+    # `POST /entitlements` の upsert でも若返るので、**purchase_id を知っている者が
+    # 叩き続けるだけで、この条件が永久に閉じたまま＝終端に到達しない**
+    # （`active` で期限が読めない行はゲートを fail-open で通るので、無期限に通る）。
+    # ⚠ 共有シークレットはバイナリから取り出せる前提なので、**到達可能**。
+    def not_found_backoff_sql
+      return '(not_found_streak <' \
+        " #{Integer(NOT_FOUND_GRACE_CHECKS)} OR not_found_checked_at IS NULL" \
+        " OR not_found_checked_at <= datetime('now', '-#{Integer(NOT_FOUND_BACKOFF_DAYS)} days'))"
+    end
+
+    # 確かめ直す「検証は済んでいるが、いまの状態を信用できない」購入 (#63)。
+    #
+    # ⚠⚠ **通知は落ちる。**Apple の V2 / Google の RTDN を取りこぼすと、行は更新前の
+    # 状態で残り続ける —— ⚠ **更新を取りこぼした `active` は期限が過ぎても `active`**
+    # で、ゲートが `expires_at` を見るようになった（#63）とはいえ、**本当は払われて
+    # いる購読を止めてしまう**。逆に失効を取りこぼせば通し続ける。**どちらも通知
+    # 任せでは直らない**ので、ここで引き直す。
+    #
+    # 引くのは次のどれかに当たる行:
+    #
+    # - `expires_at` が過ぎている（更新か失効のどちらかが起きているはず）
+    # - `expires_at` が無い（⚠ ゲートが fail-open で通す側なので、放置できない）
+    # - 最後に触ってから [stale_days] 日より長く動いていない（通知の取りこぼしの保険）
+    #
+    # ⚠ **終端の状態（`expired` / `revoked`）は引かない。**変化するのは利用者が
+    # 買い直したときで、そのときは**クライアント自身の `POST /entitlements` が
+    # その場で確かめる**（あの口はストアを引く）。ここで追い続けると、終わった購入に
+    # 永久に API を叩くことになる。
+    #
+    # ⚠ `unverified` は [unverified_entitlements] の担当（あちらは誰でも作れる行なので
+    # 期間と件数の縛りが違う）。
+    def stale_entitlements(store, limit:, stale_days:)
+      window = "-#{Integer(stale_days)} days"
+      skipped = [ENTITLEMENT_STATUS_UNVERIFIED, 'expired', 'revoked']
+      values = [store, *skipped, window, limit]
+      return @db.execute(<<~SQL, values)
+        SELECT * FROM entitlements
+        WHERE store = ? AND status NOT IN (?, ?, ?)
+          AND (expires_at IS NULL OR expires_at = ''
+               OR expires_at <= datetime('now')
+               OR updated_at <= datetime('now', ?))
+          AND #{not_found_backoff_sql}
+        ORDER BY updated_at ASC, id ASC
+        LIMIT ?
+      SQL
+    end
+
+    # ストアが「その購入は知らない」と答えたことを記録する (#63)。
+    #
+    # ⚠⚠ **[terminal_days] 日続いたら終端（`revoked`）へ落とす。**ゲートは期限の
+    # 読めない `active` を fail-open で通すので、放置すると「**ストアが知らない購入が
+    # 無期限に通る**」行が残る。終端にすれば [stale_entitlements] の除外にも入り、
+    # 掃除が止まる。
+    #
+    # ⚠ **「届かない」（`unavailable`）では呼ばない。**あちらはストア障害で、
+    # 有効な購読を失効させてはいけない（呼び出し側 [Relay::StoreVerification] で分岐）。
+    #
+    # ⚠⚠ **呼ぶのは購入ごとの鍵の中**（[Relay::StoreVerification.verify!]・PR #86 の
+    # Codex P2）。鍵の外で呼ぶと、**同じ購入の成功した検証と競合して、通ったばかりの
+    # 行に連続を書き戻す**（連続が 7 日に達していれば `revoked` まで行く ＝ **正当な
+    # 購読者が、次の明示的な検証まで拒否されたままになる**）。
+    def record_entitlement_not_found(entitlement_id, terminal_days: NOT_FOUND_TERMINAL_DAYS)
+      window = "-#{Integer(terminal_days)} days"
+      @db.transaction do
+        @db.execute(<<~SQL, [entitlement_id])
+          UPDATE entitlements SET
+            not_found_streak = not_found_streak + 1,
+            not_found_since = COALESCE(not_found_since, datetime('now')),
+            not_found_checked_at = datetime('now'),
+            updated_at = datetime('now')
+          WHERE id = ?
+        SQL
+        @db.execute(<<~SQL, [entitlement_id, window])
+          UPDATE entitlements SET status = 'revoked', updated_at = datetime('now')
+          WHERE id = ? AND not_found_since IS NOT NULL AND not_found_since <= datetime('now', ?)
+        SQL
+      end
     end
 
     # 確かめ直した行を順番の後ろへ回す（同じ行ばかり引かないように）。
@@ -630,9 +752,40 @@ module Relay
       end
       # 反映した結果にストアが署名した時刻（ミリ秒）(Codex P2・PR #75)。古い結果での
       # 上書きを拒むための順序。
-      return if columns.include?('signed_at')
+      unless columns.include?('signed_at')
+        @db.execute('ALTER TABLE entitlements ADD COLUMN signed_at INTEGER')
+      end
+      add_not_found_columns!(columns)
+    end
 
-      @db.execute('ALTER TABLE entitlements ADD COLUMN signed_at INTEGER')
+    # ストアが「その購入は知らない」と言い続けている行を数える 2 列 (#63)。
+    #
+    # ⚠⚠ **これが無いと掃除が永久に回る。**`not_found` は行を触らない（fail-open の
+    # 一種）ので、**終端にも落ちず、掃除の除外にも入らない** —— ステージングでは
+    # 行 3 つに対して not_found が 694 回出ていた（2026-10-05 実測）。
+    #
+    # - `not_found_streak`: 連続で「知らない」と言われた回数。⚠ ストアが答えたら 0 に戻す
+    #   （[update_entitlement_verification!]）
+    # - `not_found_since`: その連続が始まった時刻。⚠ **終端にするかは「回数」ではなく
+    #   「いつから」で決める** —— 掃除の間隔が変わっても判断が動かないため
+    # - `not_found_checked_at`: 最後に「知らない」と言われた時刻。⚠⚠ **バックオフの
+    #   時計を `updated_at` と分けるため**（PR #86 の Codex P2）—— あちらは
+    #   `POST /entitlements` の upsert でも若返るので、**purchase_id を知っている者が
+    #   叩き続けるだけで終端を無限に先送りできた**（共有シークレットは取り出せる前提）
+    #
+    # ⚠ `NOT NULL DEFAULT 0` なので既存の行は 0 で埋まる（組み替えは要らない）。
+    def add_not_found_columns!(columns)
+      unless columns.include?('not_found_streak')
+        @db.execute(
+          'ALTER TABLE entitlements ADD COLUMN not_found_streak INTEGER NOT NULL DEFAULT 0',
+        )
+      end
+      unless columns.include?('not_found_since')
+        @db.execute('ALTER TABLE entitlements ADD COLUMN not_found_since TEXT')
+      end
+      return if columns.include?('not_found_checked_at')
+
+      @db.execute('ALTER TABLE entitlements ADD COLUMN not_found_checked_at TEXT')
     end
 
     # ⚠⚠ **ストアの署名時刻が、いま入っているものより古ければ書かない**（Codex P2・
@@ -647,6 +800,8 @@ module Relay
         UPDATE entitlements SET purchase_id = ? WHERE id = ?
       SQL
       values = [v.product_id, v.status, v.expires_at, v.environment, v.signed_at]
+      # ⚠ ストアが答えたので「知らない」の連続は切れる (#63)。⚠⚠ **書けたときだけ
+      # 戻す** —— 古い結果が順序で弾かれた回に数えを消すと、終端までの日数が延びる。
       @db.execute(<<~SQL, values + [entitlement_id, v.signed_at, v.signed_at])
         UPDATE entitlements SET
           product_id = COALESCE(?, product_id),
@@ -654,6 +809,9 @@ module Relay
           expires_at = ?,
           environment = ?,
           signed_at = ?,
+          not_found_streak = 0,
+          not_found_since = NULL,
+          not_found_checked_at = NULL,
           updated_at = datetime('now')
         WHERE id = ? AND (signed_at IS NULL OR ? IS NULL OR signed_at <= ?)
       SQL

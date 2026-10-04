@@ -21,6 +21,17 @@ module Relay
     BATCH = 20
     WINDOW_DAYS = 7
 
+    # 検証済みの行を引き直す間隔の目安 (#63)。⚠ **これは「最後に触ってから」の
+    # 日数**で、期限切れ・期限不明の行は日数を待たずに毎周引く
+    # （[Relay::Database#stale_entitlements]）。
+    STALE_DAYS = 7
+
+    # ⚠ ストアが「その購入は知らない」と答え続ける行の間隔と終端は
+    # **[Relay::Database] 側の定数**（`NOT_FOUND_GRACE_CHECKS` /
+    # `NOT_FOUND_BACKOFF_DAYS` / `NOT_FOUND_TERMINAL_DAYS`）。⚠⚠ **掃除の側に
+    # 置かない** —— 前景の検証（`POST /entitlements` / 通知）でも同じ数えが進むため
+    # （PR #86 の Codex P2）。
+
     # どのストアのクライアントも無い・`reverify_interval` が 0 以下なら起動しない（nil）。
     # ⚠ 間隔は `app_store.reverify_interval` を見る（最初に入った設定の置き場。Google だけの
     # 構成でも既定の 600 秒で動く）。
@@ -70,18 +81,48 @@ module Relay
 
     private
 
+    # ⚠ **2 種類を回す。**`unverified`（誰でも作れる行・期間と件数で縛る）と、
+    # **検証済みだが状態を信用できない行**（通知の取りこぼし・#63）。
+    # ⚠⚠ **件数はそれぞれ [BATCH] 件。**片方が枠を食い切って、もう片方が永久に
+    # 回らない形にしない。
     def run_store(store)
-      rows = @settings.database.unverified_entitlements(store, days: WINDOW_DAYS, limit: BATCH)
+      unverified = @settings.database.unverified_entitlements(
+        store, days: WINDOW_DAYS, limit: BATCH
+      )
+      stale = @settings.database.stale_entitlements(
+        store, limit: BATCH, stale_days: STALE_DAYS
+      )
+      verify_rows(store, unverified, sweep: 'unverified')
+      verify_rows(store, stale, sweep: 'stale')
+      return unverified.size + stale.size
+    end
+
+    # ⚠ `sweep` のラベルを分ける —— **どちらの掃除が当たっているか**が分からないと、
+    # 「通知の取りこぼしが実際に起きているのか」を測れない。
+    def verify_rows(store, rows, sweep:)
       rows.each do |row|
         outcome, = Relay::StoreVerification.verify!(
           @settings, store: store, entitlement_id: row['id'], purchase_ref: row['purchase_id']
         )
-        # 反映されなかった行（見つからない・届かない）を順番の後ろへ回す。
-        @settings.database.touch_entitlement(row['id'])
+        record_outcome(row['id'], outcome)
         @settings.metrics.increment('relay_entitlement_verify_total',
-          {store: store, outcome: outcome})
+          {store: store, outcome: outcome, sweep: sweep})
       end
-      return rows.size
+    end
+
+    # ⚠⚠ **「知らない」と「届かない」を同じ扱いにしない** (#63)。
+    #
+    # | outcome | ここでやること |
+    # | --- | --- |
+    # | `not_found` | **何もしない**（数えるのは鍵の中・PR #86 の Codex P2） |
+    # | `unavailable` / `invalid` | 順番の後ろへ回すだけ（⚠ **ストア障害で失効させない**） |
+    # | ストアの状態 | 何もしない（[Relay::Database#update_entitlement_verification!] が数えを戻す） |
+    def record_outcome(entitlement_id, outcome)
+      # 反映されなかった行（届かない・署名が合わない）を順番の後ろへ回す。
+      return @settings.database.touch_entitlement(entitlement_id) if
+        ['unavailable', 'invalid'].include?(outcome)
+
+      return nil
     end
   end
 end

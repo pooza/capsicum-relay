@@ -390,6 +390,32 @@ Apple と**同じ判断**（`Relay::StoreVerification`）に乗る。ストア�
 | ⚠ **Pub/Sub は 1 トピックに購読を複数付けられる** | 本番とステージングの両方へ届けられる（Apple は環境ごとに URL が 1 つ） |
 | ⚠ **Proc を `set` しない** | Sinatra は Proc の設定を読み出しのたびに呼ぶ。OIDC の検証器は `call` を持つモジュール（`GooglePlayClient::OidcVerifier`） |
 
+### ストアが「知らない」と言い続ける購入（[#63](https://github.com/pooza/capsicum-relay/issues/63)）
+
+⚠⚠ **`not_found` は行を触らない**（ストアの応答で状態を上書きしない fail-open の一種）。そのため **何もしなければ終端にも落ちず、掃除の除外条件にも入らない** —— `stale_entitlements` は `expires_at` が NULL / 過去なら**毎周引く**ので、`touch_entitlement` では止まらない。
+
+🔴 **2026-10-05 にステージングで実測: 行 3 つに対して `not_found` が 694 回**（`sweep="unverified"` 416 / `sweep="stale"` 278）。**ストアが知らない購入へ 10 分ごとに永久に API を叩いていた**うえ、⚠⚠ **その行はゲートを fail-open で通り続ける**（期限の読めない `active` は通す側）＝ **無期限に無償で通る行**が残る。
+
+| 連続した `not_found` | 扱い |
+| --- | --- |
+| `NOT_FOUND_GRACE_CHECKS`（3）回まで | **従来どおり毎周引く。**⚠⚠ **買った直後の伝播待ちを待たせないため** —— その行は `unverified` でゲートが deny し、**自動で治す経路はこの掃除だけ**（クライアントは起動時に `POST /entitlements` を送り直さず、持っている token で `GET` するだけ）。既定の 600 秒間隔なら約 30 分ぶん |
+| それ以降 | `NOT_FOUND_BACKOFF_DAYS`（1 日）に 1 回へ落とす |
+| `NOT_FOUND_TERMINAL_DAYS`（7 日）続いたら | **`revoked` へ落とす**（終端なので `stale_entitlements` の除外に入り、掃除が止まる） |
+
+⚠ **終端にするかは「回数」ではなく `not_found_since`（いつから続いているか）で決める** —— 掃除の間隔を変えても判断が動かないようにするため。
+
+⚠⚠ **連続が始まった `unverified` の行は、作成の窓（`WINDOW_DAYS`・7 日）を過ぎても引き続き引く**（PR #86 の Codex P2）。`not_found_since` が立つのは最初の掃除（作成 + 数分）なので、**作成基準の窓は終端（同じ 7 日）より必ず先に閉じる** ＝ 窓だけで切ると **約束した `revoked` に永久に到達しない。**⚠ **叩く量は増えない** —— バックオフで 1 日 1 回に落ち、7 日で終端になって `status` の条件から外れる ＝ **1 行あたり 10 回前後で打ち止め**（直す前は 7 日間 10 分ごと ＝ 1,000 回超）。
+
+⚠⚠ **バックオフの時計は `not_found_checked_at`。`updated_at` で測ってはいけない**（PR #86 の Codex P2）。あれは `POST /entitlements` の upsert でも若返るので、🔴 **purchase_id を知っている者が前景で叩き続けるだけで終端に永久に到達しない**（＝ `active` で期限が読めない行が無期限に通る）。⚠ 共有シークレットはバイナリから取り出せる前提なので**到達可能な経路**。
+
+⚠⚠ **数えるのは購入ごとの鍵の中**（`StoreVerification.verify!`・同じ Codex P2）。鍵の外で数えると、同じ購入の**成功した検証と競合して通ったばかりの行に連続を書き戻す**（7 日に達していれば `revoked` まで行く ＝ **正当な購読者が次の明示的な検証まで拒否される**）。⚠ **前景（`POST /entitlements` / 通知）でも同じ数えが進む**ので、定数は掃除のワーカーではなく `Relay::Database` 側に置いてある。
+
+⚠ **スレッド 2 本の競合テストでは守れない。**鍵を解いた直後に数える実装でも成功側より先に書き終わるため**素通りする**（2026-10-05 に穴を開けて確認）。**鍵を握っているかを直接見る**テストにしてある（`LockWatchingDatabase`）。
+
+⚠⚠ **「届かない」（`unavailable`）では数えない。**ストア障害で有効な購読を失効させてはいけないので、あちらは順番の後ろへ回すだけ（`invalid` も同じ）。⚠ ストアが答えたら `not_found_streak` / `not_found_since` は 0 / NULL に戻る（`update_entitlement_verification!`・**書けたときだけ** —— 古い結果が順序で弾かれた回に数えを消すと終端までの日数が延びる）。
+
+⚠ 買い直したときは**クライアント自身の `POST /entitlements`** がその場で確かめるので、終端にしても回復経路は残る。
+
 ### 観測（[#59](https://github.com/pooza/capsicum-relay/issues/59)）
 
 `relay_register_entitlement_total{preset,entitlement,token}` が、フェーズ 3 でゲートを閉じたときに誰が止まるかを先に示す。
@@ -482,12 +508,13 @@ gh api -X POST   repos/pooza/capsicum-relay/branches/main/protection/enforce_adm
 
 ⚠⚠ **`ssh` を 2 行並べてから共通のコマンドを書かない**（PR #70 の Codex P2）。最初の `ssh` が triton のシェルを開いてしまい、**残りのコマンドがそちらで動く** ＝ **本番にしか当たらず、ステージングが未デプロイのまま「両方やった」ことになる。**ステージング先という手順そのものが壊れるので、**ホストごとに完結したブロックにする。**
 
+⚠⚠ **リモート側も行頭に `cd` を書かない**（2026-10-05 に貼れなくなっていたのを直した）。capsicum の `.claude/hooks/deny-bare-cd-chain.sh` は**コマンド文字列の行頭 `cd` を見る**ので、ssh の引用符の中に書いた `cd` も拒否する（ローカルの cwd は動かないので誤検出だが、**回避する書き方を探さない**のが規約・capsicum#1198）。⚠ `git -C` と `(cd … && …)` で書けば通り、**リモートの cwd を残さない**ぶん下の「`ssh` を 2 行並べない」とも同じ向きになる。
+
 ```bash
 # 1. ステージング（triton・develop を追う）
 ssh deploy@triton.b-shock.local '
-  cd ~/repos/capsicum-relay &&
-  git pull &&
-  bundle install &&
+  git -C ~/repos/capsicum-relay pull &&
+  (cd ~/repos/capsicum-relay && bundle install) &&
   sudo -n systemctl restart capsicum-relay
 '
 ```
@@ -495,9 +522,8 @@ ssh deploy@triton.b-shock.local '
 ```bash
 # 2. 本番（flauros・main を追う）。⚠ develop → main の PR をマージし、1 の疎通確認が通ってから
 ssh deploy@flauros.b-shock.co.jp '
-  cd ~/repos/capsicum-relay &&
-  git pull &&
-  bundle install &&
+  git -C ~/repos/capsicum-relay pull &&
+  (cd ~/repos/capsicum-relay && bundle install) &&
   sudo -n systemctl restart capsicum-relay
 '
 ```
