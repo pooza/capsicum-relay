@@ -1,6 +1,7 @@
 require_relative 'test_helper'
 require 'logger'
 require 'tmpdir'
+require 'delegate'
 require 'lib/relay/app_store_client'
 require 'lib/relay/google_play_client'
 require 'lib/relay/store_verification'
@@ -24,6 +25,17 @@ class AppStoreVerificationTest < Minitest::Test
     def purchase_status(transaction_id)
       @calls << transaction_id
       return @responder.call(transaction_id, @calls.size)
+    end
+  end
+
+  # `record_entitlement_not_found` が**鍵を握ったまま**呼ばれているかを捕まえる
+  # （PR #86 の Codex P2）。
+  class LockWatchingDatabase < SimpleDelegator
+    attr_reader :locked_when_recorded
+
+    def record_entitlement_not_found(entitlement_id, **)
+      @locked_when_recorded = Relay::StoreVerification.lock_for(entitlement_id).owned?
+      return __getobj__.record_entitlement_not_found(entitlement_id, **)
     end
   end
 
@@ -228,9 +240,9 @@ class AppStoreVerificationTest < Minitest::Test
     entitlement('2000')
     fake = FakeAppStore.new {nil}
     reverifier = Relay::EntitlementReverifier.new(settings(fake))
-    Relay::EntitlementReverifier::NOT_FOUND_GRACE_CHECKS.times {reverifier.run_once}
+    Relay::Database::NOT_FOUND_GRACE_CHECKS.times {reverifier.run_once}
 
-    assert_equal(Relay::EntitlementReverifier::NOT_FOUND_GRACE_CHECKS, fake.calls.size)
+    assert_equal(Relay::Database::NOT_FOUND_GRACE_CHECKS, fake.calls.size)
   end
 
   # ⚠⚠ **毎周を永久に続けない。**猶予を使い切ったらバックオフする。ステージングでは
@@ -240,9 +252,9 @@ class AppStoreVerificationTest < Minitest::Test
     entitlement('2000')
     fake = FakeAppStore.new {nil}
     reverifier = Relay::EntitlementReverifier.new(settings(fake))
-    (Relay::EntitlementReverifier::NOT_FOUND_GRACE_CHECKS + 2).times {reverifier.run_once}
+    (Relay::Database::NOT_FOUND_GRACE_CHECKS + 2).times {reverifier.run_once}
 
-    assert_equal(Relay::EntitlementReverifier::NOT_FOUND_GRACE_CHECKS, fake.calls.size,
+    assert_equal(Relay::Database::NOT_FOUND_GRACE_CHECKS, fake.calls.size,
       '猶予を使い切った行をまだ毎周引いている')
   end
 
@@ -251,9 +263,9 @@ class AppStoreVerificationTest < Minitest::Test
     id = entitlement('2000')
     fake = FakeAppStore.new {nil}
     reverifier = Relay::EntitlementReverifier.new(settings(fake))
-    (Relay::EntitlementReverifier::NOT_FOUND_GRACE_CHECKS + 1).times {reverifier.run_once}
+    (Relay::Database::NOT_FOUND_GRACE_CHECKS + 1).times {reverifier.run_once}
     before = fake.calls.size
-    raw_update("UPDATE entitlements SET updated_at = datetime('now', '-2 days') WHERE id = #{id}")
+    release_backoff(id)
     reverifier.run_once
 
     assert_equal(before + 1, fake.calls.size)
@@ -268,7 +280,7 @@ class AppStoreVerificationTest < Minitest::Test
     fake = FakeAppStore.new {nil}
     reverifier = Relay::EntitlementReverifier.new(settings(fake))
     reverifier.run_once
-    forget_since(id, days: Relay::EntitlementReverifier::NOT_FOUND_TERMINAL_DAYS + 1)
+    forget_since(id, days: Relay::Database::NOT_FOUND_TERMINAL_DAYS + 1)
     reverifier.run_once
     calls = fake.calls.size
 
@@ -284,7 +296,7 @@ class AppStoreVerificationTest < Minitest::Test
     entitlement('2000')
     nothing = FakeAppStore.new {nil}
     reverifier = Relay::EntitlementReverifier.new(settings(nothing))
-    (Relay::EntitlementReverifier::NOT_FOUND_GRACE_CHECKS - 1).times {reverifier.run_once}
+    (Relay::Database::NOT_FOUND_GRACE_CHECKS - 1).times {reverifier.run_once}
     Relay::EntitlementReverifier.new(settings(FakeAppStore.new {result('active')})).run_once
     row = @db.find_entitlement('apple', '1000')
 
@@ -304,7 +316,7 @@ class AppStoreVerificationTest < Minitest::Test
     raw_update(
       "UPDATE entitlements SET created_at = datetime('now', '-8 days') WHERE id = #{id}",
     )
-    forget_since(id, days: Relay::EntitlementReverifier::NOT_FOUND_TERMINAL_DAYS + 1)
+    forget_since(id, days: Relay::Database::NOT_FOUND_TERMINAL_DAYS + 1)
     reverifier.run_once
 
     assert_equal('revoked', @db.find_entitlement('apple', '2000')['status'])
@@ -313,13 +325,65 @@ class AppStoreVerificationTest < Minitest::Test
     assert_equal(0, reverifier.run_once, '終端にした行をまだ引いている')
   end
 
+  # 🔴 **前景の retry で終端を先送りできない**（PR #86 の Codex P2）。`POST /entitlements` の
+  # upsert は `updated_at` を若返らせるので、**バックオフをあれで測ると purchase_id を
+  # 知っている者が叩き続けるだけで終端に永久に到達しない**（`active` で期限が読めない行は
+  # ゲートを fail-open で通るので、無期限に通る）。⚠ 共有シークレットは取り出せる前提。
+  def test_foreground_retries_do_not_postpone_terminalization
+    id = entitlement('2000')
+    Relay::EntitlementReverifier.new(settings(FakeAppStore.new {result('active')})).run_once
+    fake = FakeAppStore.new {nil}
+    reverifier = Relay::EntitlementReverifier.new(settings(fake))
+    Relay::Database::NOT_FOUND_GRACE_CHECKS.times {reverifier.run_once}
+    # バックオフに入った行の `updated_at` だけを若返らせる（前景の upsert の模倣）。
+    raw_update(
+      "UPDATE entitlements SET not_found_checked_at = datetime('now', '-2 days')," \
+        " updated_at = datetime('now') WHERE id = #{id}",
+    )
+    before = fake.calls.size
+    reverifier.run_once
+
+    assert_equal(before + 1, fake.calls.size, 'updated_at を若返らせるだけで掃除から外れている')
+  end
+
+  # ⚠⚠ **前景の `not_found` も数える**（PR #86 の Codex P2）。掃除だけで数えると、
+  # 前景で叩き続けるかぎり連続が進まない。
+  def test_foreground_not_found_counts_toward_the_streak
+    id = entitlement('2000')
+    Relay::StoreVerification.verify!(
+      settings(FakeAppStore.new {nil}), store: 'apple', entitlement_id: id, purchase_ref: '2000'
+    )
+
+    assert_equal(1, @db.find_entitlement('apple', '2000')['not_found_streak'])
+  end
+
+  # ⚠⚠ **数えるのは購入ごとの鍵の中**（PR #86 の Codex P2）。鍵を解いたあとに数えると、
+  # 同じ購入の**成功した検証と競合して、通ったばかりの行に連続を書き戻す**（連続が
+  # 7 日に達していれば `revoked` まで行く ＝ **正当な購読者が次の明示的な検証まで
+  # 拒否されたままになる**）。
+  #
+  # ⚠ **スレッドを 2 本走らせる形では確かめられない。**鍵を解いた直後に数える実装でも、
+  # 成功側より先に書き終わってしまうので**素通りする**（2026-10-05 に実際に穴を開けて
+  # 確認した）。**鍵を握っているかを直接見る。**
+  def test_not_found_is_recorded_while_holding_the_purchase_lock
+    id = entitlement('2000')
+    watcher = LockWatchingDatabase.new(@db)
+    with_watcher = settings(FakeAppStore.new {nil})
+    with_watcher.database = watcher
+    Relay::StoreVerification.verify!(
+      with_watcher, store: 'apple', entitlement_id: id, purchase_ref: '2000'
+    )
+
+    assert(watcher.locked_when_recorded, '鍵を解いたあとに数えている（成功した検証と競合しうる）')
+  end
+
   # ⚠⚠ **「届かない」は「知らない」ではない。**`unavailable` は fail-open なので、
   # バックオフも終端の数えも進めない（ストア障害で有効な購読を失効させない）。
   def test_reverifier_does_not_count_unavailable_as_not_found
     entitlement('2000')
     fake = FakeAppStore.new {raise(Relay::StoreUnavailable, 'boom')}
     reverifier = Relay::EntitlementReverifier.new(settings(fake))
-    runs = Relay::EntitlementReverifier::NOT_FOUND_GRACE_CHECKS + 2
+    runs = Relay::Database::NOT_FOUND_GRACE_CHECKS + 2
     runs.times {reverifier.run_once}
 
     assert_equal(runs, fake.calls.size, 'ストア障害でバックオフに入っている')
@@ -332,7 +396,15 @@ class AppStoreVerificationTest < Minitest::Test
   def forget_since(id, days:)
     raw_update(
       "UPDATE entitlements SET not_found_since = datetime('now', '-#{Integer(days)} days')," \
-        " updated_at = datetime('now', '-2 days') WHERE id = #{Integer(id)}",
+        " not_found_checked_at = datetime('now', '-2 days') WHERE id = #{Integer(id)}",
+    )
+  end
+
+  # ⚠ バックオフの時計は `not_found_checked_at`（`updated_at` ではない・PR #86 の Codex P2）。
+  def release_backoff(id)
+    raw_update(
+      "UPDATE entitlements SET not_found_checked_at = datetime('now', '-2 days')" \
+        " WHERE id = #{Integer(id)}",
     )
   end
 
