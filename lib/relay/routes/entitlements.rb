@@ -122,7 +122,8 @@ module Relay
           store = token['store']
           return [token, nil] unless Relay::StoreVerification.client_for(settings, store)
 
-          outcome, entitlement_id = Relay::StoreVerification.verify!(
+          # ⚠ 前景の枠を通す (#89)。埋まっていれば `deferred` で、行は `unverified` のまま。
+          outcome, entitlement_id = Relay::StoreVerification.verify_in_foreground!(
             settings,
             store: store,
             entitlement_id: token['entitlement_id'],

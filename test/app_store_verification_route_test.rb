@@ -84,6 +84,24 @@ class AppStoreVerificationRouteTest < RequestTestCase
     end
   end
 
+  # ⚠⚠ #89: 前景の枠が埋まっている回は、ストアを引かずに `unverified` のまま 201 で返す
+  # （クライアントから見て、ストアに届かなかった回と同じ）。
+  def test_purchase_is_left_unverified_when_the_foreground_slot_is_busy
+    fake = FakeAppStore.new({'2000' => result('active')})
+    busy = Relay::StoreVerification::FOREGROUND
+    with_app_store(fake) do
+      busy[:busy] += Relay::StoreVerification.foreground_limit
+      body = purchase('2000')
+
+      assert_equal(201, last_response.status)
+      assert_equal('unverified', body['status'])
+      assert_empty(fake.calls)
+      assert_equal(1, verify_count('deferred'))
+    ensure
+      busy[:busy] = 0
+    end
+  end
+
   # TestFlight の購入（2026-09-27 の決定で本番でも有効・印を付ける）。
   def test_sandbox_purchase_is_active_with_environment_mark
     with_app_store(FakeAppStore.new({'2000' => result('active', environment: 'Sandbox')})) do

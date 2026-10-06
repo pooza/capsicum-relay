@@ -21,7 +21,8 @@ class GooglePlayClientTest < Minitest::Test
       next [code, body]
     end
     return Relay::GooglePlayClient.new(
-      {'package_name' => PACKAGE, 'service_account_path' => '/nonexistent.json'},
+      {'package_name' => PACKAGE, 'service_account_path' => '/nonexistent.json',
+       'product_ids' => ['relay.monthly']},
       logger: Logger.new(@log), http: http, token_source: token_source, clock: -> {NOW},
     )
   end
@@ -88,6 +89,26 @@ class GooglePlayClientTest < Minitest::Test
     ]
     result = client(200, purchase('SUBSCRIPTION_STATE_ACTIVE', items: items)).purchase_status('t')
 
+    assert_equal('2026-10-30 00:00:00', result.expires_at)
+  end
+
+  # ⚠⚠ #89: アプリの別のサブスクの購入では、利用権にならない。
+  def test_other_product_is_not_an_entitlement
+    items = [{'productId' => 'other.yearly', 'expiryTime' => '2026-10-30T00:00:00Z'}]
+
+    assert_nil(client(200, purchase('SUBSCRIPTION_STATE_ACTIVE', items: items)).purchase_status('t'))
+    assert_match(/not a relay entitlement product: other\.yearly/, @log.string)
+  end
+
+  # ⚠ #89: 別の商品の行が混ざっていても、利用権の商品の期限を採る。
+  def test_entitlement_line_item_is_picked_among_others
+    items = [
+      {'productId' => 'other.yearly', 'expiryTime' => '2027-09-30T00:00:00Z'},
+      {'productId' => 'relay.monthly', 'expiryTime' => '2026-10-30T00:00:00Z'},
+    ]
+    result = client(200, purchase('SUBSCRIPTION_STATE_ACTIVE', items: items)).purchase_status('t')
+
+    assert_equal('relay.monthly', result.product_id)
     assert_equal('2026-10-30 00:00:00', result.expires_at)
   end
 

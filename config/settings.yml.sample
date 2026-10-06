@@ -39,6 +39,7 @@ wns:
 #   issuer_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 #   bundle_id: "org.b-shock.capsicum"
 #   environments: ["Production", "Sandbox"]
+#   product_ids: ["supporter.relay.monthly"]   # 利用権として扱う商品（省略時はこの値・#89）
 #   reverify_interval: 600   # unverified の購入を確かめ直す間隔（秒・0 で止める）
 
 # Google の購入の検証 (#62) — Play Developer API + リアルタイム デベロッパー通知（RTDN）
@@ -50,6 +51,7 @@ wns:
 # google_play:
 #   package_name: "net.shrieker.capsicum"
 #   service_account_path: "/path/to/capsicum-relay-play.json"
+#   product_ids: ["supporter.relay.monthly"]   # 利用権として扱う商品（省略時はこの値・#89）
 #   push_audience: "https://relay.example/store/google/notifications"
 #   push_service_account: "xxx@capsicum-xxxxx.iam.gserviceaccount.com"
 

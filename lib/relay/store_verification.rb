@@ -23,11 +23,75 @@ module Relay
     #
     # ⚠ **全体で 1 本の鍵にしない。**ストアが遅いとき（タイムアウトまで最大 30 秒）に
     # puma の 2 本のスレッドが両方待たされ、**push の受け付けまで止まる**。
-    LOCKS = Hash.new {|locks, id| locks[id] = Mutex.new}
+    #
+    # ⚠⚠ **使い終わった鍵は消す** (#89)。行は誰でも作れる（`POST /entitlements`）ので、
+    # 残すとでたらめな `purchase_id` の数だけ Mutex が溜まり続ける。⚠ **待っている
+    # スレッドがいる間は消さない**（消すと後から来たスレッドが別の Mutex を作り、
+    # 同じ行を 2 本で触る）ので、使っている数を一緒に持つ。
+    LOCKS = {} # rubocop:disable Style/MutableConstant
     LOCKS_GUARD = Mutex.new
+    Lock = Struct.new(:mutex, :users)
 
-    def self.lock_for(entitlement_id)
-      return LOCKS_GUARD.synchronize {LOCKS[entitlement_id]}
+    def self.with_lock(entitlement_id, &)
+      lock = LOCKS_GUARD.synchronize do
+        entry = (LOCKS[entitlement_id] ||= Lock.new(Mutex.new, 0))
+        entry.users += 1
+        entry
+      end
+      begin
+        return lock.mutex.synchronize(&)
+      ensure
+        LOCKS_GUARD.synchronize do
+          lock.users -= 1
+          LOCKS.delete(entitlement_id) if lock.users.zero?
+        end
+      end
+    end
+
+    # 呼び出したスレッドがその行の鍵を握っているか（テストが「鍵の中で数えているか」を見る口）。
+    def self.lock_owned?(entitlement_id)
+      return LOCKS_GUARD.synchronize {LOCKS[entitlement_id]&.mutex&.owned? || false}
+    end
+
+    # `POST /entitlements` がストアへ同時に問い合わせてよい本数 (#89)。
+    #
+    # ⚠⚠ **puma のスレッドを 1 本、必ず配送に残す。**あの口は実質的に開いていて
+    # （共有シークレットはバイナリから取り出せる）、検証は 1 件あたり秒単位の同期 I/O
+    # （Apple は Production → Sandbox の順に引き、タイムアウトは環境ごとに最大 15 秒）。
+    # でたらめな `purchase_id` を並列に投げるだけで全スレッドが埋まり、**プリセット
+    # 利用者の `/push` まで止まる**。
+    #
+    # ⚠ **枠が無いときは待たせず、確かめずに返す**（`deferred`）。行は `unverified` の
+    # まま残り、通知の受け口か確かめ直しのワーカーが拾う ＝ ストアに届かなかった回
+    # （`unavailable`）と同じ道。待たせると、結局そのスレッドが埋まる。
+    #
+    # ⚠ 通知の受け口とワーカーは数えない（前者は署名で送り主を確かめてから引く・
+    # 後者は puma のスレッドを使わない）。
+    FOREGROUND_GUARD = Mutex.new
+    FOREGROUND = {busy: 0} # rubocop:disable Style/MutableConstant
+
+    def self.foreground_limit
+      threads = Integer(ENV.fetch('PUMA_THREADS', 2), exception: false) || 2
+      return [threads - 1, 1].max
+    end
+
+    # 前景（`POST /entitlements`）からの検証。枠が無ければ `['deferred', entitlement_id]`。
+    def self.verify_in_foreground!(settings, store:, entitlement_id:, purchase_ref:)
+      acquired = FOREGROUND_GUARD.synchronize do
+        next false if FOREGROUND[:busy] >= foreground_limit
+
+        FOREGROUND[:busy] += 1
+        true
+      end
+      return ['deferred', entitlement_id] unless acquired
+
+      begin
+        return verify!(
+          settings, store: store, entitlement_id: entitlement_id, purchase_ref: purchase_ref
+        )
+      ensure
+        FOREGROUND_GUARD.synchronize {FOREGROUND[:busy] -= 1}
+      end
     end
 
     # アプリの設定にストアまわりを組み立てる（[Relay::BaseApp] の `configure` から呼ぶ）。
@@ -72,8 +136,9 @@ module Relay
     # | `not_found` | ストアに無い購入 | 触らない（`unverified` のまま） |
     # | `unavailable` | ストアに届かない・鍵や権限が使えない | ⚠⚠ **触らない（fail-open）** |
     # | `invalid` | 署名・宛先が合わない | 触らない |
+    # | `deferred` | 前景の枠が埋まっていた（[verify_in_foreground!] だけが返す） | 触らない |
     def self.verify!(settings, store:, entitlement_id:, purchase_ref:)
-      return lock_for(entitlement_id).synchronize do
+      return with_lock(entitlement_id) do
         verify_locked(settings, store, entitlement_id, purchase_ref)
       end
     end

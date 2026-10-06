@@ -34,7 +34,7 @@ class AppStoreVerificationTest < Minitest::Test
     attr_reader :locked_when_recorded
 
     def record_entitlement_not_found(entitlement_id, **)
-      @locked_when_recorded = Relay::StoreVerification.lock_for(entitlement_id).owned?
+      @locked_when_recorded = Relay::StoreVerification.lock_owned?(entitlement_id)
       return __getobj__.record_entitlement_not_found(entitlement_id, **)
     end
   end
@@ -377,6 +377,118 @@ class AppStoreVerificationTest < Minitest::Test
     assert(watcher.locked_when_recorded, '鍵を解いたあとに数えている（成功した検証と競合しうる）')
   end
 
+  # --- 流量（#89） -------------------------------------------------------------
+
+  # ⚠⚠ 使い終わった鍵を残さない。行は誰でも作れるので、残すと Mutex が溜まり続ける。
+  def test_locks_are_released_after_verification
+    ids = ['2000', '2001', '2002'].map {|purchase| entitlement(purchase)}
+    fake = FakeAppStore.new {nil}
+    ids.each do |id|
+      Relay::StoreVerification.verify!(
+        settings(fake), store: 'apple', entitlement_id: id, purchase_ref: 'x'
+      )
+    end
+
+    assert_empty(Relay::StoreVerification::LOCKS)
+  end
+
+  # 例外で抜けた回も鍵を残さない。
+  def test_locks_are_released_after_an_error
+    id = entitlement('2000')
+    fake = FakeAppStore.new {raise(ArgumentError, 'boom')}
+
+    assert_raises(ArgumentError) do
+      Relay::StoreVerification.verify!(
+        settings(fake), store: 'apple', entitlement_id: id, purchase_ref: 'x'
+      )
+    end
+    assert_empty(Relay::StoreVerification::LOCKS)
+  end
+
+  # ⚠ 待っているスレッドがいる間は、鍵を消さない（消すと同じ行を 2 本で触る）。
+  def test_lock_is_kept_while_another_thread_waits
+    id = entitlement('2000')
+    inside = Queue.new
+    release = Queue.new
+    overlap = false
+    fake = FakeAppStore.new do |_, nth|
+      overlap = true if inside.size.positive?
+      inside << nth
+      release.pop(timeout: 5) if nth == 1
+      inside.pop
+      next nil
+    end
+    threads = Array.new(2) do
+      Thread.new do
+        Relay::StoreVerification.verify!(
+          settings(fake), store: 'apple', entitlement_id: id, purchase_ref: 'x'
+        )
+      end
+    end
+    sleep(0.1)
+    release << true
+    threads.each(&:join)
+
+    refute(overlap, '同じ行の検証が 2 本同時に走った')
+    assert_empty(Relay::StoreVerification::LOCKS)
+  end
+
+  # ⚠⚠ 前景の枠が埋まっていたら、ストアを引かずに `deferred` で返す。
+  # 待たせると puma のスレッドが埋まり、`/push` の受け付けまで止まる。
+  def test_foreground_verification_is_deferred_when_the_slot_is_busy
+    first = entitlement('2000')
+    second = entitlement('2001', device_id: 'device-2')
+    started = Queue.new
+    release = Queue.new
+    fake = FakeAppStore.new do
+      started << true
+      release.pop(timeout: 5) # ⚠ 枠が効いていない版で、CI を止めずに落とす
+      next result('active', expires_at: FUTURE)
+    end
+    holder = Thread.new do
+      Relay::StoreVerification.verify_in_foreground!(
+        settings(fake), store: 'apple', entitlement_id: first, purchase_ref: '2000'
+      )
+    end
+    started.pop
+    outcome, id = Relay::StoreVerification.verify_in_foreground!(
+      settings(fake), store: 'apple', entitlement_id: second, purchase_ref: '2001'
+    )
+    release << true
+    holder.join
+
+    assert_equal(['deferred', second], [outcome, id])
+    assert_equal(1, fake.calls.size, '枠が無いのにストアを引いた')
+    assert_equal('unverified', @db.find_entitlement('apple', '2001')['status'])
+    assert_equal('active', holder.value.first)
+  end
+
+  # 枠は、例外で抜けた回も返す（返さないと以後の購入が永久に確かめられない）。
+  def test_foreground_slot_is_returned_after_an_error
+    id = entitlement('2000')
+    failing = FakeAppStore.new {raise(ArgumentError, 'boom')}
+
+    assert_raises(ArgumentError) do
+      Relay::StoreVerification.verify_in_foreground!(
+        settings(failing), store: 'apple', entitlement_id: id, purchase_ref: '2000'
+      )
+    end
+    outcome, = Relay::StoreVerification.verify_in_foreground!(
+      settings(FakeAppStore.new {result('active', expires_at: FUTURE)}),
+      store: 'apple', entitlement_id: id, purchase_ref: '2000',
+    )
+
+    assert_equal('active', outcome)
+  end
+
+  # puma のスレッドを 1 本、必ず配送に残す（既定の 2 本なら同時 1 本）。
+  def test_foreground_limit_leaves_one_thread_for_delivery
+    assert_equal(1, foreground_limit_with('2'))
+    assert_equal(3, foreground_limit_with('4'))
+    assert_equal(1, foreground_limit_with('1'))
+    assert_equal(1, foreground_limit_with('abc'))
+  end
+
   # ⚠⚠ **「届かない」は「知らない」ではない。**`unavailable` は fail-open なので、
   # バックオフも終端の数えも進めない（ストア障害で有効な購読を失効させない）。
   def test_reverifier_does_not_count_unavailable_as_not_found
@@ -391,6 +503,14 @@ class AppStoreVerificationTest < Minitest::Test
   end
 
   private
+
+  def foreground_limit_with(threads)
+    previous = ENV.fetch('PUMA_THREADS', nil)
+    ENV['PUMA_THREADS'] = threads
+    return Relay::StoreVerification.foreground_limit
+  ensure
+    ENV['PUMA_THREADS'] = previous
+  end
 
   # その行を「[days] 日前から not_found が続いている」状態にし、バックオフも明けさせる。
   def forget_since(id, days:)
