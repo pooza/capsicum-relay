@@ -181,7 +181,9 @@ module Relay
             level: :warn,
             msg: "Entitlement verification refused (busy): #{json_body['store']}",
             store: json_body['store'],
-            busy: Relay::StoreVerification::FOREGROUND[:busy],
+            # ⚠ **埋まっている本数は載せない**（PR #92 の Codex P2）。断ったあとで
+            # 読み直すと、その間に枠が返って 0 と記録されうる。断った時点では
+            # 上限と同じなので、上限だけで足りる。
             limit: Relay::StoreVerification.foreground_limit,
             retry_after: VERIFICATION_BUSY_RETRY_AFTER,
           )
