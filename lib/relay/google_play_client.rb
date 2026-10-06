@@ -5,6 +5,7 @@ require 'net/http'
 require 'time'
 require 'uri'
 require_relative 'entitlement_gate'
+require_relative 'entitlement_products'
 require_relative 'store_errors'
 
 module Relay
@@ -71,10 +72,12 @@ module Relay
     #
     # - `package_name`: Android の applicationId（製品版は `net.shrieker.capsicum`）
     # - `service_account_path`: relay 専用のサービスアカウントの鍵（JSON）
+    # - `product_ids`: 利用権として扱う商品（省略時は [Relay::EntitlementProducts::DEFAULT]）
     #
     # [http] / [token_source] / [clock] はテストの差し替え口。
     def initialize(config, logger:, http: nil, token_source: nil, clock: -> {Time.now})
       @package_name = config.fetch('package_name')
+      @product_ids = Relay::EntitlementProducts.from(config)
       @logger = logger
       @http = http || method(:request)
       @token_source = token_source || build_token_source(config.fetch('service_account_path'))
@@ -115,8 +118,27 @@ module Relay
       raise Relay::StoreResponseInvalid, 'response is not JSON'
     end
 
+    # ⚠⚠ **利用権の商品の行だけを見る** (#89)。`packageName` は「このアプリの購入か」
+    # しか言わないので、照合しないとアプリの別のサブスクでも利用権が通る。
+    #
+    # 戻り値は `[利用権の購入か, 採る行]`。⚠ 行はあるのに利用権の商品が無ければ
+    # `[false, nil]`（＝「その購入は知らない」と同じ扱い）。行そのものが無い応答
+    # （支払い保留中など）は従来どおり状態だけを使うので `[true, nil]`。
+    def entitlement_line(json)
+      items = Array(json['lineItems'])
+      matched = items.select {|item| @product_ids.include?(item['productId'])}
+      return [true, matched.max_by {|item| item['expiryTime'].to_s}] if
+        items.empty? || !matched.empty?
+
+      products = items.map {|item| item['productId']}.uniq.join(', ')
+      @logger.warn("Google Play purchase is not a relay entitlement product: #{products}")
+      return [false, nil]
+    end
+
     def result_from(json, purchase_token, asked_at)
-      line = Array(json['lineItems']).max_by {|item| item['expiryTime'].to_s}
+      entitlement, line = entitlement_line(json)
+      return nil unless entitlement
+
       expiry = parse_time(line&.dig('expiryTime'))
       status = status_for(json['subscriptionState'], expiry)
       # ⚠⚠ **購読の期間がある状態なのに期限が読めない応答は使わない**（Codex P2・PR #76）。

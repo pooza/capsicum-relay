@@ -34,7 +34,8 @@ class AppStoreClientTest < Minitest::Test
     return Relay::AppStoreClient.new(
       {
         'key_id' => 'KEY', 'issuer_id' => 'ISSUER', 'key_path' => @key_path,
-        'bundle_id' => BUNDLE_ID, 'environments' => environments
+        'bundle_id' => BUNDLE_ID, 'environments' => environments,
+        'product_ids' => ['relay.monthly']
       },
       logger: Logger.new(@log), verifier: @pki.verifier, http: http,
     )
@@ -59,6 +60,55 @@ class AppStoreClientTest < Minitest::Test
 
   def not_found
     return [404, {'errorCode' => 4_040_010, 'errorMessage' => 'Transaction id not found.'}.to_json]
+  end
+
+  # #89 用: 複数のサブスクグループを持つ応答。[entries] は `[商品, 状態, 期限]`。
+  def groups_body(*entries)
+    data = entries.each_with_index.map do |(product, status, expires), index|
+      original = (1000 + index).to_s
+      transaction = @pki.sign({
+        'bundleId' => BUNDLE_ID, 'productId' => product, 'originalTransactionId' => original,
+        'expiresDate' => expires, 'signedDate' => 1_790_000_000_123
+      })
+      {'lastTransactions' => [{
+        'originalTransactionId' => original, 'status' => status,
+        'signedTransactionInfo' => transaction
+      }]}
+    end
+    return [200, {'environment' => 'Production', 'data' => data}.to_json]
+  end
+
+  # ⚠⚠ #89: アプリの別のサブスクの購入では、利用権にならない。
+  def test_other_product_is_not_an_entitlement
+    body = groups_body(['other.yearly', 1, EXPIRES_MS])
+
+    assert_nil(client({'Production' => body}).subscription_status('2000'))
+    assert_match(/not a relay entitlement product: other\.yearly/, @log.string)
+  end
+
+  # ⚠⚠ #89: 別グループの失効した購読が先頭に来ても、利用権の商品の状態を返す。
+  def test_entitlement_product_is_picked_over_an_expired_other_group
+    body = groups_body(['other.yearly', 2, EXPIRES_MS - 1], ['relay.monthly', 1, EXPIRES_MS])
+    result = client({'Production' => body}).subscription_status('2000')
+
+    assert_equal('active', result.status)
+    assert_equal('relay.monthly', result.product_id)
+    assert_equal('1001', result.original_transaction_id)
+  end
+
+  # 利用権の商品が複数あれば、有効なもの → 期限の遅いものを取る。
+  def test_active_entitlement_wins_over_an_expired_one
+    body = groups_body(['relay.monthly', 2, EXPIRES_MS + 1000], ['relay.monthly', 1, EXPIRES_MS])
+
+    assert_equal('1001', client({'Production' => body}).subscription_status('2000')
+      .original_transaction_id)
+  end
+
+  # 設定に `product_ids` が無ければ、既定の商品だけを利用権として扱う。
+  def test_default_product_ids
+    assert_equal(['supporter.relay.monthly'], Relay::EntitlementProducts.from({}))
+    assert_equal(['supporter.relay.monthly'], Relay::EntitlementProducts.from({'product_ids' => []}))
+    assert_equal(['a'], Relay::EntitlementProducts.from({'product_ids' => ['a', '']}))
   end
 
   def test_active_subscription

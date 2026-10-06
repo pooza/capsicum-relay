@@ -4,6 +4,7 @@ require 'net/http'
 require 'openssl'
 require 'uri'
 require_relative 'apple_jws_verifier'
+require_relative 'entitlement_products'
 require_relative 'store_errors'
 
 module Relay
@@ -56,6 +57,7 @@ module Relay
     # [config] は settings.yml の `app_store` 節。
     #
     # - `key_id` / `issuer_id` / `key_path` / `bundle_id`
+    # - `product_ids`: 利用権として扱う商品（省略時は [Relay::EntitlementProducts::DEFAULT]）
     # - `environments`: 引く順。本番 relay は `[Production, Sandbox]`、ステージングは
     #   `[Sandbox]`。⚠ 本番でサンドボックスの購入を扱うのは 2026-09-27 の決定
     #   （TestFlight のテスターは身内だけにする前提）
@@ -64,6 +66,7 @@ module Relay
       @key_id = config.fetch('key_id')
       @issuer_id = config.fetch('issuer_id')
       @bundle_id = config.fetch('bundle_id')
+      @product_ids = Relay::EntitlementProducts.from(config)
       @key = OpenSSL::PKey.read(File.read(config.fetch('key_path')))
       @environments = Array(config.fetch('environments', HOSTS.keys))
       @logger = logger
@@ -124,16 +127,16 @@ module Relay
       return {}
     end
 
-    # ⚠ 1 グループ・1 商品の前提。複数あれば最初の 1 つ（月額 ¥200 の単一階層・
-    # capsicum#1122）。
+    # ⚠⚠ **利用権の商品の取引だけを見る** (#89)。応答はアプリの**全サブスクグループ**を
+    # 持って来るので、先頭を取るだけだと次の 2 つが起きる:
+    #
+    # - 別のサブスクの購入で、リレー利用権が `active` になる
+    # - 別グループの失効した購読が先頭に来て、払っている人が `expired` と記録される
+    #
+    # ⚠ 利用権の商品が 1 つも無ければ nil（＝「その購入は知らない」と同じ扱い）。
     def result_from(body, environment)
-      last = body.dig('data', 0, 'lastTransactions', 0)
+      last, transaction = entitlement_transaction(body)
       return nil unless last
-
-      transaction = @verifier.verify(last['signedTransactionInfo'])
-      unless transaction['bundleId'] == @bundle_id
-        raise AppleJwsVerifier::Invalid, "bundleId mismatch: #{transaction['bundleId']}"
-      end
 
       return Result.new(
         original_transaction_id: last['originalTransactionId'].to_s,
@@ -145,6 +148,31 @@ module Relay
         # しないための順序**（[Relay::Database#apply_entitlement_verification]）。
         signed_at: transaction['signedDate'],
       )
+    end
+
+    # `[lastTransactions の 1 件, 検証済みの取引]`。利用権の商品が無ければ nil。
+    # ⚠ 候補が複数あるときは、有効なもの → 期限の遅いものを取る。
+    def entitlement_transaction(body)
+      entries = Array(body['data']).flat_map {|group| Array(group['lastTransactions'])}
+      verified = entries.map {|last| [last, verified_transaction(last)]}
+      matched = verified.select {|_, transaction| @product_ids.include?(transaction['productId'])}
+      if matched.empty? && !verified.empty?
+        products = verified.map {|_, transaction| transaction['productId']}.uniq.join(', ')
+        @logger.warn("App Store purchase is not a relay entitlement product: #{products}")
+      end
+
+      return matched.max_by do |last, transaction|
+        [last['status'] == 1 ? 1 : 0, transaction['expiresDate'].to_i]
+      end
+    end
+
+    def verified_transaction(last)
+      transaction = @verifier.verify(last['signedTransactionInfo'])
+      unless transaction['bundleId'] == @bundle_id
+        raise AppleJwsVerifier::Invalid, "bundleId mismatch: #{transaction['bundleId']}"
+      end
+
+      return transaction
     end
 
     def iso8601_ms(millis)
