@@ -36,7 +36,7 @@ gem 'sentry-ruby'
 group :development do
   gem 'ginseng-style', github: 'pooza/ginseng-style', branch: 'main', require: false
   # テスト (#25 / #26)。Ruby 4.0 では bundled gem も Gemfile に書かないと
-  # bundle 配下で require できないため明示する。flauros は
+  # bundle 配下で require できないため明示する。本番は
   # BUNDLE_WITHOUT=development なので本番には入らない。
   gem 'minitest'
   gem 'rake'
