@@ -131,7 +131,10 @@ module Relay
         items.empty? || !matched.empty?
 
       products = items.map {|item| item['productId']}.uniq.join(', ')
-      @logger.warn("Google Play purchase is not a relay entitlement product: #{products}")
+      # ⚠ event 名を付けて残す（[Relay::AppStoreClient] と同じ理由）。
+      msg = "Google Play purchase is not a relay entitlement product: #{products}"
+      event = 'entitlement.product_mismatch'
+      @logger.warn({event: event, store: 'google', products: products, msg: msg})
       return [false, nil]
     end
 

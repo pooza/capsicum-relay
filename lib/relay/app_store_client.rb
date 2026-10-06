@@ -158,7 +158,14 @@ module Relay
       matched = verified.select {|_, transaction| @product_ids.include?(transaction['productId'])}
       if matched.empty? && !verified.empty?
         products = verified.map {|_, transaction| transaction['productId']}.uniq.join(', ')
-        @logger.warn("App Store purchase is not a relay entitlement product: #{products}")
+        # ⚠ **event 名を付けて残す。**結果は「知らない購入」と同じ `not_found` に
+        # なるので、この行だけが「商品の設定が合っていない」を知らせる。
+        @logger.warn({
+          event: 'entitlement.product_mismatch',
+          store: 'apple',
+          products: products,
+          msg: "App Store purchase is not a relay entitlement product: #{products}",
+        })
       end
 
       return matched.max_by do |last, transaction|
