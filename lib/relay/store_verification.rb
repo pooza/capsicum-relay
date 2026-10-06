@@ -67,12 +67,16 @@ module Relay
     #
     # ⚠ 通知の受け口とワーカーは数えない（前者は署名で送り主を確かめてから引く・
     # 後者は puma のスレッドを使わない）。
+    #
+    # ⚠⚠ **スレッドが 1 本の構成では 0 本**（PR #90 の Codex P1）。1 本を許すと、その
+    # 唯一のスレッドがストアの応答待ちで埋まり、配送に残す分が無くなる。前景では
+    # 一切確かめず、通知とワーカーに任せる（買った直後の反映は最大で掃除 1 周ぶん遅れる）。
     FOREGROUND_GUARD = Mutex.new
     FOREGROUND = {busy: 0} # rubocop:disable Style/MutableConstant
 
     def self.foreground_limit
       threads = Integer(ENV.fetch('PUMA_THREADS', 2), exception: false) || 2
-      return [threads - 1, 1].max
+      return [threads - 1, 0].max
     end
 
     # 前景（`POST /entitlements`）からの検証。枠が無ければ `['deferred', entitlement_id]`。

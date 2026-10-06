@@ -485,7 +485,7 @@ class AppStoreVerificationTest < Minitest::Test
   def test_foreground_limit_leaves_one_thread_for_delivery
     assert_equal(1, foreground_limit_with('2'))
     assert_equal(3, foreground_limit_with('4'))
-    assert_equal(1, foreground_limit_with('1'))
+    assert_equal(0, foreground_limit_with('1'), '1 本しか無いなら、前景では確かめない')
     assert_equal(1, foreground_limit_with('abc'))
   end
 
