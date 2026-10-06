@@ -171,6 +171,22 @@ module Relay
 
           metrics.increment('relay_entitlement_verify_total',
             {store: json_body['store'], outcome: 'busy'})
+          # ⚠⚠ **断ったことを必ずログに残す**（capsicum v2.0 の 2 回目の差分レビュー）。
+          # ここは `entitlement.issued` より手前で抜けるので、残さないと journald に
+          # **何も出ない** —— counter は累積なので「いつ・どのストアで」が追えず、
+          # 本番でクライアントが 503 を受けた回を、前後の行から推定するしかなかった。
+          # ⚠ `purchase_id` は載せない（[post '/entitlements'] と同じ理由）。
+          log_event(
+            'entitlement.verification_busy',
+            level: :warn,
+            msg: "Entitlement verification refused (busy): #{json_body['store']}",
+            store: json_body['store'],
+            # ⚠ **埋まっている本数は載せない**（PR #92 の Codex P2）。断ったあとで
+            # 読み直すと、その間に枠が返って 0 と記録されうる。断った時点では
+            # 上限と同じなので、上限だけで足りる。
+            limit: Relay::StoreVerification.foreground_limit,
+            retry_after: VERIFICATION_BUSY_RETRY_AFTER,
+          )
           headers 'Retry-After' => VERIFICATION_BUSY_RETRY_AFTER.to_s
           halt 503, {error: 'Verification busy', reason: 'verification_busy'}.to_json
         end

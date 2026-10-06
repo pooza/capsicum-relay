@@ -30,6 +30,31 @@ class ObservabilityRouteTest < RequestTestCase
     )
   end
 
+  ## 利用権の発行を断った回
+
+  # ⚠⚠ 枠が埋まって断った回は `entitlement.issued` より手前で抜ける。残さないと
+  # journald に何も出ず、いつ・どのストアで断ったかを追えない。
+  def test_refused_entitlement_verification_is_logged
+    previous = settings.app_store
+    Relay::BaseApp.set(:app_store, Object.new)
+    busy = Relay::StoreVerification::FOREGROUND
+    busy[:busy] = Relay::StoreVerification.foreground_limit
+
+    post_json('/entitlements', {store: 'apple', purchase_id: 'tx-secret', device_id: 'install-1'})
+
+    assert_equal(503, last_response.status)
+    record = records('entitlement.verification_busy').first
+
+    refute_nil(record, '断った回がログに残っていない')
+    assert_equal('apple', record['store'])
+    assert_equal(Relay::StoreVerification.foreground_limit, record['limit'])
+    refute_empty(record['request_id'].to_s)
+    refute_includes(@log.string, 'tx-secret', 'purchase_id をログに出している')
+  ensure
+    busy[:busy] = 0
+    Relay::BaseApp.set(:app_store, previous)
+  end
+
   ## request_id
 
   def test_response_carries_a_request_id
