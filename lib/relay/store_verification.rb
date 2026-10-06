@@ -61,16 +61,18 @@ module Relay
     # でたらめな `purchase_id` を並列に投げるだけで全スレッドが埋まり、**プリセット
     # 利用者の `/push` まで止まる**。
     #
-    # ⚠ **枠が無いときは待たせず、確かめずに返す**（`deferred`）。行は `unverified` の
-    # まま残り、通知の受け口か確かめ直しのワーカーが拾う ＝ ストアに届かなかった回
-    # （`unavailable`）と同じ道。待たせると、結局そのスレッドが埋まる。
+    # ⚠ **枠が無いときは待たせず、その場で断る**（503 + `Retry-After`・
+    # [Relay::Routes::Entitlements]）。待たせると、結局そのスレッドが埋まる。
+    # クライアントは一時的な失敗として送り直す（購入そのものはストアに残っている）。
     #
     # ⚠ 通知の受け口とワーカーは数えない（前者は署名で送り主を確かめてから引く・
     # 後者は puma のスレッドを使わない）。
     #
     # ⚠⚠ **スレッドが 1 本の構成では 0 本**（PR #90 の Codex P1）。1 本を許すと、その
-    # 唯一のスレッドがストアの応答待ちで埋まり、配送に残す分が無くなる。前景では
-    # 一切確かめず、通知とワーカーに任せる（買った直後の反映は最大で掃除 1 周ぶん遅れる）。
+    # 唯一のスレッドがストアの応答待ちで埋まり、配送に残す分が無くなる。
+    # ⚠ **この構成だけは「確かめずに行を残す」**（`deferred`）—— 断ると購入を登録する
+    # 道が無くなるため。行は通知の受け口か確かめ直しのワーカーが拾う。既定は 2 本で、
+    # 1 本にするのは「配送を守るか、行を積ませないか」のどちらかを諦める選択になる。
     FOREGROUND_GUARD = Mutex.new
     FOREGROUND = {busy: 0} # rubocop:disable Style/MutableConstant
 
@@ -79,23 +81,23 @@ module Relay
       return [threads - 1, 0].max
     end
 
-    # 前景（`POST /entitlements`）からの検証。枠が無ければ `['deferred', entitlement_id]`。
-    def self.verify_in_foreground!(settings, store:, entitlement_id:, purchase_ref:)
-      acquired = FOREGROUND_GUARD.synchronize do
+    # 前景の枠を 1 本取る。取れたら true（**呼び出し側が [release_foreground] で必ず返す**）。
+    #
+    # ⚠⚠ **行を作る前に取る**（PR #90 の Codex P1）。作ってから「埋まっていた」で返すと、
+    # でたらめな行をストアの I/O の速さではなく **SQLite の速さで積める**ようになり、
+    # 確かめ直し（1 周 20 件）が正当な購入に届かなくなる。枠が取れない回は、呼び出し側が
+    # 何も保存せずに断る。
+    def self.reserve_foreground
+      return FOREGROUND_GUARD.synchronize do
         next false if FOREGROUND[:busy] >= foreground_limit
 
         FOREGROUND[:busy] += 1
         true
       end
-      return ['deferred', entitlement_id] unless acquired
+    end
 
-      begin
-        return verify!(
-          settings, store: store, entitlement_id: entitlement_id, purchase_ref: purchase_ref
-        )
-      ensure
-        FOREGROUND_GUARD.synchronize {FOREGROUND[:busy] -= 1}
-      end
+    def self.release_foreground
+      FOREGROUND_GUARD.synchronize {FOREGROUND[:busy] -= 1}
     end
 
     # アプリの設定にストアまわりを組み立てる（[Relay::BaseApp] の `configure` から呼ぶ）。
@@ -140,7 +142,7 @@ module Relay
     # | `not_found` | ストアに無い購入 | 触らない（`unverified` のまま） |
     # | `unavailable` | ストアに届かない・鍵や権限が使えない | ⚠⚠ **触らない（fail-open）** |
     # | `invalid` | 署名・宛先が合わない | 触らない |
-    # | `deferred` | 前景の枠が埋まっていた（[verify_in_foreground!] だけが返す） | 触らない |
+    # | `deferred` | 前景で確かめない構成（ここは返さない・[Relay::Routes::Entitlements]） | 触らない |
     def self.verify!(settings, store:, entitlement_id:, purchase_ref:)
       return with_lock(entitlement_id) do
         verify_locked(settings, store, entitlement_id, purchase_ref)

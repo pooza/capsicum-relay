@@ -22,19 +22,17 @@ module Relay
     # 応答する。⚠ ストアに届かないときは `unverified` のまま返す（fail-open・判断は
     # [Relay::StoreVerification]）。Microsoft は後回し。
     class Entitlements < BaseApp
+      # 前景の枠が埋まっていた回の `Retry-After`（秒）。検証 1 件は通常 1 秒前後。
+      VERIFICATION_BUSY_RETRY_AFTER = 2
+
       post '/entitlements' do
         authenticate!
         require_fields!('store', 'purchase_id', 'device_id')
         validate_store!
 
-        token = settings.database.issue_entitlement_token(
-          store: json_body['store'],
-          purchase_id: json_body['purchase_id'],
-          product_id: json_body['product_id'],
-          device_id: json_body['device_id'],
-        )
-
-        token, verification = verified(token)
+        # ⚠⚠ **枠は行を作る前に取る** (#89・PR #90 の Codex P1)。取れない回は
+        # 何も保存せずに 503 で断る（[reserve_verification!]）。
+        token, verification = issue_and_verify(reserve_verification!)
 
         metrics.increment('relay_entitlement_token_total', {store: token['store']})
         log_event(
@@ -113,17 +111,35 @@ module Relay
           return value
         end
 
+        # 行を作り、[mode] に従って確かめる。戻り値は [verified] と同じ。
+        # ⚠ **取った枠は、例外で抜けた回も必ず返す**（返さないと以後の購入が全部断られる）。
+        def issue_and_verify(mode)
+          token = settings.database.issue_entitlement_token(
+            store: json_body['store'],
+            purchase_id: json_body['purchase_id'],
+            product_id: json_body['product_id'],
+            device_id: json_body['device_id'],
+          )
+          return verified(token, mode)
+        ensure
+          Relay::StoreVerification.release_foreground if mode == :reserved
+        end
+
         # ストアのクライアントがあればその場で確かめる。戻り値は `[token, outcome]`
         # （確かめなかったときの outcome は nil）。
         #
         # ⚠ 検証で行が寄った（元の取引 ID の行が既にあった）ときは、**寄せた先の
         # token を返し直す**。クライアントの手元の token はそれで置き換わる。
-        def verified(token)
+        def verified(token, mode)
           store = token['store']
-          return [token, nil] unless Relay::StoreVerification.client_for(settings, store)
+          return [token, nil] if mode == :none
 
-          # ⚠ 前景の枠を通す (#89)。埋まっていれば `deferred` で、行は `unverified` のまま。
-          outcome, entitlement_id = Relay::StoreVerification.verify_in_foreground!(
+          if mode == :deferred
+            metrics.increment('relay_entitlement_verify_total', {store: store, outcome: 'deferred'})
+            return [token, 'deferred']
+          end
+
+          outcome, entitlement_id = Relay::StoreVerification.verify!(
             settings,
             store: store,
             entitlement_id: token['entitlement_id'],
@@ -134,6 +150,29 @@ module Relay
             settings.database.entitlement_token_for(entitlement_id, json_body['device_id']),
             outcome,
           ]
+        end
+
+        # この要求でストアをどう確かめるかを決め、要るなら前景の枠を取る (#89)。
+        #
+        # | 戻り値 | 意味 |
+        # | --- | --- |
+        # | `:none` | そのストアのクライアントが無い（確かめない・従来どおり） |
+        # | `:reserved` | 枠を取った。⚠ **呼び出し側が必ず返す** |
+        # | `:deferred` | 前景では確かめない構成（スレッドが 1 本）。行だけ残す |
+        #
+        # ⚠⚠ **枠が埋まっていたら、何も保存せずに 503 で断る。**この口は実質的に
+        # 開いているので、断らずに行を作ると、でたらめな行を SQLite の速さで積める。
+        # ⚠ **401 / 403 と区別できる形で返す** —— クライアントは一時的な失敗として
+        # 送り直す（購入はストアに残っているので、失われるものは無い）。
+        def reserve_verification!
+          return :none unless Relay::StoreVerification.client_for(settings, json_body['store'])
+          return :deferred if Relay::StoreVerification.foreground_limit.zero?
+          return :reserved if Relay::StoreVerification.reserve_foreground
+
+          metrics.increment('relay_entitlement_verify_total',
+            {store: json_body['store'], outcome: 'busy'})
+          headers 'Retry-After' => VERIFICATION_BUSY_RETRY_AFTER.to_s
+          halt 503, {error: 'Verification busy', reason: 'verification_busy'}.to_json
         end
 
         def validate_store!

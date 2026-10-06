@@ -84,22 +84,57 @@ class AppStoreVerificationRouteTest < RequestTestCase
     end
   end
 
-  # ⚠⚠ #89: 前景の枠が埋まっている回は、ストアを引かずに `unverified` のまま 201 で返す
-  # （クライアントから見て、ストアに届かなかった回と同じ）。
-  def test_purchase_is_left_unverified_when_the_foreground_slot_is_busy
+  # ⚠⚠ #89: 前景の枠が埋まっている回は、**何も保存せずに** 503 で断る
+  # （PR #90 の Codex P1・行を作ってから返すと、でたらめな行を SQLite の速さで積める）。
+  def test_purchase_is_refused_without_a_row_when_the_foreground_slot_is_busy
     fake = FakeAppStore.new({'2000' => result('active')})
     busy = Relay::StoreVerification::FOREGROUND
     with_app_store(fake) do
-      busy[:busy] += Relay::StoreVerification.foreground_limit
+      busy[:busy] = Relay::StoreVerification.foreground_limit
+      body = purchase('2000')
+
+      assert_equal(503, last_response.status)
+      assert_equal('verification_busy', body['reason'])
+      assert_equal('2', last_response.headers['Retry-After'])
+      assert_empty(fake.calls)
+      assert_equal(0, database.entitlement_count, '断ったのに行が残っている')
+      assert_equal(0, database.entitlement_token_count)
+      assert_equal(1, verify_count('busy'))
+      assert_equal(Relay::StoreVerification.foreground_limit, busy[:busy], '取っていない枠を返した')
+    ensure
+      busy[:busy] = 0
+    end
+  end
+
+  # 枠は、確かめ終わったら返す（成功した回も、例外で抜けた回も）。
+  def test_foreground_slot_is_returned_after_each_purchase
+    fake = FakeAppStore.new({'2000' => result('active'), '3000' => :unavailable})
+    with_app_store(fake) do
+      purchase('2000')
+      purchase('3000', device_id: 'device-install-2')
+      fake.define_singleton_method(:purchase_status) {|_| raise(ArgumentError, 'boom')}
+      post_json('/entitlements', {store: 'apple', purchase_id: '4000', device_id: 'device-3'})
+
+      assert_equal(500, last_response.status)
+      assert_equal(0, Relay::StoreVerification::FOREGROUND[:busy])
+    end
+  end
+
+  # スレッドが 1 本の構成では、前景で確かめずに行だけ残す（断ると登録の道が無くなる）。
+  def test_single_thread_configuration_defers_verification
+    previous = ENV.fetch('PUMA_THREADS', nil)
+    ENV['PUMA_THREADS'] = '1'
+    fake = FakeAppStore.new({'2000' => result('active')})
+    with_app_store(fake) do
       body = purchase('2000')
 
       assert_equal(201, last_response.status)
       assert_equal('unverified', body['status'])
       assert_empty(fake.calls)
       assert_equal(1, verify_count('deferred'))
-    ensure
-      busy[:busy] = 0
     end
+  ensure
+    ENV['PUMA_THREADS'] = previous
   end
 
   # TestFlight の購入（2026-09-27 の決定で本番でも有効・印を付ける）。

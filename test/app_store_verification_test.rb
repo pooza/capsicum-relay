@@ -433,52 +433,19 @@ class AppStoreVerificationTest < Minitest::Test
     assert_empty(Relay::StoreVerification::LOCKS)
   end
 
-  # ⚠⚠ 前景の枠が埋まっていたら、ストアを引かずに `deferred` で返す。
-  # 待たせると puma のスレッドが埋まり、`/push` の受け付けまで止まる。
-  def test_foreground_verification_is_deferred_when_the_slot_is_busy
-    first = entitlement('2000')
-    second = entitlement('2001', device_id: 'device-2')
-    started = Queue.new
-    release = Queue.new
-    fake = FakeAppStore.new do
-      started << true
-      release.pop(timeout: 5) # ⚠ 枠が効いていない版で、CI を止めずに落とす
-      next result('active', expires_at: FUTURE)
-    end
-    holder = Thread.new do
-      Relay::StoreVerification.verify_in_foreground!(
-        settings(fake), store: 'apple', entitlement_id: first, purchase_ref: '2000'
-      )
-    end
-    started.pop
-    outcome, id = Relay::StoreVerification.verify_in_foreground!(
-      settings(fake), store: 'apple', entitlement_id: second, purchase_ref: '2001'
-    )
-    release << true
-    holder.join
+  # ⚠⚠ 前景の枠は上限までしか取れず、返せばまた取れる。
+  def test_foreground_slots_are_bounded_and_reusable
+    limit = Relay::StoreVerification.foreground_limit
+    taken = Array.new(limit) {Relay::StoreVerification.reserve_foreground}
 
-    assert_equal(['deferred', second], [outcome, id])
-    assert_equal(1, fake.calls.size, '枠が無いのにストアを引いた')
-    assert_equal('unverified', @db.find_entitlement('apple', '2001')['status'])
-    assert_equal('active', holder.value.first)
-  end
+    assert_equal([true] * limit, taken)
+    refute(Relay::StoreVerification.reserve_foreground, '上限を超えて枠が取れた')
 
-  # 枠は、例外で抜けた回も返す（返さないと以後の購入が永久に確かめられない）。
-  def test_foreground_slot_is_returned_after_an_error
-    id = entitlement('2000')
-    failing = FakeAppStore.new {raise(ArgumentError, 'boom')}
+    Relay::StoreVerification.release_foreground
 
-    assert_raises(ArgumentError) do
-      Relay::StoreVerification.verify_in_foreground!(
-        settings(failing), store: 'apple', entitlement_id: id, purchase_ref: '2000'
-      )
-    end
-    outcome, = Relay::StoreVerification.verify_in_foreground!(
-      settings(FakeAppStore.new {result('active', expires_at: FUTURE)}),
-      store: 'apple', entitlement_id: id, purchase_ref: '2000',
-    )
-
-    assert_equal('active', outcome)
+    assert(Relay::StoreVerification.reserve_foreground, '返した枠が取れない')
+  ensure
+    Relay::StoreVerification::FOREGROUND[:busy] = 0
   end
 
   # puma のスレッドを 1 本、必ず配送に残す（既定の 2 本なら同時 1 本）。
