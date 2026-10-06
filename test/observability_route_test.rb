@@ -298,6 +298,129 @@ class ObservabilityRouteTest < RequestTestCase
     assert_equal('/register', records('auth.rejected').last['path'])
   end
 
+  ## 設定に secret が無いとき (#87)
+
+  # 🔴 以前は `provided == secret` へそのまま進んでいたので、`shared_secret` を
+  # 書き忘れた環境では**ヘッダ無しのリクエストが `nil == nil` で通った**。
+  # 設定漏れが「認証が開く」に倒れ、通ったリクエストは何も残さなかった。
+  #
+  # ⚠⚠ **第 3 引数の `true` を外さない。**Sinatra の `set` は値が Hash だと
+  # **既存の設定へマージする**ので、キーを取り除いた設定を渡しても**キーが残る**
+  # （この検査を書いたときに実際に空振りした —— 「キーが無い」場合だけ素通りで
+  # 緑になる形）。`true` はそのセッターを通さず、丸ごと差し替える。
+  def with_shared_secret(config)
+    original = Relay::BaseApp.settings.config
+    Relay::BaseApp.set(:config, config.call(original), true)
+    yield
+  ensure
+    Relay::BaseApp.set(:config, original, true)
+  end
+
+  # ⚠ 差し替えが効いていること自体を確かめる（上の罠で空振りしないように）。
+  def test_the_override_really_removes_the_key
+    with_shared_secret(UNSET) do
+      refute(Relay::BaseApp.settings.config.key?('shared_secret'))
+    end
+
+    assert_equal(SECRET, Relay::BaseApp.settings.config['shared_secret'])
+  end
+
+  UNSET = ->(config) {config.except('shared_secret')}
+  NULL = ->(config) {config.merge('shared_secret' => nil)}
+  BLANK = ->(config) {config.merge('shared_secret' => '')}
+
+  # 🔴 これが穴そのもの: secret が無い設定 × ヘッダ無し。
+  def test_unset_secret_does_not_let_headerless_requests_through
+    [UNSET, NULL].each do |config|
+      with_shared_secret(config) do
+        get '/metrics'
+
+        assert_equal(503, last_response.status, 'secret が無い設定でヘッダ無しが通った')
+      end
+    end
+  end
+
+  # 🔴 空文字を書いた設定 × 空のヘッダ（`'' == ''`）も同じ形。
+  def test_blank_secret_does_not_match_a_blank_header
+    with_shared_secret(BLANK) do
+      get('/metrics', {}, {'HTTP_X_RELAY_SECRET' => ''})
+
+      assert_equal(503, last_response.status)
+
+      get '/metrics'
+
+      assert_equal(503, last_response.status)
+    end
+  end
+
+  # ⚠ 何を送っても通らない（正しい値というものが無い）。
+  def test_unset_secret_refuses_any_header
+    with_shared_secret(UNSET) do
+      get('/metrics', {}, auth_headers)
+
+      assert_equal(503, last_response.status)
+    end
+  end
+
+  # ⚠⚠ **`authenticate!` を通る口は全部**。1 本だけ見ると、route が自前で
+  # 比べ始めたときに気付けない。
+  def test_unset_secret_closes_every_authenticated_route
+    requests = [
+      -> {post('/register', '{}', {'CONTENT_TYPE' => 'application/json'})},
+      -> {delete('/register/1')},
+      -> {post('/entitlements', '{}', {'CONTENT_TYPE' => 'application/json'})},
+      -> {get('/entitlements')},
+      -> {post('/announcement_subscriptions', '{}', {'CONTENT_TYPE' => 'application/json'})},
+      -> {get('/announcement_subscriptions/token')},
+      -> {post('/supporters/tip', '{}', {'CONTENT_TYPE' => 'application/json'})},
+      -> {get('/supporters?account=a@b.test&server=b.test')},
+      -> {get('/metrics')},
+    ]
+
+    with_shared_secret(UNSET) do
+      requests.each do |request|
+        request.call
+
+        assert_equal(503, last_response.status, last_request.path_info)
+      end
+    end
+  end
+
+  # ⚠ 401（呼び出し元の secret が違う）とは別の event にする。混ぜると、
+  # journald を読む人がクライアントのビルドを疑いに行く。
+  def test_unset_secret_is_logged_as_a_misconfiguration
+    with_shared_secret(UNSET) do
+      get '/metrics'
+    end
+
+    record = records('auth.misconfigured').last
+
+    refute_nil(record, '設定の不備がログに残っていない')
+    assert_equal('/metrics', record['path'])
+    assert_empty(records('auth.rejected'))
+  end
+
+  # ⚠ キャッシュさせないのは 503 でも同じ（拒否そのものを残させない）。
+  def test_misconfigured_response_is_not_cacheable
+    with_shared_secret(UNSET) do
+      get '/metrics'
+
+      assert_equal('private, no-store', last_response.headers['Cache-Control'])
+    end
+  end
+
+  # 対照群: 設定が正しければ、従来どおり 200 / 401。
+  def test_configured_secret_still_behaves_as_before
+    get('/metrics', {}, auth_headers)
+
+    assert_equal(200, last_response.status)
+
+    get '/metrics'
+
+    assert_equal(401, last_response.status)
+    assert_empty(records('auth.misconfigured'))
+  end
+
   # 通ったリクエストでは出さない（正常系がログを埋めない）。
   def test_authorised_request_is_not_logged_as_rejected
     get('/metrics', {}, auth_headers)

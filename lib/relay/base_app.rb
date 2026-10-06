@@ -30,7 +30,7 @@ module Relay
   # クラスからそのまま見える（DB も push クライアントも**実体は 1 つ**）。
   #
   # `configure` はクラス定義時に 1 度だけ走る。サブクラス定義では再実行されない。
-  class BaseApp < Sinatra::Base
+  class BaseApp < Sinatra::Base # rubocop:disable Metrics/ClassLength
     DEFAULT_CONFIG_PATH = File.expand_path('../../config/settings.yml', __dir__)
 
     # 読み込む設定ファイル。`RELAY_CONFIG_PATH` で差し替えられる (#34)。
@@ -204,11 +204,39 @@ module Relay
         headers['Cache-Control'] = 'private, no-store'
 
         secret = settings.config['shared_secret']
+        # 🔴 **設定に secret が無いときは、比べる前に断る (#87)。**以前は
+        # そのまま `provided == secret` へ進んでいたので、`shared_secret` を
+        # 書き忘れた環境では **ヘッダ無しのリクエストが `nil == nil` で通った**
+        # （空文字を書いた環境では、空の `X-Relay-Secret` が通る）。⚠ 設定漏れが
+        # 「認証が開く」に倒れるうえ、**通ったリクエストは何も残さない**ので
+        # 気付く手掛かりも無かった。
+        if secret.to_s.empty?
+          log_auth_misconfigured
+          halt 503, {error: 'Relay is not configured'}.to_json
+        end
+
         provided = request.env['HTTP_X_RELAY_SECRET']
         return if provided == secret
 
         log_auth_rejected(provided)
         halt 401, {error: 'Unauthorized'}.to_json
+      end
+
+      # 設定の不備で認証できないことを残す (#87)。
+      #
+      # ⚠ **401 ではなく 503 で返し、`auth.rejected` とは別の event にする。**
+      # 401 は「呼び出し元の secret が違う」で、直すのはクライアント側。こちらは
+      # **relay の設定が壊れている**ので、直すのは運用側。同じ event に混ぜると、
+      # journald を読む人がクライアントのビルドを疑いに行く（#47 の誤診の逆）。
+      def log_auth_misconfigured
+        path = redacted_path
+        log_event(
+          'auth.misconfigured',
+          level: :error,
+          msg: "Refused request because shared_secret is not configured: #{path}",
+          path: path,
+          method: request.request_method,
+        )
       end
 
       def log_auth_rejected(provided)

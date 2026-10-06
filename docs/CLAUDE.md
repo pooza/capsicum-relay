@@ -510,7 +510,7 @@ capsicum-relay/
 
 | 節 | 用途 | 無いとき |
 |------|------|--------|
-| `shared_secret` | capsicum からの登録認証（`X-Relay-Secret`） | ⚠⚠ **起動はするが、認証付きのエンドポイントが守られない**（必ず書く） |
+| `shared_secret` | capsicum からの登録認証（`X-Relay-Secret`） | ⚠⚠ **起動はするが、認証付きのエンドポイントがすべて 503 を返す**（ログは `auth.misconfigured`）。⚠ [#87](https://github.com/pooza/capsicum-relay/issues/87) までは、ヘッダ無しのリクエストが通っていた |
 | `apns`（`.p8`・Key ID・Team ID・Bundle ID） | iOS / macOS への送信 | APNs 宛が送れない |
 | `fcm`（プロジェクト ID・サービスアカウント JSON） | Android への送信 | FCM 宛が送れない |
 | `wns`（Package SID・client secret） | Windows への送信 | Windows 宛の push は 503 |
