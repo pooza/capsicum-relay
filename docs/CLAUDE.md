@@ -46,7 +46,7 @@ flowchart LR
 ⚠ **Linux にはネイティブ push の経路が無い。**capsicum の Linux 版は起動中の WebSocket だけで通知を出すので、relay には登録されない。
 
 - Web Push の暗号化ペイロードは復号**しない**。Base64 のまま `custom_payload` / `data` に詰め、クライアント側（iOS は NSE / Android は `FirebaseMessagingService`）で復号して表示する（B 案採用）。[capsicum#336](https://github.com/pooza/capsicum/issues/336) 参照
-- リレーが秘密鍵を持たないことで、将来の外部ユーザー向け有償提供時も E2E 前提を維持できる
+- リレーが秘密鍵を持たないことで、外部ユーザー向けの有償提供（capsicum v2.0〜）でも E2E 前提を維持している
 
 ### エンドポイント
 
