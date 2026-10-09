@@ -108,6 +108,20 @@ class RegisterRouteTest < RequestTestCase
     assert_equal(0, database.count)
   end
 
+  # ⚠⚠ #91: 消した行の中身を返さない。行には端末トークンが入っており、この口は
+  # 連番の id と共有シークレットだけで叩けるので、総当たりで読めてしまう。
+  def test_unregister_does_not_return_the_deleted_row
+    sub = register_subscription
+
+    delete("/register/#{sub['id']}", {}, auth_headers)
+
+    assert_equal({'id' => sub['id']}, json_response)
+    refute_includes(last_response.body, sub['token'], '端末トークンが応答に載っている')
+    ['token', 'device_token', 'account', 'server', 'device_id'].each do |key|
+      refute(json_response.key?(key), "#{key} が応答に載っている")
+    end
+  end
+
   def test_unregister_requires_secret
     sub = register_subscription
 
