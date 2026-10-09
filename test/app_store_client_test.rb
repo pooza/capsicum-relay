@@ -110,6 +110,27 @@ class AppStoreClientTest < Minitest::Test
     end
   end
 
+  # ⚠⚠ PR #94 の Codex P1: 一致した取引が有効でないとき、検証に落ちた件が残って
+  # いれば「失効」と言い切らない。落ちた 1 件が、いま有効な利用権かもしれない
+  # （`productId` は署名の中なので、無関係だと確かめる手段が無い）。失効と記録
+  # すると、次の `/push` が 410 を返して上流が購読を消す。
+  def test_invalid_transaction_beside_an_expired_match_is_invalid_not_expired
+    [2, 3, 5].each do |status|
+      body = with_broken_group(groups_body(['relay.monthly', status, EXPIRES_MS]))
+
+      assert_raises(Relay::StoreResponseInvalid, "status=#{status}") do
+        client({'Production' => body}).subscription_status('2000')
+      end
+    end
+  end
+
+  # 前提: 検証に落ちた件が無ければ、有効でない一致はそのまま返す（従来どおり）。
+  def test_expired_match_without_rejections_is_reported_as_expired
+    body = groups_body(['relay.monthly', 2, EXPIRES_MS])
+
+    assert_equal('expired', client({'Production' => body}).subscription_status('2000').status)
+  end
+
   # 応答に、署名の壊れた取引を 1 件持つグループを足す。
   def with_broken_group(response)
     code, body = response

@@ -21,11 +21,23 @@ module Relay
       entries = Array(body['data']).flat_map {|group| Array(group['lastTransactions'])}
       verified, rejected = verify_entries(entries)
       matched = verified.select {|_, transaction| @product_ids.include?(transaction['productId'])}
-      return pick_latest(matched) unless matched.empty?
+      picked = pick_latest(matched)
+      return picked if picked && granting?(picked)
 
-      # ⚠⚠ **検証に落ちた件があって一致が 0 件なら、「無い」とは言わない** (#93)。
-      # 落ちた 1 件が利用権の取引だったかもしれないので、確かめられなかった側へ倒す。
+      # ⚠⚠ **検証に落ちた件があるかぎり、「有効でない」とは言い切らない** (#93)。
+      # `productId` は署名の中にあるので、落ちた 1 件が利用権の取引でないことを
+      # 確かめる手段が無い。
+      #
+      # - 一致が 0 件 → 落ちた 1 件が利用権の取引だったかもしれない
+      # - ⚠⚠ **一致はあるが有効でない**（失効・返金・支払い待ち）→ 落ちた 1 件が、
+      #   いま有効な取引だったかもしれない（PR #94 の Codex P1）。ここで失効と
+      #   記録すると、ゲートが有効な間は次の `/push` が 410 を返し、**上流の
+      #   Mastodon / Misskey が購読を消す**
+      #
+      # どちらも「確かめられなかった」側へ倒す（状態を変えない）。⚠ **有効な一致が
+      # あるときだけは、落ちた件を無視してよい** —— それ以上良くなりようが無い。
       raise rejected.first if rejected.any?
+      return picked if picked
       return nil if verified.empty?
 
       products = verified.map {|_, transaction| transaction['productId']}.uniq.join(', ')
@@ -42,6 +54,7 @@ msg: msg})
     # 中にあるので、商品で絞る前に検証するしかない。以前は別グループの 1 件が検証に
     # 落ちると例外で抜け、**利用権の商品が正常でも結果を得られなかった**（サブスクが
     # 1 本のうちは起きないが、2 本目を足すと効く）。落ちた件は warn して除く。
+    # ⚠ **除いてよいのは、有効な一致が別にあるときだけ**（[entitlement_transaction]）。
     def verify_entries(entries)
       verified = []
       rejected = []
@@ -52,6 +65,12 @@ msg: msg})
         rejected << e
       end
       return [verified, rejected]
+    end
+
+    # その取引が利用権を与える状態か（Apple の `status` 1 ＝ 有効）。
+    def granting?(picked)
+      last, = picked
+      return last['status'] == 1
     end
 
     def pick_latest(matched)
