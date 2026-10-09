@@ -4,6 +4,7 @@ require 'net/http'
 require 'openssl'
 require 'uri'
 require_relative 'apple_jws_verifier'
+require_relative 'app_store_transactions'
 require_relative 'entitlement_products'
 require_relative 'store_errors'
 
@@ -22,6 +23,9 @@ module Relay
     # 変えずに抜ける（fail-open）。**有効な購入を「確かめられなかった」だけで
     # 失効扱いにしない。
     class Unavailable < Relay::StoreUnavailable; end
+
+    # 応答の取引から、利用権の商品のものを選ぶ（#89 / #93）。
+    include AppStoreTransactions
 
     HOSTS = {
       'Production' => 'api.storekit.itunes.apple.com',
@@ -133,7 +137,8 @@ module Relay
     # - 別のサブスクの購入で、リレー利用権が `active` になる
     # - 別グループの失効した購読が先頭に来て、払っている人が `expired` と記録される
     #
-    # ⚠ 利用権の商品が 1 つも無ければ nil（＝「その購入は知らない」と同じ扱い）。
+    # ⚠ 取引が 1 件も無ければ nil（＝「その購入は知らない」）。取引はあるのに利用権の
+    # 商品が無いときは [Relay::StoreProductMismatch] を投げる（#93・「知らない」と分ける）。
     def result_from(body, environment)
       last, transaction = entitlement_transaction(body)
       return nil unless last
@@ -148,38 +153,6 @@ module Relay
         # しないための順序**（[Relay::Database#apply_entitlement_verification]）。
         signed_at: transaction['signedDate'],
       )
-    end
-
-    # `[lastTransactions の 1 件, 検証済みの取引]`。利用権の商品が無ければ nil。
-    # ⚠ 候補が複数あるときは、有効なもの → 期限の遅いものを取る。
-    def entitlement_transaction(body)
-      entries = Array(body['data']).flat_map {|group| Array(group['lastTransactions'])}
-      verified = entries.map {|last| [last, verified_transaction(last)]}
-      matched = verified.select {|_, transaction| @product_ids.include?(transaction['productId'])}
-      if matched.empty? && !verified.empty?
-        products = verified.map {|_, transaction| transaction['productId']}.uniq.join(', ')
-        # ⚠ **event 名を付けて残す。**結果は「知らない購入」と同じ `not_found` に
-        # なるので、この行だけが「商品の設定が合っていない」を知らせる。
-        @logger.warn({
-          event: 'entitlement.product_mismatch',
-          store: 'apple',
-          products: products,
-          msg: "App Store purchase is not a relay entitlement product: #{products}",
-        })
-      end
-
-      return matched.max_by do |last, transaction|
-        [last['status'] == 1 ? 1 : 0, transaction['expiresDate'].to_i]
-      end
-    end
-
-    def verified_transaction(last)
-      transaction = @verifier.verify(last['signedTransactionInfo'])
-      unless transaction['bundleId'] == @bundle_id
-        raise AppleJwsVerifier::Invalid, "bundleId mismatch: #{transaction['bundleId']}"
-      end
-
-      return transaction
     end
 
     def iso8601_ms(millis)

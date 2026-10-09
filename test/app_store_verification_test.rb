@@ -291,6 +291,95 @@ class AppStoreVerificationTest < Minitest::Test
     assert_equal(calls, fake.calls.size)
   end
 
+  # ⚠⚠ #93: 「購入はあるが利用権の商品ではない」は、何日続いても終端へ進めない。
+  # `product_ids` の設定を誤ると正当な購入が全部ここへ来るので、`revoked` まで
+  # 進めると、設定を直しても次の明示的な検証まで拒否されたままになる。
+  def test_product_mismatch_never_terminalizes
+    id = entitlement('2000')
+    fake = FakeAppStore.new {raise Relay::StoreProductMismatch, 'other.yearly'}
+    outcome, = Relay::StoreVerification.verify!(
+      settings(fake), store: 'apple', entitlement_id: id, purchase_ref: '2000'
+    )
+
+    assert_equal('product_mismatch', outcome, '「知らない購入」（not_found）と区別できない')
+
+    forget_since(id, days: Relay::Database::NOT_FOUND_TERMINAL_DAYS + 1)
+    Relay::StoreVerification.verify!(
+      settings(fake), store: 'apple', entitlement_id: id, purchase_ref: '2000'
+    )
+
+    refute_equal('revoked', @db.find_entitlement('apple', '2000')['status'])
+  end
+
+  # ⚠⚠ PR #94 の Codex P2: 不一致が続いた日数を、終端までの時計に数えない。
+  # 数えると、不一致が 7 日続いたあとに本物の「知らない」が 1 回来ただけで、
+  # 新しく 7 日を数え直さずに即 `revoked` になる。
+  def test_product_mismatch_does_not_advance_the_terminalization_clock
+    id = entitlement('2000')
+    mismatch = FakeAppStore.new {raise Relay::StoreProductMismatch, 'other.yearly'}
+    Relay::StoreVerification.verify!(
+      settings(mismatch), store: 'apple', entitlement_id: id, purchase_ref: '2000'
+    )
+
+    assert_nil(@db.find_entitlement('apple', '2000')['not_found_since'], '時計が動いている')
+
+    # 不一致のまま 8 日経ったあと、ストアが初めて「知らない」と答えた。
+    raw_update(
+      "UPDATE entitlements SET not_found_checked_at = datetime('now', '-8 days') WHERE id = #{Integer(id)}",
+    )
+    Relay::StoreVerification.verify!(
+      settings(FakeAppStore.new {nil}), store: 'apple', entitlement_id: id, purchase_ref: '2000'
+    )
+    row = @db.find_entitlement('apple', '2000')
+
+    refute_equal('revoked', row['status'], '「知らない」の 1 回目で終端へ落ちた')
+    refute_nil(row['not_found_since'], 'ここから 7 日を数え始める')
+  end
+
+  # ⚠ ストアが購入を知っている以上、それまでの「知らない」の連続は切れる。
+  def test_product_mismatch_resets_a_running_not_found_clock
+    id = entitlement('2000')
+    Relay::StoreVerification.verify!(
+      settings(FakeAppStore.new {nil}), store: 'apple', entitlement_id: id, purchase_ref: '2000'
+    )
+    forget_since(id, days: Relay::Database::NOT_FOUND_TERMINAL_DAYS - 1)
+    mismatch = FakeAppStore.new {raise Relay::StoreProductMismatch, 'other.yearly'}
+    Relay::StoreVerification.verify!(
+      settings(mismatch), store: 'apple', entitlement_id: id, purchase_ref: '2000'
+    )
+
+    assert_nil(@db.find_entitlement('apple', '2000')['not_found_since'])
+  end
+
+  # ⚠ #93: それでも確かめ直しの間隔は空ける（空けないと、掃除が毎回引き続ける）。
+  def test_product_mismatch_still_counts_for_backoff
+    id = entitlement('2000')
+    fake = FakeAppStore.new {raise Relay::StoreProductMismatch, 'other.yearly'}
+    Relay::StoreVerification.verify!(
+      settings(fake), store: 'apple', entitlement_id: id, purchase_ref: '2000'
+    )
+
+    row = @db.find_entitlement('apple', '2000')
+
+    assert_equal(1, row['not_found_streak'])
+    refute_nil(row['not_found_checked_at'])
+  end
+
+  # 前提: 「知らない購入」は従来どおり終端へ落ちる（分けたことで緩んでいない）。
+  def test_not_found_still_terminalizes
+    id = entitlement('2000')
+    fake = FakeAppStore.new {nil}
+    Relay::StoreVerification.verify!(
+      settings(fake), store: 'apple', entitlement_id: id, purchase_ref: '2000'
+    )
+    forget_since(id, days: Relay::Database::NOT_FOUND_TERMINAL_DAYS + 1)
+    Relay::StoreVerification.verify!(
+      settings(fake), store: 'apple', entitlement_id: id, purchase_ref: '2000'
+    )
+
+    assert_equal('revoked', @db.find_entitlement('apple', '2000')['status'])
+  end
+
   # ⚠ ストアが答えたら数え直す（バックオフも終端までの日数も解ける）。
   def test_reverifier_clears_the_not_found_streak_when_the_store_answers
     entitlement('2000')

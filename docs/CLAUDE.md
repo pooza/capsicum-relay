@@ -46,7 +46,7 @@ flowchart LR
 ⚠ **Linux にはネイティブ push の経路が無い。**capsicum の Linux 版は起動中の WebSocket だけで通知を出すので、relay には登録されない。
 
 - Web Push の暗号化ペイロードは復号**しない**。Base64 のまま `custom_payload` / `data` に詰め、クライアント側（iOS は NSE / Android は `FirebaseMessagingService`）で復号して表示する（B 案採用）。[capsicum#336](https://github.com/pooza/capsicum/issues/336) 参照
-- リレーが秘密鍵を持たないことで、将来の外部ユーザー向け有償提供時も E2E 前提を維持できる
+- リレーが秘密鍵を持たないことで、外部ユーザー向けの有償提供（capsicum v2.0〜）でも E2E 前提を維持している
 
 ### エンドポイント
 
@@ -402,6 +402,25 @@ journalctl -u capsicum-relay --no-pager --since "-14 days" -o short-iso \
 `outcome=success`（＝`Pushed to <device_type>:`）が成功、`outcome=wns_dropped`（＝`WNS delivered but dropped:`）が drop。アカウント別に数えて成功率を出し、さらに**時刻（JST）別の分布**を見る。
 
 `request_id` は応答の `X-Request-Id` と同じ値で、Sentry イベントにも同名の tag が乗る。特定の 1 リクエストを追うときはこれで 3 者を突き合わせる。
+
+#### 「relay は投げた、端末には出ない」を追う（#85）
+
+`outcome=success` は**配送先が受理した**ところまでしか言えない。その先（端末への配送・破棄の理由）は配送先の側にしか無いので、成功した行には配送先が振った識別子を載せてある。
+
+| キー | 出どころ | 使い道 |
+| --- | --- | --- |
+| `apns_id` | APNs の応答ヘッダ `apns-id` | Apple の **Push Notification Console** でこの値を引くと、受理・端末への配送・破棄の理由が出る |
+| `fcm_name` | FCM の応答 `name` | Firebase 側の配送の記録と突き合わせる |
+| `wns_msg_id` | WNS の応答ヘッダ `X-WNS-Msg-ID` | Microsoft へ問い合わせるときの識別子 |
+
+```bash
+# 特定のアカウントの、直近の iOS 向け成功行と apns_id
+journalctl -u capsicum-relay --no-pager --since "-1 day" -o cat \
+  | grep '"event":"push.result"' \
+  | jq -r 'select(.device_type == "ios" and .outcome == "success") | [.ts, .account, .apns_id] | @tsv'
+```
+
+⚠ **通知 1 通の識別子で、個人や端末を名指しする値ではない。**ログ方針（`purchase_id` や token を出さない）には触れない。⚠ 人間向けの 1 行（`msg`）は変えていないので、従来の `grep` はそのまま効く。
 
 #### 判定基準
 

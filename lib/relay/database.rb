@@ -513,6 +513,30 @@ module Relay
       end
     end
 
+    # ストアが「購入はあるが、利用権の商品ではない」と答えたことを記録する (#93)。
+    #
+    # ⚠⚠ **終端までの時計（`not_found_since`）を動かさない。むしろ戻す。**
+    # `product_ids` の設定を誤ると正当な購入が全部ここへ来るので、`revoked` へ
+    # 進めてはいけない。⚠ 当初は [record_entitlement_not_found] を「終端にしない」
+    # 指定で流用していたが、**時計だけは進んでいた** —— 不一致が 7 日続いたあとに
+    # 本物の「知らない」が 1 回来ると、数え直さずに即 `revoked` になった
+    # （PR #94 の Codex P2）。ストアはその購入を知っているので、「知らない」の
+    # 連続はここで切れたものとして扱う。
+    #
+    # ⚠ **確かめ直しの間隔（バックオフ）は効かせる。**連続の回数と最後に確かめた
+    # 時刻は進める（[not_found_backoff_sql] が見るのはこの 2 つで、時計は見ない）。
+    # 進めないと、掃除がその行を毎回引き続ける。
+    def record_entitlement_product_mismatch(entitlement_id)
+      @db.execute(<<~SQL, [entitlement_id])
+        UPDATE entitlements SET
+          not_found_streak = not_found_streak + 1,
+          not_found_since = NULL,
+          not_found_checked_at = datetime('now'),
+          updated_at = datetime('now')
+        WHERE id = ?
+      SQL
+    end
+
     # 確かめ直した行を順番の後ろへ回す（同じ行ばかり引かないように）。
     def touch_entitlement(entitlement_id)
       @db.execute("UPDATE entitlements SET updated_at = datetime('now') WHERE id = ?",

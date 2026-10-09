@@ -63,6 +63,20 @@ module Relay
 
     # 失敗の材料になる項目だけ拾う。生のレスポンス body は載せない（通常 push 側の
     # [Relay::PushDeliveryReporter] と同じ方針で status / reason に絞る）。
+    #
+    # ⚠ **成功した回は、配送先が振った識別子を載せる** (#85)。これが無いと
+    # 「relay は投げた、端末には出ない」を追う材料が 1 つ足りない —— Apple の
+    # Push Notification Console は `apns-id` で配送ログ（受理・端末への配送・
+    # 破棄の理由）を引けるが、ログに出ていなければ引く鍵が無い。
+    #
+    # | キー | 出どころ |
+    # | --- | --- |
+    # | `apns_id` | APNs の応答ヘッダ `apns-id` |
+    # | `fcm_name` | FCM の応答 `name`（`projects/…/messages/…`） |
+    # | `wns_msg_id` | WNS の応答ヘッダ `X-WNS-Msg-ID` |
+    #
+    # ⚠ **通知 1 通の識別子で、個人や端末を名指しする値ではない。**ログ方針
+    # （`purchase_id` や token を出さない）には触れない。
     def self.detail(result)
       return {} unless result.is_a?(Hash)
 
@@ -71,6 +85,9 @@ module Relay
         reason: result[:reason],
         wns_status: result[:wns_status],
         original_size: result[:original_size],
+        apns_id: result[:id],
+        fcm_name: result[:name],
+        wns_msg_id: result[:msg_id],
       }.compact
     end
   end

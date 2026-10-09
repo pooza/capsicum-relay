@@ -93,11 +93,67 @@ class GooglePlayClientTest < Minitest::Test
   end
 
   # ⚠⚠ #89: アプリの別のサブスクの購入では、利用権にならない。
+  # ⚠ #93: 「知らない購入」（nil）とは分けて、専用の例外で知らせる。
   def test_other_product_is_not_an_entitlement
     items = [{'productId' => 'other.yearly', 'expiryTime' => '2026-10-30T00:00:00Z'}]
 
-    assert_nil(client(200, purchase('SUBSCRIPTION_STATE_ACTIVE', items: items)).purchase_status('t'))
+    assert_raises(Relay::StoreProductMismatch) do
+      client(200, purchase('SUBSCRIPTION_STATE_ACTIVE', items: items)).purchase_status('t')
+    end
     assert_match(/not a relay entitlement product: other\.yearly/, @log.string)
+  end
+
+  # ⚠ #93: 期限は時刻として比べる（文字列のまま比べない）。
+  #
+  # 起票時の懸念は「小数秒の有無が混じると順序が逆転しうる」（`…:00.5Z` と
+  # `…:00Z` は、文字列では後者が大きい）。⚠ ただし結果は秒へ丸めて持つので、
+  # その形では採った行の違いが外から見えない。**文字列順と時刻順が秒単位で
+  # 食い違う入力**（UTC オフセットの表記が混じる形）で、時刻で比べていることを
+  # 固定する。
+  def test_latest_line_item_is_picked_by_time_not_by_string
+    items = [
+      # 文字列では大きい（`T09` > `T00`）が、時刻は 00:00:00Z で早い。
+      {'productId' => 'relay.monthly', 'expiryTime' => '2026-10-30T09:00:00+09:00'},
+      {'productId' => 'relay.monthly', 'expiryTime' => '2026-10-30T00:30:00Z'},
+    ]
+    result = client(200, purchase('SUBSCRIPTION_STATE_ACTIVE', items: items)).purchase_status('t')
+
+    assert_equal('2026-10-30 00:30:00', result.expires_at)
+  end
+
+  # ⚠ PR #94 の Codex P2: 期限が文字列でない行（形の崩れた応答）が混じっていても
+  # 落ちない。`Time.iso8601` は文字列以外に TypeError を投げる。
+  def test_line_item_with_non_string_expiry_does_not_raise
+    [1_790_000_000, 1.5, true, ['x'], {'seconds' => 1}].each do |bad|
+      items = [
+        {'productId' => 'relay.monthly', 'expiryTime' => bad},
+        {'productId' => 'relay.monthly', 'expiryTime' => '2026-10-30T00:00:00Z'},
+      ]
+      result = client(200, purchase('SUBSCRIPTION_STATE_ACTIVE', items: items)).purchase_status('t')
+
+      assert_equal('2026-10-30 00:00:00', result.expires_at, bad.inspect)
+    end
+  end
+
+  # ⚠ 採った行の期限そのものが文字列でないときは、「形が合わない」として扱う
+  # （例外を素通しして 500 にしない）。
+  def test_only_line_item_with_non_string_expiry_is_invalid
+    items = [{'productId' => 'relay.monthly', 'expiryTime' => 1_790_000_000}]
+
+    assert_raises(Relay::StoreResponseInvalid) do
+      client(200, purchase('SUBSCRIPTION_STATE_ACTIVE', items: items)).purchase_status('t')
+    end
+  end
+
+  # 期限の読めない行が混じっていても落ちず、読める行を採る (#93)。
+  def test_line_item_with_unreadable_expiry_does_not_win
+    items = [
+      {'productId' => 'relay.monthly', 'expiryTime' => 'not-a-time'},
+      {'productId' => 'relay.monthly', 'expiryTime' => '2026-10-30T00:00:00Z'},
+    ]
+    result = client(200, purchase('SUBSCRIPTION_STATE_ACTIVE', items: items)).purchase_status('t')
+
+    assert_equal('2026-10-30 00:00:00', result.expires_at)
   end
 
   # ⚠ #89: 別の商品の行が混ざっていても、利用権の商品の期限を採る。
