@@ -1,6 +1,7 @@
 require_relative 'test_helper'
 require 'logger'
 require 'lib/relay/wns_client'
+require 'lib/relay/push_outcome'
 
 # #21: WNS Channel URI の host allowlist と送信前の payload サイズチェック。
 # いずれも「送る前に弾く」ロジックなので、OAuth / ネットワークに触れずに検査
@@ -118,6 +119,17 @@ class WnsClientTest < Minitest::Test
     assert_equal(payload.to_json, pool.requests.first.body)
   end
 
+  # 成功した回は、WNS が振った識別子を持ち帰る (#85)。ログの `wns_msg_id` になり、
+  # 「受理されたあと」を追う鍵になる。
+  def test_success_carries_wns_msg_id
+    payload = oversized_encrypted_payload.merge('body' => 'x' * 100)
+    result = build_client(RecordingPool.new).push(device_token: VALID_URI, payload: payload)
+
+    assert(result[:success])
+    assert_equal('MSG-0001', result[:msg_id])
+    assert_equal('MSG-0001', Relay::PushOutcome.detail(result)[:wns_msg_id])
+  end
+
   # degrade して送ったが WNS が失敗を返したときは、degraded を付けない（上位が
   # 「汎用文面を届けた」と誤って数えないように）。
   def test_degraded_flag_is_not_attached_to_failures
@@ -172,6 +184,7 @@ class WnsClientTest < Minitest::Test
       code = @status.to_s
       res = Net::HTTPResponse.send(:response_class, code).new('1.1', code, 'OK')
       res['X-WNS-NotificationStatus'] = 'received' if @status == 200
+      res['X-WNS-Msg-ID'] = 'MSG-0001' if @status == 200
       return res
     end
   end

@@ -280,9 +280,11 @@ module Relay
         # WNS は 200 でも X-WNS-NotificationStatus が dropped / channelthrottled の
         # ことがある。配信自体は受理されたものとして success 扱いにし、観測のため
         # ステータスだけ残す。
+        # `msg_id` は配送を追うための識別子 (#85)。ログの `wns_msg_id` になる。
         return {
           success: true, status: status,
-          wns_status: response['X-WNS-NotificationStatus'], conn: sent.conn
+          wns_status: response['X-WNS-NotificationStatus'],
+          msg_id: response['X-WNS-Msg-ID'], conn: sent.conn
         }
       end
 
