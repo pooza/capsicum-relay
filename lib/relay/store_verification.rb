@@ -140,6 +140,7 @@ module Relay
     # | --- | --- | --- |
     # | `active` 等 | ストアの状態 | 反映した |
     # | `not_found` | ストアに無い購入 | 触らない（`unverified` のまま） |
+    # | `product_mismatch` | 購入はあるが利用権の商品ではない (#93) | 触らない。⚠ **終端へ数えない** |
     # | `unavailable` | ストアに届かない・鍵や権限が使えない | ⚠⚠ **触らない（fail-open）** |
     # | `invalid` | 署名・宛先が合わない | 触らない |
     # | `deferred` | 前景で確かめない構成（ここは返さない・[Relay::Routes::Entitlements]） | 触らない |
@@ -166,6 +167,13 @@ module Relay
         entitlement_id, verification_of(store, result)
       )
       return [result.status, id]
+    rescue Relay::StoreProductMismatch
+      # ⚠⚠ **「知らない購入」と分けて数える** (#93)。`product_ids` の設定を誤ると
+      # 正当な購入が全部ここへ来るので、**終端（`revoked`）へは進めない**（設定を
+      # 直せば、次の検証で戻れる）。⚠ 確かめ直しの間隔だけは空ける —— 空けないと、
+      # 掃除がこの行を毎回引き続ける。ログは投げた側が event 名つきで出している。
+      settings.database.record_entitlement_not_found(entitlement_id, terminal: false)
+      return ['product_mismatch', entitlement_id]
     rescue Relay::StoreUnavailable => e
       # ⚠⚠ **有効な購入を「確かめられなかった」だけで失効扱いにしない。**
       settings.logger.warn("Store verification unavailable (#{store}, state kept): #{e.message}")

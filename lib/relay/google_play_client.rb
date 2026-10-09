@@ -121,13 +121,16 @@ module Relay
     # ⚠⚠ **利用権の商品の行だけを見る** (#89)。`packageName` は「このアプリの購入か」
     # しか言わないので、照合しないとアプリの別のサブスクでも利用権が通る。
     #
-    # 戻り値は `[利用権の購入か, 採る行]`。⚠ 行はあるのに利用権の商品が無ければ
-    # `[false, nil]`（＝「その購入は知らない」と同じ扱い）。行そのものが無い応答
-    # （支払い保留中など）は従来どおり状態だけを使うので `[true, nil]`。
+    # 戻り値は採る行。行そのものが無い応答（支払い保留中など）は従来どおり状態だけを
+    # 使うので nil。⚠ 行はあるのに利用権の商品が無ければ
+    # [Relay::StoreProductMismatch]（#93・「その購入は知らない」と分ける）。
     def entitlement_line(json)
       items = Array(json['lineItems'])
       matched = items.select {|item| @product_ids.include?(item['productId'])}
-      return [true, matched.max_by {|item| item['expiryTime'].to_s}] if
+      # ⚠ **期限は時刻に直してから比べる** (#93)。文字列のままだと、小数秒の有無が
+      # 混じったときに 1 秒未満の範囲で順序が逆転しうる
+      # （`…:00.5Z` と `…:00Z` は、文字列では後者が大きい）。
+      return matched.max_by {|item| parse_time(item['expiryTime']) || Time.at(0)} if
         items.empty? || !matched.empty?
 
       products = items.map {|item| item['productId']}.uniq.join(', ')
@@ -135,12 +138,11 @@ module Relay
       msg = "Google Play purchase is not a relay entitlement product: #{products}"
       event = 'entitlement.product_mismatch'
       @logger.warn({event: event, store: 'google', products: products, msg: msg})
-      return [false, nil]
+      raise Relay::StoreProductMismatch, msg
     end
 
     def result_from(json, purchase_token, asked_at)
-      entitlement, line = entitlement_line(json)
-      return nil unless entitlement
+      line = entitlement_line(json)
 
       expiry = parse_time(line&.dig('expiryTime'))
       status = status_for(json['subscriptionState'], expiry)

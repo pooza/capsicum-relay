@@ -23,6 +23,10 @@ module Relay
     # [Relay::StoreVerification]）。Microsoft は後回し。
     class Entitlements < BaseApp
       # 前景の枠が埋まっていた回の `Retry-After`（秒）。検証 1 件は通常 1 秒前後。
+      #
+      # ⚠ **capsicum 側の送り直しの間隔（2 / 5 / 15 秒）と連動している** (#93)。
+      # クライアントはこのヘッダを読まず、自分の定数で待つ（pooza/capsicum#1237）。
+      # ここを変えても**クライアントは追随しない**ので、変えるなら両方を変える。
       VERIFICATION_BUSY_RETRY_AFTER = 2
 
       post '/entitlements' do

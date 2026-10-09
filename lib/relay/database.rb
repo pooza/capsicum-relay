@@ -495,7 +495,12 @@ module Relay
     # Codex P2）。鍵の外で呼ぶと、**同じ購入の成功した検証と競合して、通ったばかりの
     # 行に連続を書き戻す**（連続が 7 日に達していれば `revoked` まで行く ＝ **正当な
     # 購読者が、次の明示的な検証まで拒否されたままになる**）。
-    def record_entitlement_not_found(entitlement_id, terminal_days: NOT_FOUND_TERMINAL_DAYS)
+    #
+    # ⚠ [terminal] を false にすると、**数えるだけで終端へは進めない** (#93)。
+    # 「購入はあるが利用権の商品ではない」回に使う —— 設定の誤りで正当な購入が
+    # `revoked` まで進まないようにしつつ、確かめ直しの間隔（バックオフ）は効かせる。
+    def record_entitlement_not_found(entitlement_id, terminal_days: NOT_FOUND_TERMINAL_DAYS,
+      terminal: true)
       window = "-#{Integer(terminal_days)} days"
       @db.transaction do
         @db.execute(<<~SQL, [entitlement_id])
@@ -506,6 +511,8 @@ module Relay
             updated_at = datetime('now')
           WHERE id = ?
         SQL
+        next unless terminal
+
         @db.execute(<<~SQL, [entitlement_id, window])
           UPDATE entitlements SET status = 'revoked', updated_at = datetime('now')
           WHERE id = ? AND not_found_since IS NOT NULL AND not_found_since <= datetime('now', ?)

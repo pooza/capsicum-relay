@@ -79,11 +79,46 @@ class AppStoreClientTest < Minitest::Test
   end
 
   # ⚠⚠ #89: アプリの別のサブスクの購入では、利用権にならない。
+  # ⚠ #93: 「知らない購入」（nil）とは分けて、専用の例外で知らせる。
   def test_other_product_is_not_an_entitlement
     body = groups_body(['other.yearly', 1, EXPIRES_MS])
 
-    assert_nil(client({'Production' => body}).subscription_status('2000'))
+    assert_raises(Relay::StoreProductMismatch) do
+      client({'Production' => body}).subscription_status('2000')
+    end
     assert_match(/not a relay entitlement product: other\.yearly/, @log.string)
+  end
+
+  # ⚠⚠ #93: 無関係なグループの 1 件が検証に落ちても、利用権の商品は返す。
+  # `productId` は署名の中にあるので、商品で絞る前に全件を検証するしかない。
+  def test_unrelated_invalid_transaction_does_not_hide_the_entitlement
+    body = with_broken_group(groups_body(['relay.monthly', 1, EXPIRES_MS]))
+    result = client({'Production' => body}).subscription_status('2000')
+
+    assert_equal('active', result.status)
+    assert_equal('relay.monthly', result.product_id)
+    assert_match(/failed verification \(skipped\)/, @log.string)
+  end
+
+  # ⚠⚠ #93: 検証に落ちた件があって一致が 0 件なら、「無い」とも「別の商品」とも
+  # 言わない（落ちた 1 件が利用権の取引だったかもしれない）。
+  def test_invalid_transaction_with_no_match_is_invalid_not_missing
+    body = with_broken_group(groups_body(['other.yearly', 1, EXPIRES_MS]))
+
+    assert_raises(Relay::StoreResponseInvalid) do
+      client({'Production' => body}).subscription_status('2000')
+    end
+  end
+
+  # 応答に、署名の壊れた取引を 1 件持つグループを足す。
+  def with_broken_group(response)
+    code, body = response
+    json = JSON.parse(body)
+    json['data'] << {'lastTransactions' => [{
+      'originalTransactionId' => '9999', 'status' => 1,
+      'signedTransactionInfo' => 'not-a-jws'
+    }]}
+    return [code, json.to_json]
   end
 
   # ⚠⚠ #89: 別グループの失効した購読が先頭に来ても、利用権の商品の状態を返す。

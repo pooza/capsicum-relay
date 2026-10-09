@@ -306,6 +306,8 @@ Apple と**同じ判断**（`Relay::StoreVerification`）に乗る。ストア�
 
 ⚠ **スレッド 2 本の競合テストでは守れない。**鍵を解いた直後に数える実装でも成功側より先に書き終わるため**素通りする**（2026-10-05 に穴を開けて確認）。**鍵を握っているかを直接見る**テストにしてある（`LockWatchingDatabase`）。
 
+⚠⚠ **「購入はあるが、利用権の商品ではない」（`product_mismatch`）は `not_found` と分ける**（[#93](https://github.com/pooza/capsicum-relay/issues/93)）。以前は同じ `not_found` に数えていたので、**`product_ids` の設定を誤ると、正当な購入が全部「知らない」に倒れ、連続が終端の日数に達すると `revoked` まで進んだ**。metrics（`relay_entitlement_verify_total` の `outcome`）からも、でたらめな `purchase_id` と区別できなかった。⚠ **終端へは進めない**（設定を直せば、次の検証で戻れる）が、**確かめ直しの間隔（バックオフ）は同じ数えで効かせる** —— 効かせないと掃除がその行を毎回引き続ける。ログは `entitlement.product_mismatch`。
+
 ⚠⚠ **「届かない」（`unavailable`）では数えない。**ストア障害で有効な購読を失効させてはいけないので、あちらは順番の後ろへ回すだけ（`invalid` も同じ）。⚠ ストアが答えたら `not_found_streak` / `not_found_since` は 0 / NULL に戻る（`update_entitlement_verification!`・**書けたときだけ** —— 古い結果が順序で弾かれた回に数えを消すと終端までの日数が延びる）。
 
 ⚠ 買い直したときは**クライアント自身の `POST /entitlements`** がその場で確かめるので、終端にしても回復経路は残る。
