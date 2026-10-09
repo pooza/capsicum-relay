@@ -121,6 +121,30 @@ class GooglePlayClientTest < Minitest::Test
     assert_equal('2026-10-30 00:30:00', result.expires_at)
   end
 
+  # ⚠ PR #94 の Codex P2: 期限が文字列でない行（形の崩れた応答）が混じっていても
+  # 落ちない。`Time.iso8601` は文字列以外に TypeError を投げる。
+  def test_line_item_with_non_string_expiry_does_not_raise
+    [1_790_000_000, 1.5, true, ['x'], {'seconds' => 1}].each do |bad|
+      items = [
+        {'productId' => 'relay.monthly', 'expiryTime' => bad},
+        {'productId' => 'relay.monthly', 'expiryTime' => '2026-10-30T00:00:00Z'},
+      ]
+      result = client(200, purchase('SUBSCRIPTION_STATE_ACTIVE', items: items)).purchase_status('t')
+
+      assert_equal('2026-10-30 00:00:00', result.expires_at, bad.inspect)
+    end
+  end
+
+  # ⚠ 採った行の期限そのものが文字列でないときは、「形が合わない」として扱う
+  # （例外を素通しして 500 にしない）。
+  def test_only_line_item_with_non_string_expiry_is_invalid
+    items = [{'productId' => 'relay.monthly', 'expiryTime' => 1_790_000_000}]
+
+    assert_raises(Relay::StoreResponseInvalid) do
+      client(200, purchase('SUBSCRIPTION_STATE_ACTIVE', items: items)).purchase_status('t')
+    end
+  end
+
   # 期限の読めない行が混じっていても落ちず、読める行を採る (#93)。
   def test_line_item_with_unreadable_expiry_does_not_win
     items = [

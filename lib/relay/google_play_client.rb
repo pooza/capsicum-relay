@@ -182,8 +182,12 @@ module Relay
       end
     end
 
+    # ⚠ **文字列でない値は読めないものとして扱う**（PR #94 の Codex P2）。
+    # `Time.iso8601` は文字列以外に `TypeError` を投げ、`ArgumentError` の rescue を
+    # すり抜ける。形の崩れた応答（数値など）が 1 行混じっただけで、前景の要求が
+    # 500 になり、掃除はその回の残りを捨ててしまう。
     def parse_time(value)
-      return nil unless value
+      return nil unless value.is_a?(String)
 
       return Time.iso8601(value)
     rescue ArgumentError
