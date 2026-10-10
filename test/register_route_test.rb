@@ -166,6 +166,31 @@ class RegisterRouteTest < RequestTestCase
     assert_equal(0, Relay::BaseApp.settings.metrics.value('relay_register_total', {action: 'deleted'}))
   end
 
+  # ⚠⚠ PR #96 の Codex P2: 照合と削除は 1 文で行う。照合のあとに `/register` が
+  # 同じ行を別の端末のものへ差し替えると、ID だけの削除はその登録を消す。
+  def test_unregister_owned_does_not_delete_a_row_rebound_to_another_device
+    sub = register_with_device('device-a')
+    # 同じ token で別の端末が登録し直す（行 ID を保ったまま device_id が替わる）。
+    rebound = register_with_device('device-b')
+
+    assert_equal(sub['id'], rebound['id'], '前提: 行 ID は保たれる')
+    assert_nil(database.unregister_owned(sub['id'], 'device-a'))
+    assert_equal(1, database.count, '差し替わった後の登録が消えた')
+  end
+
+  def test_unregister_owned_deletes_the_owners_row
+    sub = register_with_device('device-a')
+
+    removed = database.unregister_owned(sub['id'], 'device-a')
+
+    assert_equal(sub['id'], removed['id'])
+    assert_equal(0, database.count)
+  end
+
+  def test_unregister_owned_returns_nil_for_unknown_id
+    assert_nil(database.unregister_owned(9999, 'device-a'))
+  end
+
   # ⚠ 出荷済みの版（〜2.0）は送ってこない。拒むと古い端末が登録を消せなくなる。
   def test_unregister_without_device_id_still_deletes
     sub = register_with_device('device-a')

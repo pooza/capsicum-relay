@@ -56,16 +56,9 @@ module Relay
         # ⚠ **食い違いは 404 で返す**（403 にすると、その id に行があると分かる）。
         binding = unregister_binding(sub)
         metrics.increment('relay_unregister_binding_total', {binding: binding})
-        if binding == 'mismatch'
-          log_event(
-            'register.delete_refused', level: :warn,
-            msg: 'Unregister refused: device_id mismatch',
-            device_type: sub['device_type'], latency_ms: latency_ms
-          )
-          halt 404, {error: 'Not found'}.to_json
-        end
+        halt_unregister_refused!(sub) if binding == 'mismatch'
+        halt 404, {error: 'Not found'}.to_json unless remove_registration(sub, binding)
 
-        settings.database.unregister(sub['id'])
         metrics.increment('relay_register_total', {action: 'deleted'})
         log_event(
           'register.deleted', msg: "Unregistered: #{sub['account']}",
@@ -81,6 +74,27 @@ module Relay
       end
 
       helpers do
+        def halt_unregister_refused!(sub)
+          log_event(
+            'register.delete_refused', level: :warn,
+            msg: 'Unregister refused: device_id mismatch',
+            device_type: sub['device_type'], latency_ms: latency_ms
+          )
+          halt 404, {error: 'Not found'}.to_json
+        end
+
+        # ⚠ **照合に通った回は、照合した `device_id` を条件に付けて消す**（PR #96 の
+        # Codex P2）。照合から削除までの間に `/register` が同じ行を別の端末のものへ
+        # 差し替えることがあり、ID だけで消すとその登録を消してしまう。
+        # 消せなかったら nil。
+        def remove_registration(sub, binding)
+          if binding == 'matched'
+            return settings.database.unregister_owned(sub['id'], sub['device_id'])
+          end
+
+          return settings.database.unregister(sub['id'])
+        end
+
         # `DELETE /register/:id` が、行の持ち主から来たかどうか (#91)。
         #
         # - `matched`: 送ってきた `X-Device-Id` が行と一致した
