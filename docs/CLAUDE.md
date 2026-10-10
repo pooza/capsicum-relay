@@ -55,7 +55,7 @@ flowchart LR
 | GET | `/health` | なし | ヘルスチェック。稼働中の `revision`（コミット）と購読数を返す |
 | GET | `/metrics` | X-Relay-Secret | 配送・ゲート・検証の counter（⚠ in-memory で、再起動でゼロに戻る） |
 | POST | `/register` | X-Relay-Secret | デバイストークン登録（capsicum → リレー） |
-| DELETE | `/register/:id` | X-Relay-Secret | 登録解除 |
+| DELETE | `/register/:id` | X-Relay-Secret（+ 任意の `X-Device-Id`） | 登録解除。`X-Device-Id` が行の `device_id` と食い違えば 404（⚠ **送ってこない要求はまだ通す** —— 〜2.0 の capsicum が送らないため。閉じる時期は `relay_unregister_binding_total{binding="legacy"}` で決める・[#91](https://github.com/pooza/capsicum-relay/issues/91)） |
 | POST | `/push/:push_token` | なし（トークンの推測困難性で保護） | Web Push 受信（Mastodon / Misskey → リレー） |
 | POST | `/entitlements` | X-Relay-Secret | 有償リレーの利用権の発行（capsicum#597 / [#58](https://github.com/pooza/capsicum-relay/issues/58)） |
 | GET | `/entitlements` | X-Relay-Secret + `X-Entitlement-Token` | 利用権の**現在の状態**を読む（⚠ 副作用なし・🔴 **token を URL に載せない**・[#80](https://github.com/pooza/capsicum-relay/issues/80)） |

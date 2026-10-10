@@ -27,6 +27,10 @@ module Relay
       'relay_announcement_push_total' =>
         'Announcement pushes sent by the polling worker, by device_type and outcome.',
       'relay_register_total' => 'Device registration changes, by action.',
+      # ⚠ **`legacy` が減ったら、ヘッダの無い登録解除を拒める** (#91)。それまでは
+      # 照合が何も守っていない（省けば通る）ので、閉じる時期はこの系列で決める。
+      'relay_unregister_binding_total' =>
+        'Unregister requests, by whether the caller proved it owns the row.',
       'relay_announcement_subscription_total' =>
         'Announcement subscription changes, by action.',
       'relay_supporter_tip_total' => 'Supporter tips recorded.',

@@ -11,6 +11,9 @@ apns:
   key_id: "XXXXXXXXXX"
   team_id: "XXXXXXXXXX"
   bundle_id: "org.b-shock.capsicum"
+  # macOS だけ宛先が違う環境で置く（debug ビルドを受けるステージング）。
+  # 本番では置かない（iOS と macOS が同じ Bundle ID）。
+  # macos_bundle_id: "org.b-shock.capsicum"
   sandbox: false
 
 # FCM (Android)

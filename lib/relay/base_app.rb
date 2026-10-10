@@ -88,6 +88,14 @@ module Relay
 
       if settings.config.dig('apns', 'key_path')
         set :apns, Relay::ApnsClient.new(settings.config, logger: settings.logger)
+        # macOS の宛先が iOS と違う環境だけ、macOS 用のクライアントを別に持つ (#95)。
+        # ⚠ **本番では設定しない**（iOS と macOS が同じ Bundle ID なので 1 本で足りる）。
+        macos_bundle_id = Relay::PushHelpers.macos_bundle_id(settings.config)
+        if macos_bundle_id
+          set :apns_macos, Relay::ApnsClient.new(
+            settings.config, logger: settings.logger, bundle_id: macos_bundle_id
+          )
+        end
       end
       set :fcm, Relay::FcmClient.new(settings.config) if settings.config.dig('fcm', 'project_id')
       # ストアの購入の検証 (#61 / #62)。組み立ては [Relay::StoreVerification.configure!]。

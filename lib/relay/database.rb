@@ -114,6 +114,27 @@ module Relay
       return sub
     end
 
+    # 行の持ち主を確かめた登録解除 (#91 / PR #96 の Codex P2)。
+    #
+    # ⚠⚠ **照合と削除を 1 文にする。**[update_registration] は**行 ID を保ったまま
+    # `device_id` を差し替える**ので、route で照合してから ID だけで消すと、その間に
+    # `/register` で別の端末のものになった行を消してしまう（[unregister_stale] が
+    # `token` で塞いでいるのと同じ窓）。
+    #
+    # 消えたら行を返し、差し替わっていたら nil を返す（＝消さなかった）。
+    def unregister_owned(id, device_id)
+      sub = find(id)
+      return nil unless sub
+      return nil unless sub['device_id'] == device_id
+
+      @db.execute(
+        'DELETE FROM subscriptions WHERE id = ? AND device_id = ?', [id, device_id]
+      )
+      return nil unless @db.changes.positive?
+
+      return sub
+    end
+
     # 配送が恒久的に失敗した購読を落とす (#55 / PR #67 の Codex P1)。
     #
     # ⚠⚠ **行 ID だけで消してはいけない。**[update_registration] は**行 ID を保ったまま

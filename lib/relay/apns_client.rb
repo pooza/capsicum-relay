@@ -23,11 +23,14 @@ module Relay
     # 足りる長さだけ残してログ / Sentry へ載せる (#25)。
     BODY_SNIPPET_LIMIT = 200
 
-    def initialize(config, logger: Logger.new($stdout))
+    # [bundle_id] は宛先（apns-topic）。省けば `apns.bundle_id`。⚠ **macOS だけ
+    # 別の ID にしたい環境がある** (#95) —— debug ビルドの iOS は `….debug` だが、
+    # macOS は debug でも本番と同じ ID なので、ステージングでは 1 つに揃わない。
+    def initialize(config, logger: Logger.new($stdout), bundle_id: nil)
       @config = config
       @logger = logger
       @mon = Monitor.new
-      @payload = Relay::ApnsPayload.new(config['apns']['bundle_id'])
+      @payload = Relay::ApnsPayload.new(bundle_id || config['apns']['bundle_id'])
       @connection = build_connection
     end
 

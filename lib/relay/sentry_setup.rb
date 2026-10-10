@@ -16,7 +16,8 @@ module Relay
     # ⚠ `X-Entitlement-Token` は**そのまま利用権として使える**（PR #81 の Codex P2）。
     # ⚠ **ヘッダで capability を受ける口を足したら、必ずここにも足す。**
     SENSITIVE_HEADERS = [
-      'X-Relay-Secret', 'X-Entitlement-Token', 'Authorization', 'Crypto-Key', 'Encryption'
+      'X-Relay-Secret', 'X-Entitlement-Token', 'X-Device-Id', 'Authorization', 'Crypto-Key',
+      'Encryption'
     ].freeze
 
     def self.init!
