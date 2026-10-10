@@ -73,6 +73,21 @@ class AnnouncementWorkerTest < Minitest::Test
     assert_empty(@fcm.pushes)
   end
 
+  # ⚠ macOS の宛先が iOS と違う環境 (#95)。iOS の宛先で送ると登録ごと消える。
+  def test_macos_goes_to_its_own_apns_client_when_given
+    macos = RecordingClient.new
+    worker = Relay::AnnouncementWorker.new(
+      database: nil, logger: Logger.new(IO::NULL), apns: @apns, apns_macos: macos,
+    )
+    sub = {'token' => 'tok', 'account' => 'alice@example'}
+
+    worker.send(:deliver, sub: sub.merge('device_type' => 'macos'), payload: {}, alert: {})
+    worker.send(:deliver, sub: sub.merge('device_type' => 'ios'), payload: {}, alert: {})
+
+    assert_equal(1, macos.pushes.size)
+    assert_equal(1, @apns.pushes.size)
+  end
+
   # macOS の NSE は `aps.alert` をそのまま出すので、alert を落とすと無音になる。
   def test_macos_carries_alert
     deliver('macos')

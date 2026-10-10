@@ -34,12 +34,14 @@ module Relay
     # `settings.respond_to?` の分岐が別の入れ物へ移るだけになる。
     # rubocop:disable Metrics/ParameterLists
     def initialize(
-      database:, logger:, apns: nil, fcm: nil, wns: nil, metrics: nil,
+      database:, logger:, apns: nil, apns_macos: nil, fcm: nil, wns: nil, metrics: nil,
       interval: DEFAULT_INTERVAL
     )
       @database = database
       @logger = logger
       @apns = apns
+      # macOS の宛先が iOS と違う環境だけ別物になる (#95)。無ければ iOS と同じ。
+      @apns_macos = apns_macos || apns
       @fcm = fcm
       @wns = wns
       @interval = interval
@@ -67,7 +69,8 @@ module Relay
         database: database,
         logger: logger,
         interval: interval,
-        apns: (settings.respond_to?(:apns) ? settings.apns : nil),
+        apns: Relay::PushHelpers.apns_for(settings, 'ios'),
+        apns_macos: Relay::PushHelpers.apns_for(settings, 'macos'),
         fcm: (settings.respond_to?(:fcm) ? settings.fcm : nil),
         wns: (settings.respond_to?(:wns) ? settings.wns : nil),
         # `/metrics` の counter (#2)。App と同じインスタンスを渡す — worker は
@@ -222,7 +225,8 @@ module Relay
     # そのまま表示される（#17 で実測済みの挙動）。
     def client_for(device_type)
       case device_type
-      when 'ios', 'macos' then @apns
+      when 'ios' then @apns
+      when 'macos' then @apns_macos
       when 'android' then @fcm
       when 'windows' then @wns
       end

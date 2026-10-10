@@ -34,4 +34,47 @@ class PushHelpersTest < Minitest::Test
   def test_moves_wns_benign_statuses_constant
     assert_equal(['dropped'], Relay::PushHelpers::WNS_BENIGN_STATUSES)
   end
+
+  # --- macOS だけ宛先が違う環境 (#95) ---------------------------------------
+
+  SharedApns = Struct.new(:apns)
+  SplitApns = Struct.new(:apns, :apns_macos)
+
+  # 本番の形。macOS も iOS と同じクライアントへ流す。
+  def test_apns_for_uses_the_shared_client_by_default
+    settings = SharedApns.new(:shared)
+
+    assert_equal(:shared, Relay::PushHelpers.apns_for(settings, 'ios'))
+    assert_equal(:shared, Relay::PushHelpers.apns_for(settings, 'macos'))
+    assert_equal([:shared, 'APNs'], Relay::PushHelpers.client_for(settings, 'macos'))
+  end
+
+  # ⚠⚠ ステージングの形。macOS を iOS の宛先で送ると `DeviceTokenNotForTopic` に
+  # なり、登録ごと消える。
+  def test_apns_for_routes_macos_to_its_own_client_when_configured
+    settings = SplitApns.new(:ios_client, :macos_client)
+
+    assert_equal(:ios_client, Relay::PushHelpers.apns_for(settings, 'ios'))
+    assert_equal(:macos_client, Relay::PushHelpers.apns_for(settings, 'macos'))
+    assert_equal([:macos_client, 'APNs'], Relay::PushHelpers.client_for(settings, 'macos'))
+    assert_equal([:ios_client, 'APNs'], Relay::PushHelpers.client_for(settings, 'ios'))
+  end
+
+  def test_apns_for_is_nil_when_apns_is_not_configured
+    assert_nil(Relay::PushHelpers.apns_for(Struct.new(:fcm).new(:x), 'macos'))
+  end
+
+  def test_macos_bundle_id_is_only_returned_when_it_differs
+    base = {'apns' => {'bundle_id' => 'a.debug'}}
+
+    assert_nil(Relay::PushHelpers.macos_bundle_id(base))
+    assert_nil(Relay::PushHelpers.macos_bundle_id({'apns' => base['apns'].merge('macos_bundle_id' => ' ')}))
+    assert_nil(
+      Relay::PushHelpers.macos_bundle_id({'apns' => base['apns'].merge('macos_bundle_id' => 'a.debug')}),
+    )
+    assert_equal(
+      'a', Relay::PushHelpers.macos_bundle_id({'apns' => base['apns'].merge('macos_bundle_id' => 'a')})
+    )
+    assert_nil(Relay::PushHelpers.macos_bundle_id({}))
+  end
 end

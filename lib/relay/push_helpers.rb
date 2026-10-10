@@ -47,9 +47,7 @@ module Relay
     def self.client_for(settings, device_type)
       case device_type
       when 'ios', 'macos'
-        # macOS は iOS と同一 Bundle ID + 同一 APNs Auth Key で動くため、同じ
-        # APNs クライアントに流す (capsicum#468)。
-        [(settings.apns if settings.respond_to?(:apns)), 'APNs']
+        [apns_for(settings, device_type), 'APNs']
       when 'android'
         [(settings.fcm if settings.respond_to?(:fcm)), 'FCM']
       when 'windows'
@@ -57,6 +55,27 @@ module Relay
         # payload をそのまま転送し、bg task が復号する (capsicum#474)。
         [(settings.wns if settings.respond_to?(:wns)), 'WNS']
       end
+    end
+
+    # iOS / macOS の APNs クライアントを選ぶ。
+    #
+    # 本番の macOS は iOS と同一 Bundle ID + 同一 APNs Auth Key なので、同じ
+    # クライアントに流す (capsicum#468)。⚠ **`apns.macos_bundle_id` を置いた環境
+    # だけ、macOS を別のクライアントへ流す** (#95)。宛先が違う端末へ iOS の ID で
+    # 送ると APNs は `DeviceTokenNotForTopic` を返し、relay はそれを恒久的な失敗と
+    # 読んで**登録ごと消す**（上流へは 410 が返り、購読も消える）。
+    def self.apns_for(settings, device_type)
+      return settings.apns_macos if device_type == 'macos' && settings.respond_to?(:apns_macos)
+
+      return (settings.apns if settings.respond_to?(:apns))
+    end
+
+    # `apns.macos_bundle_id` が、`apns.bundle_id` と違う値で置かれているときだけ返す。
+    def self.macos_bundle_id(config)
+      value = config.dig('apns', 'macos_bundle_id').to_s.strip
+      return nil if value.empty? || value == config.dig('apns', 'bundle_id')
+
+      return value
     end
 
     def log_push_received(sub)
