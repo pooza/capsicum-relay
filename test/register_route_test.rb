@@ -122,6 +122,81 @@ class RegisterRouteTest < RequestTestCase
     end
   end
 
+  # --- 消す対象を呼び出し元の端末に縛る (#91) ------------------------------
+
+  def register_with_device(device_id)
+    post_json(
+      '/register',
+      {
+        token: 'device-token', device_type: 'ios', account: 'alice@example.test',
+        server: 'example.test', device_id: device_id
+      },
+    )
+    return JSON.parse(last_response.body)
+  end
+
+  def delete_as(id, device_id)
+    delete("/register/#{id}", {}, auth_headers.merge('HTTP_X_DEVICE_ID' => device_id))
+  end
+
+  def binding_count(binding)
+    return Relay::BaseApp.settings.metrics.value('relay_unregister_binding_total', {binding: binding})
+  end
+
+  def test_unregister_with_matching_device_id_deletes
+    sub = register_with_device('device-a')
+
+    delete_as(sub['id'], 'device-a')
+
+    assert_equal(200, last_response.status)
+    assert_equal(0, database.count)
+    assert_equal(1, binding_count('matched'))
+  end
+
+  # ⚠⚠ 他人の端末の ID では消せない。404 で返す（行があることを教えない）。
+  def test_unregister_with_other_device_id_is_refused
+    sub = register_with_device('device-a')
+
+    delete_as(sub['id'], 'device-b')
+
+    assert_equal(404, last_response.status)
+    assert_equal({'error' => 'Not found'}, json_response)
+    assert_equal(1, database.count, '他人の device_id で登録が消えた')
+    assert_equal(1, binding_count('mismatch'))
+    assert_equal(0, Relay::BaseApp.settings.metrics.value('relay_register_total', {action: 'deleted'}))
+  end
+
+  # ⚠ 出荷済みの版（〜2.0）は送ってこない。拒むと古い端末が登録を消せなくなる。
+  def test_unregister_without_device_id_still_deletes
+    sub = register_with_device('device-a')
+
+    delete("/register/#{sub['id']}", {}, auth_headers)
+
+    assert_equal(200, last_response.status)
+    assert_equal(0, database.count)
+    assert_equal(1, binding_count('legacy'))
+  end
+
+  # 行に device_id が無い（#15 より前の登録）なら照合できないので通す。
+  def test_unregister_of_a_row_without_device_id_deletes
+    sub = register_subscription
+
+    delete_as(sub['id'], 'device-a')
+
+    assert_equal(200, last_response.status)
+    assert_equal(0, database.count)
+    assert_equal(1, binding_count('unbound_row'))
+  end
+
+  def test_unregister_treats_blank_device_id_as_absent
+    sub = register_with_device('device-a')
+
+    delete_as(sub['id'], '   ')
+
+    assert_equal(200, last_response.status)
+    assert_equal(1, binding_count('legacy'))
+  end
+
   def test_unregister_requires_secret
     sub = register_subscription
 

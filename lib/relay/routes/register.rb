@@ -42,9 +42,30 @@ module Relay
       delete '/register/:id' do
         authenticate!
 
-        sub = settings.database.unregister(params[:id].to_i)
+        sub = settings.database.find(params[:id].to_i)
         halt 404, {error: 'Not found'}.to_json unless sub
 
+        # 消す対象を、呼び出し元の端末に縛る (#91)。
+        #
+        # ⚠⚠ **`X-Device-Id` を送ってこない要求は、まだ従来どおり通す。**出荷済みの
+        # capsicum（〜2.0）は送ってこないので、すぐ拒むと古い版の端末が自分の登録を
+        # 消せなくなる。⚠ **だからこの照合は、いまは何も守っていない** —— 攻撃する
+        # 側はヘッダを省けばよい。拒む時期を決めるための母数を `binding` で数えて
+        # おき、`legacy` が減ったら閉じる。
+        #
+        # ⚠ **食い違いは 404 で返す**（403 にすると、その id に行があると分かる）。
+        binding = unregister_binding(sub)
+        metrics.increment('relay_unregister_binding_total', {binding: binding})
+        if binding == 'mismatch'
+          log_event(
+            'register.delete_refused', level: :warn,
+            msg: 'Unregister refused: device_id mismatch',
+            device_type: sub['device_type'], latency_ms: latency_ms
+          )
+          halt 404, {error: 'Not found'}.to_json
+        end
+
+        settings.database.unregister(sub['id'])
         metrics.increment('relay_register_total', {action: 'deleted'})
         log_event(
           'register.deleted', msg: "Unregistered: #{sub['account']}",
@@ -56,12 +77,27 @@ module Relay
         # バイナリから取り出せる前提なので、**id を総当たりすれば、消した行の端末
         # トークンとアカウント名・サーバー名まで読めた**。クライアントは応答の
         # 中身を読んでいない（最初の実装から戻り値が void）ので、id だけ返す。
-        # ⚠ 「他人の登録を消せる」こと自体は残っている（消す対象を呼び出し元の
-        # 端末に縛るにはクライアントの変更が要る・#91）。
         {id: sub['id']}.to_json
       end
 
       helpers do
+        # `DELETE /register/:id` が、行の持ち主から来たかどうか (#91)。
+        #
+        # - `matched`: 送ってきた `X-Device-Id` が行と一致した
+        # - `mismatch`: 食い違った（＝消さない）
+        # - `unbound_row`: 行に `device_id` が無い（#15 より前の登録）。照合できない
+        # - `legacy`: ヘッダを送ってこない（〜2.0 の capsicum）
+        def unregister_binding(sub)
+          provided = request.env['HTTP_X_DEVICE_ID'].to_s.strip
+          return 'legacy' if provided.empty?
+
+          expected = sub['device_id'].to_s
+          return 'unbound_row' if expected.empty?
+          return 'matched' if Rack::Utils.secure_compare(expected, provided)
+
+          return 'mismatch'
+        end
+
         # ⚠ **401 と区別できる形で返す。**クライアントは「シークレットが違う」と
         # 「利用権が無い」で出す文面が違う（capsicum#1123 の登録ステータス画面）。
         def halt_entitlement_required!
