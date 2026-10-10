@@ -2,6 +2,7 @@ require 'json'
 require 'net/http'
 require 'uri'
 require_relative 'announcement_delivery_reporter'
+require_relative 'push_helpers'
 require_relative 'sentry_setup'
 
 module Relay
