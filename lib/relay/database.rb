@@ -363,6 +363,22 @@ module Relay
       ).map {|row| row['server']}
     end
 
+    # 同じ端末トークンが登録しているサーバー (#101)。
+    #
+    # ⚠ **`device_id` を送らない旧クライアント（〜capsicum v1.53）の行を束ねるため
+    # だけに使う。**1 インストールは全アカウントを同じトークンで登録するので、
+    # `device_id` が無くても同じ端末を指せる（2026-10-14 に本番で確かめた: 1 端末が
+    # 複数のトークンを持つ例は 0）。
+    # ⚠ 相手の行の `device_id` は問わない —— 同じインストールが新しい版へ上がる
+    # 途中は、`device_id` のある行と無い行が同じトークンで並ぶ。
+    def servers_for_token(token)
+      return [] if token.to_s.empty?
+
+      return @db.execute(
+        'SELECT DISTINCT server FROM subscriptions WHERE token = ?', [token]
+      ).map {|row| row['server']}
+    end
+
     # 1 購入にぶら下がっている端末 (#58)。
     #
     # ⚠ **上限は設けない**（#57）。対象者 0 人から始まるので先回りで制限せず、
