@@ -166,7 +166,9 @@ module Relay
         def observed_preset(sub)
           extra = settings.config['extra_preset_hosts']
           return true if Relay::PresetServers.preset?(sub['server'], extra: extra)
-          if Relay::EntitlementGate.preset_device?(settings.database, sub['device_id'], extra)
+          if Relay::EntitlementGate.preset_device?(
+            settings.database, sub['device_id'], extra, token: sub['token']
+          )
             return Relay::EntitlementObservation::PRESET_DEVICE
           end
 

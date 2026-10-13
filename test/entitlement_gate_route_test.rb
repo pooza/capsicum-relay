@@ -156,6 +156,65 @@ class EntitlementGateRouteTest < RequestTestCase
     )
   end
 
+  # --- 旧クライアント（`device_id` を送らない・〜capsicum v1.53）の併用者 (#101) ---
+
+  LEGACY_EXTERNAL = VALID.except(:device_id).freeze
+  LEGACY_PRESET = PRESET_SAME_DEVICE.except(:device_id).freeze
+
+  # ⚠⚠ **#101 の核心。**2026-10-13 に本番で、プリセット 2 + 外部 4 を併用する
+  # 1.45.0 の端末が、外部の 4 本とも 403 になった。`device_id` が無くても、
+  # 同じ端末トークンにプリセットの行があれば通す。
+  def test_legacy_external_register_passes_when_the_token_has_a_preset
+    with_enforce do
+      post_json('/register', LEGACY_PRESET)
+      post_json('/register', LEGACY_EXTERNAL)
+    end
+
+    assert_equal(201, last_response.status)
+    assert_equal(
+      1,
+      metrics.value('relay_entitlement_gate_total',
+        {route: 'register', decision: 'allow', reason: 'preset_device'}),
+    )
+  end
+
+  def test_legacy_external_push_passes_when_the_token_has_a_preset
+    post_json('/register', LEGACY_PRESET)
+    post_json('/register', LEGACY_EXTERNAL)
+    push_token = json_response['push_token']
+
+    with_enforce do
+      post("/push/#{push_token}", 'body', {'CONTENT_TYPE' => 'application/octet-stream'})
+    end
+
+    refute_equal(410, last_response.status)
+    assert_equal(
+      1,
+      metrics.value('relay_entitlement_gate_total',
+        {route: 'push', decision: 'allow', reason: 'preset_device'}),
+    )
+  end
+
+  # ⚠ **別のトークン（＝別の端末）のプリセットは効かない。**
+  def test_legacy_preset_on_another_token_does_not_help
+    with_enforce do
+      post_json('/register', LEGACY_PRESET.merge(token: 'other-token'))
+      post_json('/register', LEGACY_EXTERNAL)
+    end
+
+    assert_equal(403, last_response.status)
+  end
+
+  # ⚠ 外部サーバーだけの旧クライアントは、従来どおり止まる。
+  def test_legacy_external_only_register_is_denied
+    with_enforce do
+      post_json('/register', LEGACY_EXTERNAL.merge(account: 'b@misskey.io', server: 'misskey.io'))
+      post_json('/register', LEGACY_EXTERNAL)
+    end
+
+    assert_equal(403, last_response.status)
+  end
+
   # ⚠ **別の端末のプリセットは効かない。**束ねるのは `device_id` 単位。
   def test_preset_on_another_device_does_not_help
     post_json(

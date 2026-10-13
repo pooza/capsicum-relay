@@ -8,15 +8,19 @@ require 'relay/entitlement_gate'
 class EntitlementGateTest < Minitest::Test
   G = Relay::EntitlementGate
 
-  # `entitlement_tokens_for_device` と `servers_for_device` だけを持つ最小の DB 代役。
+  # `entitlement_tokens_for_device` と `servers_for_device` / `servers_for_token`
+  # だけを持つ最小の DB 代役。
   class FakeDatabase
-    def initialize(rows, servers = [])
+    def initialize(rows, servers = [], token_servers = [])
       @rows = rows
       @servers = servers
+      @token_servers = token_servers
     end
 
     def entitlement_tokens_for_device(_device_id) = @rows
     def servers_for_device(_device_id) = @servers
+    # ⚠ 本物と同じく、トークンが空なら何も返さない (#101)。
+    def servers_for_token(token) = token.to_s.empty? ? [] : @token_servers
   end
 
   # 呼ばれたら落ちる DB（fail-open の検査用）。
@@ -28,21 +32,30 @@ class EntitlementGateTest < Minitest::Test
     def servers_for_device(_device_id)
       raise SQLite3::BusyException, 'database is locked'
     end
+
+    def servers_for_token(_token)
+      raise SQLite3::BusyException, 'database is locked'
+    end
   end
 
   ON = {'RELAY_ENTITLEMENT_ENFORCE' => 'true'}.freeze
   OFF = {}.freeze
 
-  def sub(server: 'mastodon.social', device_id: 'd1')
-    return {'server' => server, 'device_id' => device_id, 'account' => "a@#{server}"}
+  def sub(server: 'mastodon.social', device_id: 'd1', token: 'tok1')
+    return {
+      'server' => server, 'device_id' => device_id, 'token' => token,
+      'account' => "a@#{server}"
+    }
   end
 
-  # ⚠ 同じ端末の購読先 (#82) は `servers:` で渡す。引数を増やさないため DB 代役に持たせる。
+  # ⚠ 同じ端末の購読先 (#82) は `servers:` で、同じトークンの購読先 (#101) は
+  # `token_servers:` で渡す。引数を増やさないため DB 代役に持たせる。
   def decide(env: ON, rows: [], database: nil, verification: G::PRESET_NOT_CHECKED, **overrides)
     servers = overrides.delete(:servers) || []
+    token_servers = overrides.delete(:token_servers) || []
     return G.decide(
       subscription: sub(**overrides),
-      database: database || FakeDatabase.new(rows, servers),
+      database: database || FakeDatabase.new(rows, servers, token_servers),
       preset_verification: verification,
       env: env,
     )
@@ -96,11 +109,52 @@ class EntitlementGateTest < Minitest::Test
     )
   end
 
-  # ⚠ 旧クライアント（`device_id` 無し）は端末で束ねられない。
-  def test_preset_device_needs_a_device_id
+  # --- 旧クライアント（`device_id` 無し・〜capsicum v1.53）の併用者 (#101) ----
+
+  # ⚠⚠ **#101 の核心。**`device_id` が無い行は、端末のトークンで束ねる。
+  # 当初は「束ねられない」として拒んでいたが、旧クライアントの併用者の外部側が
+  # 起動のたびに 403 になった（2026-10-13・本番）。
+  def test_legacy_external_row_passes_when_the_token_has_a_preset
+    assert_equal(
+      [true, 'preset_device'],
+      decide(device_id: nil, token_servers: ['mastodon.social', 'mstdn.b-shock.org']),
+    )
+    assert_equal(
+      [true, 'preset_device'],
+      decide(device_id: '', token_servers: ['mstdn.b-shock.org']),
+    )
+  end
+
+  def test_legacy_external_only_token_still_needs_an_entitlement
+    assert_equal(
+      [false, 'no_entitlement'],
+      decide(device_id: nil, token_servers: ['mastodon.social', 'misskey.io']),
+    )
+  end
+
+  # ⚠ `device_id` もトークンも無ければ束ねようがない。
+  def test_legacy_row_without_a_token_is_not_bound
+    assert_equal(
+      [false, 'no_entitlement'],
+      decide(device_id: nil, token: nil, token_servers: ['mstdn.b-shock.org']),
+    )
+  end
+
+  # ⚠ **`device_id` の無い行は、`device_id` 側の束ねを見ない。**空の `device_id` で
+  # 引いた結果（＝無関係な行）に救われない。
+  def test_legacy_row_does_not_use_the_device_binding
     assert_equal(
       [false, 'no_entitlement'],
       decide(device_id: nil, servers: ['mstdn.b-shock.org']),
+    )
+  end
+
+  # ⚠ **`device_id` のある行は、従来どおり `device_id` だけで束ねる。**トークンへ
+  # 広げるのは旧クライアントの行だけ（既存の経路の挙動を変えない）。
+  def test_row_with_a_device_id_does_not_use_the_token_binding
+    assert_equal(
+      [false, 'no_entitlement'],
+      decide(servers: ['mastodon.social'], token_servers: ['mstdn.b-shock.org']),
     )
   end
 

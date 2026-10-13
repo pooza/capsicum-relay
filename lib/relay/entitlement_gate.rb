@@ -180,7 +180,9 @@ module Relay
       # そのアカウント自身のホストを送るので、行だけを見ると**プリセットと外部を
       # 併用する人の外部側が止まる** —— 仕様（全部無償）に反するうえ、その人の
       # 画面には課金の表示が出ない（capsicum#1123）ので**黙って通知が消える。**
-      if preset_device?(database, subscription['device_id'], extra_preset_hosts)
+      if preset_device?(
+        database, subscription['device_id'], extra_preset_hosts, token: subscription['token']
+      )
         return [true, REASON_PRESET_DEVICE]
       end
       allowed_reason, denied_reason = entitlement_decision(
@@ -304,11 +306,20 @@ module Relay
     # 外部の通知を黙って失う。偽装による迂回は許すことになるが、⚠ **プリセットの行
     # そのものへの push の裏取り（#69）はそのまま効く**（[preset_decision]）。
     #
-    # ⚠ **`device_id` が無い行（旧クライアント）は端末をまたいで束ねられない**ので false。
-    def self.preset_device?(database, device_id, extra_preset_hosts)
-      return false if device_id.to_s.empty?
-
-      return database.servers_for_device(device_id).any? do |server|
+    # ⚠⚠ **`device_id` が無い行（〜capsicum v1.53 の旧クライアント）は、端末の
+    # トークンで束ねる (#101)。**当初は「束ねられない」として false を返していたが、
+    # それだと旧クライアントの併用者は外部側が**順番に関係なく毎回**止まる。
+    # 許容した根拠は「`device_id` の無い外部行は起動していない install」だったが、
+    # 2026-10-13 に本番で 1 台が起動して崩れた。
+    # ⚠ [token] も無ければ束ねようがないので false。
+    def self.preset_device?(database, device_id, extra_preset_hosts, token: nil)
+      servers =
+        if device_id.to_s.empty?
+          database.servers_for_token(token)
+        else
+          database.servers_for_device(device_id)
+        end
+      return servers.any? do |server|
         Relay::PresetServers.preset?(server, extra: extra_preset_hosts)
       end
     end
