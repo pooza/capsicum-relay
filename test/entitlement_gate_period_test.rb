@@ -26,6 +26,7 @@ class EntitlementGatePeriodTest < Minitest::Test
     def entitlement_tokens_for_device(_device_id) = @rows
     # 同じ端末の購読先 (#82)。期間の検査ではプリセットを持たない端末として扱う。
     def servers_for_device(_device_id) = []
+    def servers_for_token(_token) = []
   end
 
   ON = {'RELAY_ENTITLEMENT_ENFORCE' => 'true'}.freeze

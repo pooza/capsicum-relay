@@ -311,14 +311,14 @@ module Relay
     # それだと旧クライアントの併用者は外部側が**順番に関係なく毎回**止まる。
     # 許容した根拠は「`device_id` の無い外部行は起動していない install」だったが、
     # 2026-10-13 に本番で 1 台が起動して崩れた。
-    # ⚠ [token] も無ければ束ねようがないので false。
+    # ⚠⚠ **`device_id` があっても、同じトークンの行も見る (#105)。**同じ
+    # インストールが新しい版へ上がる途中は、`device_id` のある行と無い行が同じ
+    # トークンで並ぶ。プリセットの行が旧版のまま（`device_id` 無し）で外部の行が
+    # 新しい版（`device_id` あり）だと、`device_id` だけでは同じ端末のプリセットが
+    # 見えず、外部側が止まっていた。和集合で広がるのは「無償になる」側だけ。
+    # ⚠ `device_id` も [token] も無ければ束ねようがないので false。
     def self.preset_device?(database, device_id, extra_preset_hosts, token: nil)
-      servers =
-        if device_id.to_s.empty?
-          database.servers_for_token(token)
-        else
-          database.servers_for_device(device_id)
-        end
+      servers = database.servers_for_device(device_id) | database.servers_for_token(token)
       return servers.any? do |server|
         Relay::PresetServers.preset?(server, extra: extra_preset_hosts)
       end
