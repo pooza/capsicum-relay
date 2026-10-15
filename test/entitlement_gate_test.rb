@@ -18,7 +18,8 @@ class EntitlementGateTest < Minitest::Test
     end
 
     def entitlement_tokens_for_device(_device_id) = @rows
-    def servers_for_device(_device_id) = @servers
+    # ⚠ 本物と同じく、`device_id` が空なら何も返さない（#105 で常に引くようになった）。
+    def servers_for_device(device_id) = device_id.to_s.empty? ? [] : @servers
     # ⚠ 本物と同じく、トークンが空なら何も返さない (#101)。
     def servers_for_token(token) = token.to_s.empty? ? [] : @token_servers
   end
@@ -149,12 +150,22 @@ class EntitlementGateTest < Minitest::Test
     )
   end
 
-  # ⚠ **`device_id` のある行は、従来どおり `device_id` だけで束ねる。**トークンへ
-  # 広げるのは旧クライアントの行だけ（既存の経路の挙動を変えない）。
-  def test_row_with_a_device_id_does_not_use_the_token_binding
+  # ⚠⚠ **`device_id` のある行も、同じトークンの行を見る (#105)。**新しい版へ上がる
+  # 途中は、プリセットの行が旧版のまま（`device_id` 無し）で外部の行だけ
+  # `device_id` を持つ。#101 では「既存の経路を変えない」としてトークンを見ず、
+  # この並びの外部側が止まる形を固定していた。
+  def test_row_with_a_device_id_also_uses_the_token_binding
+    assert_equal(
+      [true, 'preset_device'],
+      decide(servers: ['mastodon.social'], token_servers: ['mstdn.b-shock.org']),
+    )
+  end
+
+  # 和集合でも、どちらにもプリセットが無ければ従来どおり止める。
+  def test_union_without_a_preset_still_needs_an_entitlement
     assert_equal(
       [false, 'no_entitlement'],
-      decide(servers: ['mastodon.social'], token_servers: ['mstdn.b-shock.org']),
+      decide(servers: ['mastodon.social'], token_servers: ['misskey.io']),
     )
   end
 
