@@ -122,17 +122,28 @@ module Relay
     # `token` で塞いでいるのと同じ窓）。
     #
     # 消えたら行を返し、差し替わっていたら nil を返す（＝消さなかった）。
+    #
+    # ⚠ **消えたかどうかは `RETURNING` で受け取る**（PR #107 の Codex P2）。接続は
+    # Puma のスレッドで共有していて、`SerializedConnection` のロックは 1 呼び出し
+    # ずつなので、`DELETE` のあとに `changes` を読むと、間に入った別のスレッドの
+    # 文の件数を読むことがある。
     def unregister_owned(id, device_id)
-      sub = find(id)
-      return nil unless sub
-      return nil unless sub['device_id'] == device_id
+      return @db.execute(
+        'DELETE FROM subscriptions WHERE id = ? AND device_id = ? RETURNING *',
+        [id, device_id],
+      ).first
+    end
 
-      @db.execute(
-        'DELETE FROM subscriptions WHERE id = ? AND device_id = ?', [id, device_id]
-      )
-      return nil unless @db.changes.positive?
-
-      return sub
+    # `device_id` の無い行の登録解除 (#91 / PR #107 の Codex P2)。
+    #
+    # ⚠⚠ **「まだ `device_id` が無いこと」を条件に付けて 1 文で消す。**照合してから
+    # 消すまでの間に `/register` がこの行を引き取って（`adoptable_row`）`device_id`
+    # を埋めると、ID だけの削除は**付け替わった後の登録**を消してしまう。
+    # 消せなかったら nil。⚠ 消えたかどうかは [unregister_owned] と同じく `RETURNING`
+    # で受け取る。
+    def unregister_unbound(id)
+      sql = "DELETE FROM subscriptions WHERE id = ? AND (device_id IS NULL OR device_id = '')"
+      return @db.execute("#{sql} RETURNING *", [id]).first
     end
 
     # 配送が恒久的に失敗した購読を落とす (#55 / PR #67 の Codex P1)。
