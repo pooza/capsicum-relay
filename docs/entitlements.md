@@ -146,6 +146,35 @@ capsicum は**ログアウトでは relay の購読行を消さない**（消え
 
 ⚠ **再判定しない。**対象者が増えて取りはぐれが「relay を持ち出しにしない」目標に届かなくなったときだけ、数字を持って開け直す。
 
+#### プリセットサーバーで BAN した人の行は、手で消す（2026-10-18 pooza）
+
+**原則として、一度プリセットのメンバーになった端末の行は残し続ける**（上の 2 つの決定）。⚠ **例外は、プリセットサーバーで BAN（凍結・削除）した人**で、その人のプリセットの行を手で消して、端末単位の特例から外す。
+
+⚠ **運用者は `DELETE /register/:id` を使えない**（行に `device_id` があると `X-Device-Id` を求める・[#91](https://github.com/pooza/capsicum-relay/issues/91)）ので、本番のデータベースを直接触る。
+
+1. **読み取りだけで対象を確かめる。**同じ端末（`device_id` か `token`）にほかのプリセットのアカウントが無いかも見る
+
+   ```sh
+   sqlite3 -readonly ~/repos/capsicum-relay/db/relay.sqlite3 \
+     "select id, account, server, device_type, device_id, updated_at from subscriptions where account = '<user>@<preset host>'"
+   # 同じ端末のほかの行（device_id が空なら token で引く）
+   sqlite3 -readonly ~/repos/capsicum-relay/db/relay.sqlite3 \
+     "select id, account, server, updated_at from subscriptions where device_id = '<device_id>'"
+   ```
+
+2. **そのアカウントの行だけを消す。**⚠ **端末ごと消さない** —— 同じ人の外部のアカウントの通知まで止まる。外部の行は残し、利用権の判定を受ける側へ移す
+
+   ```sh
+   sqlite3 ~/repos/capsicum-relay/db/relay.sqlite3 \
+     "PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; delete from subscriptions where account = '<user>@<preset host>'; select changes();"
+   ```
+
+   - ⚠⚠ **`PRAGMA foreign_keys=ON` を必ず付ける。**`sqlite3` コマンドは既定で外部キーが無効で、付けないとお知らせの購読（`announcement_subscriptions`）が連鎖して消えずに残る
+   - relay は判定のたびにデータベースを引くので、**再起動は要らない**
+   - ⚠ 同じ端末にほかのプリセットのアカウント（サブアカウントなど）があれば、特例は残る。そちらも BAN しているなら同じ手順で消す
+
+3. **数日後に、行が作り直されていないかを見る。**⚠ capsicum は**上流の購読より先に relay へ登録する**（`push_registration_service.dart`）ので、BAN された人がアプリにアカウントを残したまま起動すると、行が作り直されうる（起動時の復元で止まるかは未確認）。作り直されていたら、手順を見直す
+
 ### プリセットの名乗りの裏取り（[#69](https://github.com/pooza/capsicum-relay/issues/69)）
 
 ⚠⚠ **`subscriptions.server` はクライアントの申告で、それ自体は証拠にならない。**共有シークレットは authorization boundary にできない（[capsicum#1121](https://github.com/pooza/capsicum/issues/1121)）ので、**誰でも `server: "mstdn.b-shock.org"` と名乗れる。**
