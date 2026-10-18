@@ -191,6 +191,26 @@ class RegisterRouteTest < RequestTestCase
     assert_nil(database.unregister_owned(9999, 'device-a'))
   end
 
+  # ⚠⚠ PR #107 の Codex P2: device_id の無い行も、照合のあとに `/register` が
+  # 引き取って device_id を埋めることがある。「まだ無いこと」を条件に消す。
+  def test_unregister_unbound_does_not_delete_a_row_adopted_by_a_device
+    sub = register_subscription
+    adopted = register_with_device('device-a')
+
+    assert_equal(sub['id'], adopted['id'], '前提: 行 ID は保たれる')
+    assert_nil(database.unregister_unbound(sub['id']))
+    assert_equal(1, database.count, '引き取られた後の登録が消えた')
+  end
+
+  def test_unregister_unbound_deletes_a_row_without_device_id
+    sub = register_subscription
+
+    removed = database.unregister_unbound(sub['id'])
+
+    assert_equal(sub['id'], removed['id'])
+    assert_equal(0, database.count)
+  end
+
   # ⚠⚠ #91（2026-10-18 pooza 判断）: 行に device_id があるのにヘッダを送って
   # こない要求は拒む。通すと、攻撃する側はヘッダを省けば他人の登録を消せる。
   def test_unregister_without_device_id_is_refused

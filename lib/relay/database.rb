@@ -135,6 +135,25 @@ module Relay
       return sub
     end
 
+    # `device_id` の無い行の登録解除 (#91 / PR #107 の Codex P2)。
+    #
+    # ⚠⚠ **「まだ `device_id` が無いこと」を条件に付けて 1 文で消す。**照合してから
+    # 消すまでの間に `/register` がこの行を引き取って（`adoptable_row`）`device_id`
+    # を埋めると、ID だけの削除は**付け替わった後の登録**を消してしまう。
+    # 消せなかったら nil。
+    def unregister_unbound(id)
+      sub = find(id)
+      return nil unless sub
+      return nil unless sub['device_id'].to_s.empty?
+
+      @db.execute(
+        "DELETE FROM subscriptions WHERE id = ? AND (device_id IS NULL OR device_id = '')", [id]
+      )
+      return nil unless @db.changes.positive?
+
+      return sub
+    end
+
     # 配送が恒久的に失敗した購読を落とす (#55 / PR #67 の Codex P1)。
     #
     # ⚠⚠ **行 ID だけで消してはいけない。**[update_registration] は**行 ID を保ったまま

@@ -91,13 +91,15 @@ module Relay
         # ⚠ **照合に通った回は、照合した `device_id` を条件に付けて消す**（PR #96 の
         # Codex P2）。照合から削除までの間に `/register` が同じ行を別の端末のものへ
         # 差し替えることがあり、ID だけで消すとその登録を消してしまう。
+        # ⚠ `device_id` の無い行も同じで、「まだ無いこと」を条件に付けて消す
+        # （PR #107 の Codex P2）。
         # 消せなかったら nil。
         def remove_registration(sub, binding)
           if binding == 'matched'
             return settings.database.unregister_owned(sub['id'], sub['device_id'])
           end
 
-          return settings.database.unregister(sub['id'])
+          return settings.database.unregister_unbound(sub['id'])
         end
 
         # `DELETE /register/:id` が、行の持ち主から来たかどうか (#91)。
