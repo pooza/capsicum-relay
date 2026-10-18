@@ -47,16 +47,20 @@ module Relay
 
         # 消す対象を、呼び出し元の端末に縛る (#91)。
         #
-        # ⚠⚠ **`X-Device-Id` を送ってこない要求は、まだ従来どおり通す。**出荷済みの
-        # capsicum（〜2.0）は送ってこないので、すぐ拒むと古い版の端末が自分の登録を
-        # 消せなくなる。⚠ **だからこの照合は、いまは何も守っていない** —— 攻撃する
-        # 側はヘッダを省けばよい。拒む時期を決めるための母数を `binding` で数えて
-        # おき、`legacy` が減ったら閉じる。
+        # ⚠⚠ **行に `device_id` があるのに `X-Device-Id` を送ってこない要求は拒む**
+        # （2026-10-18 pooza 判断）。送らなければ通す形のままだと、攻撃する側は
+        # ヘッダを省けばよく、照合が何も守らない。
+        # ⚠ 拒まれるのは capsicum 〜2.0 と、端末の ID を読めなかった回の解除。
+        # capsicum は上流の購読と鍵を先に消してから relay の行を消すので、拒まれても
+        # **行が残るだけで通知は届かない**（ログアウトの経路で元から起きていること）。
+        # 端末の ID を読めなかった回の行は、次の `/register` が `adoptable_row` で
+        # 付け替える。
+        # ⚠ 行に `device_id` が無い（#15 より前の登録）ものは照合しようがないので通す。
         #
-        # ⚠ **食い違いは 404 で返す**（403 にすると、その id に行があると分かる）。
+        # ⚠ **拒むときは 404 で返す**（403 にすると、その id に行があると分かる）。
         binding = unregister_binding(sub)
         metrics.increment('relay_unregister_binding_total', {binding: binding})
-        halt_unregister_refused!(sub) if binding == 'mismatch'
+        halt_unregister_refused!(sub, binding) if ['mismatch', 'legacy'].include?(binding)
         halt 404, {error: 'Not found'}.to_json unless remove_registration(sub, binding)
 
         metrics.increment('relay_register_total', {action: 'deleted'})
@@ -74,11 +78,12 @@ module Relay
       end
 
       helpers do
-        def halt_unregister_refused!(sub)
+        def halt_unregister_refused!(sub, binding)
+          reason = binding == 'legacy' ? 'device_id missing' : 'device_id mismatch'
           log_event(
             'register.delete_refused', level: :warn,
-            msg: 'Unregister refused: device_id mismatch',
-            device_type: sub['device_type'], latency_ms: latency_ms
+            msg: "Unregister refused: #{reason}",
+            device_type: sub['device_type'], binding: binding, latency_ms: latency_ms
           )
           halt 404, {error: 'Not found'}.to_json
         end
@@ -100,13 +105,18 @@ module Relay
         # - `matched`: 送ってきた `X-Device-Id` が行と一致した
         # - `mismatch`: 食い違った（＝消さない）
         # - `unbound_row`: 行に `device_id` が無い（#15 より前の登録）。照合できない
-        # - `legacy`: ヘッダを送ってこない（〜2.0 の capsicum）
+        #   ので、ヘッダの有無にかかわらず通す
+        # - `legacy`: 行に `device_id` があるのに、ヘッダを送ってこない（〜2.0 の
+        #   capsicum・端末の ID を読めなかった回）＝消さない
+        #
+        # ⚠ 行の側を先に見る。ヘッダを先に見ると、`device_id` の無い行の解除まで
+        # `legacy` として拒んでしまう。
         def unregister_binding(sub)
-          provided = request.env['HTTP_X_DEVICE_ID'].to_s.strip
-          return 'legacy' if provided.empty?
-
           expected = sub['device_id'].to_s
           return 'unbound_row' if expected.empty?
+
+          provided = request.env['HTTP_X_DEVICE_ID'].to_s.strip
+          return 'legacy' if provided.empty?
           return 'matched' if Rack::Utils.secure_compare(expected, provided)
 
           return 'mismatch'

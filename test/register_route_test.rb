@@ -191,15 +191,30 @@ class RegisterRouteTest < RequestTestCase
     assert_nil(database.unregister_owned(9999, 'device-a'))
   end
 
-  # ⚠ 出荷済みの版（〜2.0）は送ってこない。拒むと古い端末が登録を消せなくなる。
-  def test_unregister_without_device_id_still_deletes
+  # ⚠⚠ #91（2026-10-18 pooza 判断）: 行に device_id があるのにヘッダを送って
+  # こない要求は拒む。通すと、攻撃する側はヘッダを省けば他人の登録を消せる。
+  def test_unregister_without_device_id_is_refused
     sub = register_with_device('device-a')
+
+    delete("/register/#{sub['id']}", {}, auth_headers)
+
+    assert_equal(404, last_response.status)
+    assert_equal({'error' => 'Not found'}, json_response)
+    assert_equal(1, database.count, 'ヘッダを省いた要求で登録が消えた')
+    assert_equal(1, binding_count('legacy'))
+    assert_equal(0, Relay::BaseApp.settings.metrics.value('relay_register_total', {action: 'deleted'}))
+  end
+
+  # ⚠ 行に device_id が無いものは、ヘッダが無くても通す（照合しようがない・
+  # 〜v1.53 の登録）。ヘッダを先に見ると、ここまで拒んでしまう。
+  def test_unregister_of_a_row_without_device_id_deletes_without_header
+    sub = register_subscription
 
     delete("/register/#{sub['id']}", {}, auth_headers)
 
     assert_equal(200, last_response.status)
     assert_equal(0, database.count)
-    assert_equal(1, binding_count('legacy'))
+    assert_equal(1, binding_count('unbound_row'))
   end
 
   # 行に device_id が無い（#15 より前の登録）なら照合できないので通す。
@@ -218,7 +233,8 @@ class RegisterRouteTest < RequestTestCase
 
     delete_as(sub['id'], '   ')
 
-    assert_equal(200, last_response.status)
+    assert_equal(404, last_response.status)
+    assert_equal(1, database.count)
     assert_equal(1, binding_count('legacy'))
   end
 
