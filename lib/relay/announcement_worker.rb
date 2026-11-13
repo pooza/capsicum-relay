@@ -33,7 +33,7 @@ module Relay
     # このコップが狙う「順序を覚えられない位置引数の列」にはあたらない。増えたのは
     # push クライアントが 4 種そろったためで、束ねると base_app 側の
     # `settings.respond_to?` の分岐が別の入れ物へ移るだけになる。
-    # rubocop:disable Metrics/ParameterLists
+    # rubocop:disable-next Metrics/ParameterLists
     def initialize(
       database:, logger:, apns: nil, apns_macos: nil, fcm: nil, wns: nil, metrics: nil,
       interval: DEFAULT_INTERVAL
@@ -52,7 +52,6 @@ module Relay
         logger: logger, metrics: metrics, database: database,
       )
     end
-    # rubocop:enable Metrics/ParameterLists
 
     # Sinatra の settings から push クライアントを拾って組み立てる (#36 Phase 2)。
     #
