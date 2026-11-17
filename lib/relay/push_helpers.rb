@@ -1,5 +1,6 @@
 require 'base64'
 require 'json'
+require_relative 'push_content_type'
 require_relative 'sentry_setup'
 
 module Relay
@@ -98,6 +99,9 @@ module Relay
     def push_received_fields
       return {
         encoding: request.env['HTTP_CONTENT_ENCODING'].to_s,
+        # 読み替える前の Content-Type (#118)。Mastodon は `application/octet-stream`、
+        # Akkoma は付けてこない。上流ごとの送り方を後から確かめるための観測。
+        content_type: request.env[Relay::PushContentType::ORIGINAL_KEY].to_s,
         has_crypto_key: !request.env['HTTP_CRYPTO_KEY'].nil?,
         has_encryption: !request.env['HTTP_ENCRYPTION'].nil?,
         has_topic: !request.env['HTTP_TOPIC'].nil?,

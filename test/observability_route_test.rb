@@ -115,6 +115,8 @@ class ObservabilityRouteTest < RequestTestCase
     record = records('push.received').first
 
     assert_equal('aes128gcm', record['encoding'])
+    # 読み替える前の Content-Type (#118)。
+    assert_equal('application/octet-stream', record['content_type'])
     assert_equal('ios', record['device_type'])
     # jq で数値比較できるよう整数で出す（Rack は String で返す）。
     assert_equal(14, record['length'])
