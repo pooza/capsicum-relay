@@ -1,4 +1,5 @@
 require_relative 'lib/relay/base_app'
+require_relative 'lib/relay/push_content_type'
 require_relative 'lib/relay/routes/announcement_subscriptions'
 require_relative 'lib/relay/routes/entitlements'
 require_relative 'lib/relay/routes/google_play_notifications'
@@ -24,6 +25,8 @@ module Relay
   # 並び順に依存は無い（パスが重ならない）。読みやすさのためアルファベット順。
   class App < BaseApp
     use Sentry::Rack::CaptureExceptions if Relay::SentrySetup.enabled?
+    # ⚠ **route のクラスより前に置く (#118)。**理由は [Relay::PushContentType] の doc。
+    use PushContentType
 
     use Routes::AnnouncementSubscriptions
     use Routes::Entitlements
