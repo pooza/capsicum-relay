@@ -109,8 +109,9 @@ sequenceDiagram
 
 #### 復号の実装上の注意
 
-- **aes128gcm (RFC 8291)**: body 先頭に `salt` (16 byte) / `rs` (4 byte) / `idlen` (1 byte) / sender public key が前置されているため、body のみで復号可能。Mastodon 4.x / 現行 Misskey はこちら
-- **aesgcm (legacy RFC 8188 draft 03)**: salt は `Encryption` ヘッダ、sender public key は `Crypto-Key` ヘッダの `dh=` パラメータに入っているため、これらも参照しないと復号できない。古い Mastodon フォーク / 一部 Misskey で使用される可能性あり
+- **aes128gcm (RFC 8291)**: body 先頭に `salt` (16 byte) / `rs` (4 byte) / `idlen` (1 byte) / sender public key が前置されているため、body のみで復号可能。Mastodon（capsicum が `subscription[standard]=true` で選ばせる）/ Misskey はこちら
+- **aesgcm (legacy RFC 8188 draft 03)**: salt は `Encryption` ヘッダ、sender public key は `Crypto-Key` ヘッダの `dh=` パラメータに入っているため、これらも参照しないと復号できない。**Akkoma（Pleroma 系）はこちらでしか送らない**（Akkoma 3.20.1 で実測・2026-11-18）。古い Mastodon（4.3 以前）もこちら。端末側の復号は capsicum v2.13 から（[pooza/capsicum#1390](https://github.com/pooza/capsicum/issues/1390)）
+- **`Content-Type` の無い本文**: Akkoma は `/push` の本文に `Content-Type` を付けてこない。Sinatra（Rack）はそれをフォームとして読みにいき、route の手前で 400 を返す（上流は購読を消す）。`PushContentType` の middleware が `POST /push/` に限り、`Content-Type` が無いかフォーム形式のときだけ `application/octet-stream` に読み替える（[#118](https://github.com/pooza/capsicum-relay/issues/118)）。⚠ Mastodon / Misskey が付けてくる `application/octet-stream` には触れない
 - **VAPID ヘッダ**: capsicum-relay は VAPID `Authorization` ヘッダを転送しない（push service 側で consume するもので、クライアント復号には不要）
 - **TTL / Topic / Urgency**: Web Push 仕様のヘッダは転送しない（通知表示の用途なし）
 
